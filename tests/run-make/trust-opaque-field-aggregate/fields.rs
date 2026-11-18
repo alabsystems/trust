@@ -93,3 +93,30 @@ pub fn havoc_payload(value: ScalarTuple, n: u32) -> u8 {
         }
     }
 }
+
+
+// Same payload shape as the measured AY dt_eta::Fields::len producer failure.
+pub struct SliceField {
+    pub name: String,
+    pub sort: u64,
+}
+
+pub enum SlicePayload<'a> {
+    Tuples(&'a [(String, u64)]),
+    Datatype(&'a [SliceField]),
+}
+
+pub fn slice_payload_len(value: SlicePayload<'_>) -> usize {
+    match value {
+        SlicePayload::Tuples(value) => value.len(),
+        SlicePayload::Datatype(value) => value.len(),
+    }
+}
+
+pub fn direct_tuple_slice_len(value: &[(String, u64)]) -> usize {
+    value.len()
+}
+
+pub fn direct_field_slice_len(value: &[SliceField]) -> usize {
+    value.len()
+}

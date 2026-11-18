@@ -75,7 +75,8 @@ impl<'a> NativePublicQuestion<'a> {
     }
 
     /// Both scopes bind the identical original question. An unconditional
-    /// derivation consumes no premise, including an unsupported declaration.
+    /// derivation consumes no root premise, including an unsupported root
+    /// declaration. Original callee preconditions remain obligations at calls.
     pub fn for_derivation(
         public: &'a TrustContractBundle,
         native: &ValidatedNativeBundle<'a>,
@@ -117,7 +118,9 @@ impl<'a> NativePublicQuestion<'a> {
         // interpret it. This may invalidate a cache on an unrelated catalog
         // change, but never turns that catalog entry into a premise.
         let digest = question_digest(public, native, obligation, proof, function)?;
-        if scope == NativePublicProofScope::Unconditional {
+        // A single-body unit has no non-root entry declaration to charge.
+        // Recursion and unavailable/indirect callees retain engine refusals.
+        if scope == NativePublicProofScope::Unconditional && native.module.functions.len() == 1 {
             return Ok(Self {
                 public,
                 native,
@@ -140,9 +143,28 @@ impl<'a> NativePublicQuestion<'a> {
             let mut definitions = Vec::new();
             let mut outside = false;
             let mut inside = false;
+            let mut omitted_root = false;
             for candidate in &public.obligations {
                 if candidate.contract_id.as_deref() != Some(contract.contract_id.as_str()) {
                     continue;
+                }
+                if scope == NativePublicProofScope::Unconditional {
+                    let root_only = match original_proof(native, &candidate.obligation_id) {
+                        Ok(original) => {
+                            original.function == Some(function) && original.site.is_none()
+                        }
+                        Err(_) => function_context(candidate, contract.kind).is_ok_and(|context| {
+                            post_context.as_ref() == Some(&context)
+                                || native
+                                    .module
+                                    .function_by_id(function)
+                                    .is_some_and(|root| matches_function(public, root, &context))
+                        }),
+                    };
+                    if root_only {
+                        omitted_root = true;
+                        continue;
+                    }
                 }
                 if candidate.kind != ObligationKind::Precondition {
                     return Err(
@@ -205,7 +227,7 @@ impl<'a> NativePublicQuestion<'a> {
                     function: owner,
                 });
             }
-            if definitions.is_empty() && outside && !inside {
+            if definitions.is_empty() && (outside || omitted_root) && !inside {
                 continue;
             }
             let mut owners = rustc_hash::FxHashSet::default();
@@ -225,12 +247,17 @@ impl<'a> NativePublicQuestion<'a> {
         for original in &native.module.proof_obligations {
             if original.kind == trust_ir::ObligationKind::Precondition
                 && original.site.is_none()
+                && !(scope == NativePublicProofScope::Unconditional
+                    && original.function == Some(function))
                 && !entries.iter().any(|entry| entry.proof.id == original.id)
             {
                 return Err("native entry precondition has no exact public declaration".into());
             }
         }
-        if !entries.is_empty() && post_context.is_none() {
+        if scope == NativePublicProofScope::DeclaredEntry
+            && !entries.is_empty()
+            && post_context.is_none()
+        {
             return Err(
                 "declared entry domain requires the original selected function context".into()
             );

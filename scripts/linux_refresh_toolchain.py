@@ -135,19 +135,39 @@ def submodule_names(worktree: Path) -> dict[str, str]:
     return names
 
 
-def materialize_submodules(worktree: Path, modules: Path, repo: Path) -> list[str]:
-    """Check out every submodule of `worktree` at its pin, from `modules/<path>`.
+def module_roots(repo: Path) -> list[Path]:
+    """The directories that can hold `repo`'s module stores, in the order they are tried.
 
-    `modules` is another checkout's module store (`<git dir>/modules`), so nothing is
+    Its own git directory's `modules` comes first. A second worktree has none there once
+    scripts/submodule_sync.sh has populated it: its submodule checkouts are linked
+    worktrees of the stores the first checkout cloned, `<common git dir>/modules`.
+    """
+    roots = []
+    for flag in ("--absolute-git-dir", "--git-common-dir"):
+        root = Path(git(repo, "rev-parse", "--path-format=absolute", flag)).resolve() / "modules"
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def module_store(roots: list[Path], path: str) -> Path | None:
+    """The first of `roots` that holds a store for the submodule at `path`."""
+    return next((root / path for root in roots if (root / path / "HEAD").is_file()), None)
+
+
+def materialize_submodules(worktree: Path, modules: list[Path], repo: Path) -> list[str]:
+    """Check out every submodule of `worktree` at its pin, from a store under `modules`.
+
+    `modules` names another checkout's module stores (`module_roots`), so nothing is
     fetched: a pin that store lacks is a refusal that names the command, not a clone
     from the network. Nested submodules come from the nested store the same way.
     """
     done = []
     names = submodule_names(worktree)
     for path, pin in gitlinks(worktree):
-        store = modules / path
-        if not (store / "HEAD").is_file():
-            raise Refusal(f"{store} is not a module store: {repo} never initialised {path}")
+        store = module_store(modules, path)
+        if store is None:
+            raise Refusal(f"{modules[0] / path} is not a module store: {repo} never initialised {path}")
         if subprocess.run(["git", "-C", str(store), "cat-file", "-e", pin + "^{commit}"],
                           capture_output=True).returncode:
             raise Refusal(f"{path} is pinned at {pin[:10]}, which {store} does not hold; in {repo} run "
@@ -160,7 +180,7 @@ def materialize_submodules(worktree: Path, modules: Path, repo: Path) -> list[st
             "--init", "--no-fetch", "--", path)
         done.append(path)
         done += [f"{path}/{nested}"
-                 for nested in materialize_submodules(worktree / path, store / "modules", repo)]
+                 for nested in materialize_submodules(worktree / path, [store / "modules"], repo)]
     return done
 
 
@@ -170,8 +190,7 @@ def clone_rung(repo: Path, commit: str, worktree: Path) -> list[str]:
         raise Refusal(f"{worktree} exists")
     git(repo, "clone", "--quiet", "--no-checkout", str(repo), str(worktree))
     git(worktree, "checkout", "--quiet", "--detach", commit)
-    return materialize_submodules(worktree, Path(git(repo, "rev-parse", "--absolute-git-dir")) / "modules",
-                                  repo)
+    return materialize_submodules(worktree, module_roots(repo), repo)
 
 
 def worktree_problems(worktree: Path, commit: str) -> list[str]:

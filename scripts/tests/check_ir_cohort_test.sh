@@ -633,9 +633,29 @@ for root in surface:
     before = removed
 
 assert cohort.semantic_digest(store, "0" * 40, surface) is None
+
+# A named committed file whose object cannot be read is not an absent file.
+# Exercise both the explicit root and a discovered split child with real Git
+# object loss, then restore the exact object and require the original digest.
+for rel in (surface[0], surface[0].removesuffix(".rs") + "/unreadable.bin"):
+    source = store / rel
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"unique committed source whose object must remain readable\x00\xff")
+    named = commit()
+    expected = cohort.semantic_digest(store, named, surface)
+    assert expected is not None
+    oid = git("rev-parse", named + ":" + rel)
+    loose = store / ".git" / "objects" / oid[:2] / oid[2:]
+    held = loose.with_name(loose.name + ".held")
+    loose.rename(held)
+    try:
+        assert cohort.semantic_digest(store, named, surface) is None, rel
+    finally:
+        held.rename(loose)
+    assert cohort.semantic_digest(store, named, surface) == expected, rel
 PY
 then
-  printf 'ok    every split subtree binds exact committed bytes, additions, removals and replacement immunity\n'; pass=$((pass+1))
+  printf 'ok    every split subtree binds exact committed bytes and refuses unreadable root/child objects\n'; pass=$((pass+1))
 else
   printf 'FAIL  split subtree content, membership or revision binding\n'; fail=$((fail+1))
 fi

@@ -52,7 +52,11 @@ fn main() {
         if lane == "on" {
             compiler.arg("-Ztrust-dump=ir:fields-ir").arg("-Ztrust-ir-flip=yes");
         }
-        compiler.run();
+        let output = compiler.run();
+        assert!(
+            !output.stderr_utf8().contains("final Trust-IR module validation failed"),
+            "an opaque receiver must refuse its body without invalidating other functions"
+        );
     }
 
     let coverage: serde_json::Value =
@@ -70,6 +74,9 @@ fn main() {
         "direct_struct",
         "joined_payload",
         "havoc_payload",
+        "slice_payload_len",
+        "direct_tuple_slice_len",
+        "direct_field_slice_len",
     ]);
     let actual = bodies
         .iter()
@@ -91,6 +98,7 @@ fn main() {
             // (KNOWN_HAZARDS "an opaque-carrier binding ALIASED into a new local and then
             // rebound"), one step before the value-ledger field check it used to reach.
             "rebound_payload" => Some("Let(opaque carrier at a real type)"),
+            "slice_payload_len" => Some("SliceLen(opaque receiver carrier)"),
             _ => None,
         };
         if let Some(refusal) = refusal {
@@ -100,14 +108,34 @@ fn main() {
                 unsupported.contains(&serde_json::json!([refusal, 2])),
                 "both arms must retain the refusal {refusal}: {body}"
             );
-            let field_rows = unsupported
+            let prefix = if name == "slice_payload_len" { "SliceLen(" } else { "Field(" };
+            let receiver_rows = unsupported
                 .iter()
-                .filter(|row| row[0].as_str().is_some_and(|tag| tag.starts_with("Field(")))
+                .filter(|row| row[0].as_str().is_some_and(|tag| tag.starts_with(prefix)))
                 .collect::<Vec<_>>();
-            assert_eq!(field_rows.len(), 1, "exactly one field check names the refusal: {body}");
+            assert_eq!(receiver_rows.len(), 1, "one receiver check names the refusal: {body}");
         } else {
             assert_eq!(body["lowered"], true, "real aggregate must lower: {body}");
             assert!(unsupported.is_empty(), "control acquired a refusal: {body}");
         }
     }
+
+    for lane in ["off", "on"] {
+        let executable = format!("slice-receivers-{lane}");
+        let mut compiler = cmd(&trustc);
+        compiler.arg("slice_receivers.rs")
+            .arg("--edition=2021")
+            .arg("-Copt-level=3")
+            .arg("-Ztrust-verify=off")
+            .arg("-Ztrust-policy=strict")
+            .arg(format!("-Ztrust-ir-lower={lane}"))
+            .arg("-o").arg(&executable);
+        if lane == "on" {
+            compiler.arg("-Ztrust-ir-flip=yes");
+        }
+        let output = compiler.run();
+        assert!(!output.stderr_utf8().contains("final Trust-IR module validation failed"));
+        run_make_support::run(&executable);
+    }
+
 }

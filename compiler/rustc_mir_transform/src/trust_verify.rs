@@ -70252,6 +70252,12 @@ fn trust_mc_default_instruction_requires_fail_closed_admission(
         | trust_ir::Inst::TensorView { .. }
         | trust_ir::Inst::TensorGather { .. }
         | trust_ir::Inst::TensorScatter { .. } => true,
+        // Trust: trust-ir v74's Box deref is undefined behaviour unless its
+        // validity conjuncts hold, and its fact is a named assumption this
+        // structural encoder neither validates nor models (trust-ir §28: a
+        // consumer that has not modelled it refuses it). A fail-closed `error`
+        // edge, named rather than left to the default below.
+        trust_ir::Inst::BoxDeref { .. } => true,
         _ => false,
     }
 }
@@ -70788,6 +70794,13 @@ fn chc_inst_arithmetic_surface_modeled(inst: &trust_ir::Inst) -> bool {
         | trust_ir::Inst::TensorView { .. }
         | trust_ir::Inst::TensorGather { .. }
         | trust_ir::Inst::TensorScatter { .. } => false,
+        // Trust: trust-ir v74's Box deref does no arithmetic, but it is undefined
+        // behaviour unless its validity conjuncts hold, and trust-ir §28 says a
+        // consumer that has not modelled its fact refuses it. This CHC models
+        // neither the fact nor the conjuncts, so the function is gated out here
+        // as the default admission's fail-closed edge refuses it, rather than
+        // admitted as non-arithmetic by the `_` arm below.
+        trust_ir::Inst::BoxDeref { .. } => false,
         // Every other `Inst` is treated as non-arithmetic. A NEW `Inst` variant
         // lands HERE and is admitted, so each one must be reviewed against this
         // list when trust-ir adds it; only new `BinOp` / `UnOp` / `CastOp`
@@ -75416,12 +75429,8 @@ fn trust_mc_native_typed_chc_metadata_json(
     request: &trust_ir::TrustMcNativeRequest,
     proof_obligation_id: trust_ir::ProofId,
 ) -> serde_json::Value {
-    let (adapter_input, source_digest) = match native_trust_ir_bundle.input {
-        trust_ir::NativeAdapterInput::RustMir { body_digest } => {
-            ("rust-mir", Some(native_artifact_digest_json(body_digest)))
-        }
-        trust_ir::NativeAdapterInput::TrustIrModule => ("trust_ir-module", None),
-    };
+    let (adapter_input, source_digest) =
+        native_adapter_input_metadata_json(native_trust_ir_bundle.input);
 
     serde_json::json!({
         "schema_version": 3,
@@ -75444,6 +75453,24 @@ fn trust_mc_native_typed_chc_metadata_json(
         "replay_identity": request.provenance.replay_identity().and_then(native_replay_identity_json),
         "replay_context": native_replay_context_json(request.provenance.replay_context()),
     })
+}
+
+/// The typed-CHC metadata's `adapter_input` name and `source_digest` for a bundle's native
+/// input. The spellings are the ones the pinned trust-mc native runner writes for the same
+/// bundle (`NativeChcMetadataContext::new`), so the binding identity check compares like
+/// with like. trust-ir's `RustThir` digest is identity only, never source authority.
+fn native_adapter_input_metadata_json(
+    input: trust_ir::NativeAdapterInput,
+) -> (&'static str, Option<serde_json::Value>) {
+    match input {
+        trust_ir::NativeAdapterInput::RustMir { body_digest } => {
+            ("rust-mir", Some(native_artifact_digest_json(body_digest)))
+        }
+        trust_ir::NativeAdapterInput::RustThir { source_digest } => {
+            ("rust-thir", Some(native_artifact_digest_json(source_digest)))
+        }
+        trust_ir::NativeAdapterInput::TrustIrModule => ("trust_ir-module", None),
+    }
 }
 
 fn native_artifact_digest_json(digest: trust_ir::ProofDigest) -> serde_json::Value {

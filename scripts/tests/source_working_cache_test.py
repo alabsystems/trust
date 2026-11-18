@@ -326,27 +326,42 @@ class NativeWorkingCacheTests(unittest.TestCase):
         indexed = owner._indexed_submodules(parent)[0]
         return parent, indexed
 
-    def test_production_pinned_child_installs_complete_tree_with_independent_git(self):
-        self.require_native()
+    def test_object_cache_child_is_checked_out_by_git_and_never_read_as_working_data(self):
+        # A declared object cache is Agh's only, even when it has a complete worktree
+        # whose files match the pin: Git checks the child out (the route of build 27009).
         parent, indexed = self.parent_fixture("parent")
-        calls = []
+        calls, donors = [], []
         def acquire(url, stage, source_ref, private_ref, **kwargs):
-            calls.append((url, source_ref, private_ref, kwargs))
+            calls.append((url, source_ref, private_ref, kwargs, stage.parent))
             self.git(stage, "-c", "protocol.file.allow=always", "fetch", "-q", "--no-tags",
                      str(self.source), source_ref + ":" + private_ref)
-        with mock.patch.object(owner, "_agh_source_fetch", side_effect=acquire):
+        actual_prepare = owner._prepare_source_working_cache
+        def prepare(stage, commit, donor):
+            donors.append(donor)
+            return actual_prepare(stage, commit, donor)
+        with mock.patch.object(owner, "_agh_source_fetch", side_effect=acquire), \
+                mock.patch.object(owner, "_prepare_source_working_cache", side_effect=prepare):
             owner._install_missing_submodule(parent, indexed, checkout_cache=self.source)
+        self.assertEqual(donors, [None])
+        self.assertEqual(calls[0][1], self.commit)
+        # Agh's scratch goes in the stage's own container, which is removed with it.
+        self.assertEqual(calls[0][3], {"checkout_cache": self.source, "scratch_parent": calls[0][4]})
+        self.assertTrue(calls[0][4].name.startswith(".trust-submodule-"))
+        self.assertFalse(calls[0][4].exists())
         child = parent / "first-party/clean"
         self.assertEqual(self.inventory(child), self.inventory(self.source))
+        self.assertEqual(self.git(child, "ls-files", "--stage"), self.git(self.source, "ls-files", "--stage"))
         self.assertEqual(self.git(child, "rev-parse", "HEAD").decode().strip(), self.commit)
-        receipt = json.loads((child / ".git/trust-source-working-cache.json").read_text())
-        self.assertGreater(receipt["cloned"], 0)
-        self.assertEqual(calls[0][1], self.commit)
-        self.assertEqual(calls[0][3]["checkout_cache"], self.source)
+        detached = subprocess.run([*owner._controlled_git_command([]), "-C", str(child), "symbolic-ref", "-q", "HEAD"],
+                                  env=owner._provenance_git_environment(), capture_output=True)
+        self.assertEqual(detached.returncode, 1)
+        self.assertEqual(self.git(child, "status", "--porcelain"), b"")
+        self.assertFalse(os.path.lexists(child / ".git/trust-source-working-cache.json"))
+        self.assertFalse(os.path.lexists(child / ".git/trust-source-working-cache.jsonl.gz"))
         for p in (child / ".git").rglob("*"):
+            self.assertFalse(p.is_symlink())
             if p.is_file():
                 self.assertEqual(p.stat().st_nlink, 1)
-                self.assertFalse(p.is_symlink())
         self.assertFalse((child / ".git/objects/info/alternates").exists())
 
     def test_separate_plain_data_donor_never_selects_git_or_agh_authority(self):
@@ -364,7 +379,7 @@ class NativeWorkingCacheTests(unittest.TestCase):
         calls = []
         def acquire(url, stage, source_ref, private_ref, **kwargs):
             calls.append(kwargs)
-            self.assertEqual(kwargs, {"checkout_cache": self.source})
+            self.assertEqual(kwargs, {"checkout_cache": self.source, "scratch_parent": stage.parent})
             self.git(stage, "-c", "protocol.file.allow=always", "fetch", "-q", "--no-tags",
                      str(self.source), source_ref + ":" + private_ref)
         with mock.patch.object(owner, "_agh_source_fetch", side_effect=acquire):
@@ -467,7 +482,9 @@ class NativeWorkingCacheTests(unittest.TestCase):
                 owner, "_prepare_source_working_cache", side_effect=lambda stage, commit, donor: self.prepare(stage, donor)), mock.patch.object(
                 cache, "_native", return_value=(failure, *native[1:])):
             with self.assertRaises(cache.CustodyRefused):
-                owner._install_missing_submodule(parent, indexed, checkout_cache=self.source)
+                # Only an explicit working cache is a DATA donor; the object cache is Agh's.
+                owner._install_missing_submodule(parent, indexed, checkout_cache=self.source,
+                                                 working_cache=self.source)
         candidates = list((parent / "first-party").glob(".trust-submodule-*/source/.git/trust-working-data-*/candidate"))
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].read_bytes(), b"retain through owner cleanup")
@@ -532,7 +549,8 @@ class NativeWorkingCacheTests(unittest.TestCase):
                         owner, "_local_submodule_git", side_effect=git), mock.patch.object(
                         cache, "_native", return_value=(native[0], move, native[2])):
                     with self.assertRaises(cache.CustodyRefused):
-                        owner._install_missing_submodule(parent, indexed, checkout_cache=self.source)
+                        owner._install_missing_submodule(parent, indexed, checkout_cache=self.source,
+                                                         working_cache=self.source)
                 self.assertEqual(len(affected), 1)
                 stages = list((parent / "first-party").glob(".trust-submodule-*/source"))
                 self.assertEqual(len(stages), 1, "outer cleanup deleted ambiguous installed source")

@@ -587,6 +587,15 @@ class EffectiveBootstrapConfigTests(unittest.TestCase):
 
 
 class XPyForwardingTests(unittest.TestCase):
+    def test_build_directory_forms_retain_cli_precedence_and_double_dash(self) -> None:
+        for argv, selected in (
+            (["--build-dir", "../scratch", "test"], "../scratch"),
+            (["test", "--build-dir=/ram/build"], "/ram/build"),
+            (["--build-dir=first", "--build-dir", "second", "--", "--build-dir=ignored"], "second"),
+        ):
+            forwarded = x_entry._trust_preflight_config_args(argv, "/work/tree")
+            self.assertEqual(forwarded[-2:], ["--build-dir", selected])
+
     def test_split_and_equals_forms_are_forwarded_before_double_dash(self) -> None:
         forwarded = x_entry._trust_preflight_config_args(
             [
@@ -621,6 +630,53 @@ class XPyForwardingTests(unittest.TestCase):
             "/work/tree",
         )
         self.assertEqual(forwarded[-2:], ["--bootstrap-toml", "/work/tree/second.toml"])
+
+
+class BuildVolumeTests(unittest.TestCase):
+    def test_fresh_external_build_uses_its_volume_and_preserves_both_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            source, external = base / "source", base / "external"
+            source.mkdir(); external.mkdir()
+            destination = external / "new" / "build"
+            for free, expected in ((9_000_000_000, preflight.FAIL),
+                                   (13_000_000_000, preflight.WARN),
+                                   (26_000_000_000, preflight.INFO)):
+                report = preflight.Report(False)
+                with patch.object(preflight.shutil, "disk_usage",
+                                  return_value=SimpleNamespace(free=free)) as usage:
+                    preflight.check_misc(source, {"build": {"build-dir": "ignored"}}, report,
+                                         build_dir=str(destination), invocation_cwd=source)
+                usage.assert_called_once_with(external)
+                self.assertFalse(destination.exists())
+                self.assertEqual(report.findings[-1].severity, expected)
+                self.assertIn(str(destination), report.findings[-1].detail[0])
+
+    def test_relative_config_and_default_build_follow_invocation_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve(); source = base / "source"; caller = base / "caller"
+            source.mkdir(); caller.mkdir(); (caller / "cache").mkdir()
+            for config, expected in (({}, caller),
+                                     ({"build": {"build-dir": "cache/new"}}, caller / "cache")):
+                with patch.object(preflight.shutil, "disk_usage",
+                                  return_value=SimpleNamespace(free=30_000_000_000)) as usage:
+                    preflight.check_misc(source, config, preflight.Report(False), invocation_cwd=caller)
+                usage.assert_called_once_with(expected)
+
+    def test_unmeasurable_or_invalid_destination_fails_without_source_volume_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(); file = root / "file"; file.write_text("input")
+            for selected in (False, "", str(file / "build")):
+                report = preflight.Report(False)
+                with patch.object(preflight.shutil, "disk_usage") as usage:
+                    preflight.check_misc(root, {"build": {"build-dir": selected}}, report)
+                usage.assert_not_called()
+                self.assertEqual(report.findings[-1].severity, preflight.FAIL)
+            report = preflight.Report(False)
+            with patch.object(preflight.shutil, "disk_usage", side_effect=PermissionError("denied")) as usage:
+                preflight.check_misc(root, {}, report)
+            usage.assert_called_once_with(root)
+            self.assertEqual(report.findings[-1].severity, preflight.FAIL)
 
 
 class RecursiveSubmoduleTests(unittest.TestCase):

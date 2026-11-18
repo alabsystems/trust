@@ -111,9 +111,10 @@ pub(crate) enum ArgShape {
         ext: AbiExtension,
         /// `InReg`.
         inreg: bool,
-        /// Whether the audited register lane admits this slot: for an argument,
-        /// `scalar_register_abi_ty_supported(arg, EnumAbi::Admit)`; for the result, that or
-        /// `zext_bool_return_abi_supported`.
+        /// Trust: whether actual physical register transport is supported. This
+        /// is the legacy scalar predicate or the source-owned thin-pointer
+        /// contract; a result additionally accepts the existing bool extension.
+        /// It carries no pointee/provenance/NoUB or proof permission.
         audited: bool,
         /// Whether the slot is a single-field struct passed as that field's scalar
         /// (`direct_newtype_struct_arg_abi_supported`) whose one field is an integer, a `char`
@@ -323,6 +324,14 @@ fn arg_shape<'tcx>(tcx: TyCtxt<'tcx>, arg: &ArgAbi<'tcx, Ty<'tcx>>, audited: boo
     }
 }
 
+// Trust: physical transport and the old MIR proof fragment are distinct.
+// Keep the legacy predicate unchanged, and add only the source-owned native
+// pointer contract; the pure legalizer still checks its actual width/kind/attrs.
+fn direct_register_abi_supported<'tcx>(tcx: TyCtxt<'tcx>, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+    crate::scalar_register_abi_ty_supported(arg, crate::EnumAbi::Admit)
+        || crate::source_abi::direct_thin_pointer_transport_supported(tcx, arg)
+}
+
 /// rustc's `FnAbi` for `instance`, after the old lane's preconditions (`fn_abi_preconditions`:
 /// codegen attributes, the audited Rust/C convention, convention drift, no variadic or
 /// implicit argument, no unwinding, and `ir_param_count` arguments). The precondition's message
@@ -349,10 +358,10 @@ pub(crate) fn abi_shape_of<'tcx>(
         .args
         .iter()
         .map(|arg| {
-            arg_shape(tcx, arg, crate::scalar_register_abi_ty_supported(arg, crate::EnumAbi::Admit))
+            arg_shape(tcx, arg, direct_register_abi_supported(tcx, arg))
         })
         .collect();
-    let ret_audited = crate::scalar_register_abi_ty_supported(&fn_abi.ret, crate::EnumAbi::Admit)
+    let ret_audited = direct_register_abi_supported(tcx, &fn_abi.ret)
         || crate::zext_bool_return_abi_supported(&fn_abi.ret);
     let ret = arg_shape(tcx, &fn_abi.ret, ret_audited);
     Ok(AbiShape { conv, params, ret })

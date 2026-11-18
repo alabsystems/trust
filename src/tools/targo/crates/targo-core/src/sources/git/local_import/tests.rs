@@ -10,7 +10,6 @@ pub(super) fn private_world() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("source-")
         .permissions(std::fs::Permissions::from_mode(0o700))
-        .disable_cleanup(true)
         .tempdir_in(base)
         .unwrap()
 }
@@ -421,9 +420,6 @@ fn explicit_object_input_never_falls_back_for_missing_history_or_bad_bytes() {
 fn missing_original_objects_keep_source_revision_and_typed_cause_without_url_secrets() {
     for selected in [false, true] {
         for missing in ["commit", "blob", "parent"] {
-            if selected && missing == "parent" {
-                continue; // Stored selected DATA does not claim full history.
-            }
             let fixture = Fixture::new();
             let url = url::Url::parse(
                 "https://user-fixture:password-fixture@github.com/Source-Fixture/Dependency.git?token=query-fixture#fragment-fixture",

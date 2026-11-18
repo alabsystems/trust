@@ -100,7 +100,7 @@ fn write_ratchet(root_path: &Path, count: usize) {
 }
 
 pub fn check(root_path: &Path, tidy_ctx: TidyCtx) {
-    let mut check = tidy_ctx.start_check(CheckId::new("workspace_lints"));
+    let check = tidy_ctx.start_check(CheckId::new("workspace_lints"));
 
     for workspace in TRUST_WORKSPACES {
         let path = root_path.join(workspace);

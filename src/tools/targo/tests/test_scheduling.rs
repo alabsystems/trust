@@ -118,7 +118,10 @@ fn apple_sdk_root() -> Option<std::ffi::OsString> {
         .expect("xcrun names the SDK");
     assert!(output.status.success(), "xcrun --show-sdk-path failed");
     let path = String::from_utf8(output.stdout).unwrap().trim().to_owned();
-    assert!(Path::new(&path).is_dir(), "xcrun named no SDK directory: {path}");
+    assert!(
+        Path::new(&path).is_dir(),
+        "xcrun named no SDK directory: {path}"
+    );
     Some(path.into())
 }
 
@@ -539,6 +542,171 @@ fn managed_fixture() -> tempfile::TempDir {
     .unwrap();
     fs::write(root.path().join("src/lib.rs"), MANAGED_LIBTEST).unwrap();
     root
+}
+
+#[test]
+fn ordinary_activity_policy_executes_busy_body_and_retires_silent_body() {
+    for (body, should_pass, marker) in [
+        (
+            r#"
+            let began = std::time::Instant::now();
+            while began.elapsed() < std::time::Duration::from_secs(2) {
+                std::hint::black_box((0..1000_u64).fold(0_u64, u64::wrapping_add));
+            }
+            println!("actual-busy-harness-completed");
+        "#,
+            true,
+            "actual-busy-harness-completed",
+        ),
+        (
+            r#"
+            use std::io::Write;
+            println!("actual-silent-harness-started");
+            std::io::stdout().flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            println!("silent-harness-was-not-retired");
+        "#,
+            false,
+            "actual-silent-harness-started",
+        ),
+    ] {
+        let root = managed_fixture();
+        fs::write(
+            root.path().join("src/lib.rs"),
+            format!("#[test] fn actual_body() {{ {body} }}"),
+        )
+        .unwrap();
+        let mut declared = graph_command(root.path());
+        declared.args([
+            "--unverified",
+            "test",
+            "--offline",
+            "--lib",
+            "--config",
+            "build.test-stall-seconds=1",
+            "--",
+            "--nocapture",
+        ]);
+        // Keep this existing fixture's exact isolated compiler/environment,
+        // but supervise its owning Targo through the native capture owner.
+        // The 120s parent limit is separate from the actual 1s harness policy.
+        let mut process = cargo_util::ProcessBuilder::new(declared.get_program());
+        process
+            .args(&declared.get_args().collect::<Vec<_>>())
+            .cwd(root.path().as_os_str());
+        process.environment_snapshot(
+            cargo_util::EnvironmentInputs::from_variables(declared.get_envs().filter_map(
+                |(name, value)| value.map(|value| (name.to_owned(), value.to_owned())),
+            ))
+            .unwrap(),
+        );
+        let observed = process.exec_with_capture(
+            cargo_util::StreamingOutputLimits::new(1024 * 1024, 4 * 1024 * 1024)
+                .with_timeout(Duration::from_secs(120))
+                .with_child_exit_cleanup(),
+        );
+        assert!(observed.started && observed.complete(), "{observed:?}");
+        assert!(observed.cleanup_error.is_none(), "{observed:?}");
+        let stdout = String::from_utf8_lossy(&observed.stdout);
+        let stderr = String::from_utf8_lossy(&observed.stderr);
+        assert!(stdout.contains(marker), "{stdout}\n{stderr}");
+        assert_eq!(observed.succeeded(), should_pass, "{stdout}\n{stderr}");
+        if should_pass {
+            assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+        } else {
+            assert!(stderr.contains("inactivity window"), "{stdout}\n{stderr}");
+            assert!(
+                !stdout.contains("silent-harness-was-not-retired"),
+                "{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ordinary_narrowing_policy_preserves_config_and_resident_limits() {
+    let idle = r#"
+        use std::io::Write;
+        println!("actual-narrowing-body-started");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        println!("narrowing-body-was-not-retired");
+    "#;
+    let resident = r#"
+        use std::io::Write;
+        println!("actual-narrowing-body-started");
+        std::io::stdout().flush().unwrap();
+        let mut memory = vec![0_u8; 96 * 1024 * 1024];
+        for page in memory.chunks_mut(4096) { page[0] = 1; }
+        let began = std::time::Instant::now();
+        while began.elapsed() < std::time::Duration::from_secs(2) {
+            std::hint::black_box(&memory);
+        }
+        println!("narrowing-body-was-not-retired");
+    "#;
+    for (body, configured_seconds, requested_ms, resident_bytes, cause) in [
+        (idle, 1, 5000, None, "inactivity window"),
+        (idle, 5, 1000, None, "inactivity window"),
+        (
+            resident,
+            1,
+            5000,
+            Some(32_u64 * 1024 * 1024),
+            "resident-byte ceiling",
+        ),
+    ] {
+        let root = managed_fixture();
+        fs::write(
+            root.path().join("src/lib.rs"),
+            format!("#[test] fn actual_body() {{ {body} }}"),
+        )
+        .unwrap();
+        let mut declared = graph_command(root.path());
+        declared.args([
+            "--unverified",
+            "test",
+            "--offline",
+            "--lib",
+            "--config",
+            &format!("build.test-stall-seconds={configured_seconds}"),
+            "--resource-child-policy",
+            &serde_json::json!({
+                "version": 1, "inactivity_ms": requested_ms, "resident_bytes": resident_bytes,
+            })
+            .to_string(),
+            "--",
+            "--nocapture",
+        ]);
+        let mut process = cargo_util::ProcessBuilder::new(declared.get_program());
+        process
+            .args(&declared.get_args().collect::<Vec<_>>())
+            .cwd(root.path().as_os_str());
+        process.environment_snapshot(
+            cargo_util::EnvironmentInputs::from_variables(declared.get_envs().filter_map(
+                |(name, value)| value.map(|value| (name.to_owned(), value.to_owned())),
+            ))
+            .unwrap(),
+        );
+        let observed = process.exec_with_capture(
+            cargo_util::StreamingOutputLimits::new(1024 * 1024, 4 * 1024 * 1024)
+                .with_timeout(Duration::from_secs(120))
+                .with_child_exit_cleanup(),
+        );
+        assert!(observed.started && observed.complete(), "{observed:?}");
+        assert!(observed.cleanup_error.is_none(), "{observed:?}");
+        let stdout = String::from_utf8_lossy(&observed.stdout);
+        let stderr = String::from_utf8_lossy(&observed.stderr);
+        assert!(
+            stdout.contains("actual-narrowing-body-started"),
+            "{stdout}\n{stderr}"
+        );
+        assert!(!observed.succeeded(), "{stdout}\n{stderr}");
+        assert!(stderr.contains(cause), "{stdout}\n{stderr}");
+        assert!(
+            !stdout.contains("narrowing-body-was-not-retired"),
+            "{stdout}\n{stderr}"
+        );
+    }
 }
 
 fn native_command(root: &Path) -> Command {

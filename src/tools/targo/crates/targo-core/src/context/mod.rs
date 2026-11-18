@@ -272,6 +272,14 @@ struct RetainedTestEndpoint {
     completed: bool,
 }
 
+/// Parsed native lint context, separated by the ordinary Cargo command scope.
+/// This is argument transport only; it grants no planner/compiler authority.
+#[derive(Debug, Default)]
+pub(crate) struct NativeLintContextArgs {
+    pub global: Vec<OsString>,
+    pub command: Vec<OsString>,
+}
+
 /// Configuration information for cargo. This is not specific to a build, it is information
 /// relating to cargo itself.
 #[derive(Debug)]
@@ -898,31 +906,43 @@ impl GlobalContext {
 
     /// Replay the already parsed caller options when native lint enters its
     /// own planner. This data carries no compiler or scheduling authority.
-    pub(crate) fn native_lint_context_args(&self) -> Vec<OsString> {
+    pub(crate) fn native_lint_context_args(&self) -> NativeLintContextArgs {
         let mut args = Vec::new();
+        let mut command = Vec::new();
         if let Some(config) = &self.cli_config {
             for value in config {
-                args.extend(["--config".into(), value.into()]);
+                // Joined spelling conserves a path such as `--offline` as
+                // the required option value in the canonical child parser.
+                let mut argument = OsString::from("--config=");
+                argument.push(value);
+                args.push(argument);
             }
         }
         if let Some(flags) = &self.unstable_flags_cli {
             args.extend(flags.iter().map(|flag| OsString::from(format!("-Z{flag}"))));
         }
-        if let Some(flag) = self.offline_flag() {
+        let offline = self.offline_flag();
+        let locked = self.locked_flag();
+        if let Some(flag) = offline {
             args.push(flag.into());
         }
-        if let Some(flag) = self.locked_flag() {
-            if !args.iter().any(|arg| arg.as_os_str() == OsStr::new(flag)) {
+        // Frozen contributes both restrictions. Compare typed policy values,
+        // never argument bytes which may also be a --config operand.
+        if locked != offline {
+            if let Some(flag) = locked {
                 args.push(flag.into());
             }
         }
         if let Some(directory) = &self.target_dir {
-            args.extend([
+            command.extend([
                 "--target-dir".into(),
                 directory.as_path_unlocked().as_os_str().to_owned(),
             ]);
         }
-        args
+        NativeLintContextArgs {
+            global: args,
+            command,
+        }
     }
 
     // Trust: the compiler-content captures this command has taken.
@@ -2532,6 +2552,21 @@ impl GlobalContext {
             claim
                 .check_current()
                 .context("original fixed command admission changed")?;
+            if claim.has_original_output_member()? && claim.original_output_cwd()?.is_none() {
+                // V2 adds an explicit original output member, never a missing-
+                // worktree wildcard. Outside that member preserve the exact
+                // original source-worktree continuation check.
+                let worktree = match git2::Repository::discover(self.cwd()) {
+                    Ok(repository) => {
+                        Some(repository.path().canonicalize()?.join("build-slot.lock"))
+                    }
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+                    Err(error) => {
+                        return Err(error).context("resolve original fixed source worktree");
+                    }
+                };
+                claim.check_nested(claim.budget()?, worktree.as_deref(), false)?;
+            }
         }
         Ok(claim.as_ref())
     }

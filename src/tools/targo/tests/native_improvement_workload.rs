@@ -26,9 +26,67 @@ mod supported {
         Scenario::AmbiguousModuleRefusal,
     ];
 
+    /// Set by bootstrap's targo test step (`src/bootstrap/src/core/build_steps/test.rs`)
+    /// to the stage-N trustc it tests. Bootstrap hands this test binary its own
+    /// tool-build shim as RUSTC and RUSTC_WRAPPER, and that shim's inherited
+    /// RUSTC_REAL is the build compiler (the stage-0 seed), not the compiler
+    /// under test, so neither may select the compiler here.
+    const TESTED_RUSTC_ENV: &str = "TRUST_TARGO_TEST_TESTED_RUSTC";
+
+    /// The Cargo and compiler configuration bootstrap's `Builder::cargo` hands
+    /// its own tool build (`src/bootstrap/src/core/builder/cargo.rs`), which
+    /// this binary inherits: the tool build's compiler flags, output tree,
+    /// build policy, library metadata seed, workspace remap and unstable
+    /// switch (`RUSTC_BOOTSTRAP`; the `trust` channel admits the fixture's
+    /// unstable flags without it, as on a direct run). With every
+    /// `CARGO_PROFILE_` key (`BOOTSTRAP_CARGO_PROFILE_PREFIX`), none reaches a
+    /// descendant under bootstrap, so the fixture compiles as a direct
+    /// `targo test` run compiles it. Its build directory is set explicitly in
+    /// `run` on either path. The compiler selection is pinned separately;
+    /// bootstrap's shim context (`RUSTC_REAL`, `RUSTC_STAGE`, ...) is read by
+    /// no program a descendant runs once no shim is the compiler.
+    const BOOTSTRAP_CARGO_CONFIGURATION: [&str; 12] = [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CARGO_ENCODED_RUSTDOCFLAGS",
+        "CARGO_TARGET_DIR",
+        "CARGO_INCREMENTAL",
+        "CARGO_BUILD_WARNINGS",
+        "CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT",
+        "CARGO_UNSTABLE_FINE_GRAIN_LOCKING",
+        "__CARGO_DEFAULT_LIB_METADATA",
+        "__CARGO_RUSTC_BOOTSTRAP_WS_REMAP",
+        "RUSTC_BOOTSTRAP",
+    ];
+
+    /// Bootstrap sets the tool build's profile through `CARGO_PROFILE_<P>_*`
+    /// (`cargo_profile_var`: strip, debug, opt-level, debug-assertions,
+    /// overflow-checks, codegen-units), and with `rust.optimize = false` they
+    /// are DEV keys, the fixture's own profile. Under bootstrap every key of
+    /// this prefix is removed from every descendant.
+    const BOOTSTRAP_CARGO_PROFILE_PREFIX: &str = "CARGO_PROFILE_";
+
+    fn bootstrap_configuration_key(key: &str) -> bool {
+        BOOTSTRAP_CARGO_CONFIGURATION.contains(&key)
+            || key.starts_with(BOOTSTRAP_CARGO_PROFILE_PREFIX)
+    }
+
+    /// The flag the unverified lane itself appends to every native build's
+    /// rustc flags (`targo_core`'s `TRUST_TARGO_LANE` documentation): a direct
+    /// `targo --unverified build` records it too.
+    const UNVERIFIED_LANE_FLAG: &str = "-Ztrust-verify=off";
+
     struct Originals {
         scheduler: Option<Jobserver>,
         fixed: Option<InheritedFixedClaim>,
+        compiler: std::ffi::OsString,
+        /// Whether bootstrap's targo test step named the compiler under test.
+        bootstrap: bool,
+        /// The bootstrap tool build's own rustc flags, inherited by this binary
+        /// and removed from every descendant (`BOOTSTRAP_CARGO_CONFIGURATION`).
+        /// Empty on a direct run, which keeps its environment.
+        bootstrap_rustflags: Vec<String>,
     }
 
     pub fn main() -> Result<()> {
@@ -73,18 +131,64 @@ mod supported {
                 Ok::<_, std::io::Error>(scheduler)
             })
             .transpose()?;
-        let originals = Originals { scheduler, fixed };
-        let compiler =
-            std::env::var_os("RUSTC").context("an explicit genuine Trust compiler is required")?;
+        // Under bootstrap the step names the tested compiler; the inherited
+        // RUSTC, wrappers and tool-build Cargo configuration are bootstrap's
+        // own and reach no descendant (`command` sets RUSTC and removes the
+        // rest). A direct run must select the compiler itself, with no wrapper.
+        let bootstrap = std::env::var_os(TESTED_RUSTC_ENV).is_some();
+        let compiler = match std::env::var_os(TESTED_RUSTC_ENV) {
+            Some(tested) => {
+                ensure!(
+                    Path::new(&tested).is_absolute(),
+                    "{TESTED_RUSTC_ENV} must name the actual absolute compiler under test"
+                );
+                tested
+            }
+            None => {
+                let compiler = std::env::var_os("RUSTC")
+                    .context("an explicit genuine Trust compiler is required")?;
+                ensure!(
+                    Path::new(&compiler).is_absolute(),
+                    "RUSTC must select the actual absolute compiler"
+                );
+                ensure!(
+                    std::env::var_os("RUSTC_WRAPPER").is_none()
+                        && std::env::var_os("RUSTC_WORKSPACE_WRAPPER").is_none(),
+                    "this genuine compiler regression does not admit compiler wrappers"
+                );
+                compiler
+            }
+        };
+        // Cargo reads CARGO_ENCODED_RUSTFLAGS (0x1f-separated) before RUSTFLAGS.
+        let bootstrap_rustflags = if bootstrap {
+            match std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+                Ok(encoded) => encoded
+                    .split('\x1f')
+                    .filter(|flag| !flag.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                Err(_) => std::env::var("RUSTFLAGS")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect(),
+            }
+        } else {
+            Vec::new()
+        };
+        // The leak check below compares receipts against these flags; with
+        // none inherited it would compare against nothing and pass vacuously.
         ensure!(
-            Path::new(&compiler).is_absolute(),
-            "RUSTC must select the actual absolute compiler"
+            !bootstrap || !bootstrap_rustflags.is_empty(),
+            "under bootstrap this binary inherited no tool-build rustflags, so the fixture's flag-leak check would check nothing"
         );
-        ensure!(
-            std::env::var_os("RUSTC_WRAPPER").is_none()
-                && std::env::var_os("RUSTC_WORKSPACE_WRAPPER").is_none(),
-            "this genuine compiler regression does not admit compiler wrappers"
-        );
+        let originals = Originals {
+            scheduler,
+            fixed,
+            compiler,
+            bootstrap,
+            bootstrap_rustflags,
+        };
         // The world is retained under this checkout's ignored `.ubd/` area,
         // never as an untracked directory of the source tree
         // (TARGO-TEST-TMP-HYGIENE-1; `tests/fixture_retention.rs`).
@@ -136,14 +240,24 @@ mod supported {
             captured.succeeded(),
             "selected image is not runnable genuine Targo: {captured:?}"
         );
-        ensure!(
-            captured.stdout.starts_with(b"targo ")
-                && captured.stdout.windows(7).any(|part| part == b"(targo)"),
-            "selected image did not identify the native Targo frontend"
+        // The frontend's brand rule (`src/bin/cargo/cli.rs`, `brand`): a build
+        // that binds CFG_TRUST_VERSION, as bootstrap does, says `(targo <version>)`,
+        // and one that does not says `(targo)`. This target compiles in the
+        // same Targo build as the binary, so it reads the same binding.
+        let brand = option_env!("CFG_TRUST_VERSION").map_or_else(
+            || " (targo)".to_owned(),
+            |version| format!(" (targo {version})"),
         );
-        let compiler =
-            std::env::var_os("RUSTC").context("actual compiler selection disappeared")?;
-        let mut version = command(Path::new(&compiler), root, originals)?;
+        let banner = captured
+            .stdout
+            .split(|&byte| byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        ensure!(
+            banner.starts_with(b"targo ") && banner.ends_with(brand.as_bytes()),
+            "selected image did not identify the native Targo frontend (expected brand `{brand}`)"
+        );
+        let mut version = command(Path::new(&originals.compiler), root, originals)?;
         version.arg("-vV");
         let captured = capture(
             &version,
@@ -159,6 +273,23 @@ mod supported {
                     .any(|line| line.starts_with(b"trust: ")),
             "selected compiler did not identify the actual Trust toolchain: {captured:?}"
         );
+        if originals.bootstrap {
+            // The stage-N trustc this step tests and this Targo build bind one
+            // CFG_TRUST_VERSION (bootstrap's `trust_version`, set for the
+            // compiler in compile.rs and for this tool in tool.rs). The stage-0
+            // seed, or a compiler of another build, names a different identity
+            // (a seed's carries its own `+g<sha>`), so any other selection fails.
+            let identity = option_env!("CFG_TRUST_VERSION")
+                .context("bootstrap built this target without CFG_TRUST_VERSION")?;
+            let expected = format!("trust: {identity}");
+            ensure!(
+                captured
+                    .stdout
+                    .split(|&byte| byte == b'\n')
+                    .any(|line| line == expected.as_bytes()),
+                "{TESTED_RUSTC_ENV} did not select the compiler this build tests (expected `{expected}`): {captured:?}"
+            );
+        }
 
         for scenario in SCENARIOS {
             match scenario {
@@ -224,6 +355,10 @@ mod supported {
                     "--target-dir",
                 ])
                 .arg(&target)
+                // Intermediates and receipts stay in this world: an inherited
+                // build directory (bootstrap sets its tool tree's) would
+                // otherwise receive them, where nothing removes them.
+                .env("CARGO_BUILD_BUILD_DIR", &target)
                 .env("CARGO_HOME", &home)
                 .env("CARGO_CACHE_RUSTC_INFO", "0");
             if !scenario.features().is_empty() {
@@ -292,12 +427,56 @@ mod supported {
                 }
             }
         }
+        receipts_stayed_in_world(&target, originals)?;
         fs::write(
             root.join("executed-population.txt"),
             "five serial scenarios: cold, warm, preserved-mtime source change, feature change, ambiguous-module refusal\ntwelve independent app executions: four successful scenarios times arguments 0,17,251\nconcurrent consumers: not exercised by this serial integration target\nproof obligations: none; candidate coordinator: not exercised; compiler execution counts: not measured\n",
         )?;
         eprintln!(
             "native improvement workload: 5 serial scenarios and 12 actual app executions passed"
+        );
+        Ok(())
+    }
+
+    /// Every fixture build wrote its build receipt (`<build-dir>/.targo-receipts`)
+    /// into this world's target, so its intermediates did too; and under
+    /// bootstrap no receipt records a flag of the tool build's own rustc
+    /// flags, so the fixture compiled as a direct run compiles it.
+    fn receipts_stayed_in_world(target: &Path, originals: &Originals) -> Result<()> {
+        let mut receipts = 0usize;
+        for entry in fs::read_dir(target.join(".targo-receipts"))
+            .context("the fixture builds left no receipt in this world's build directory")?
+        {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            receipts += 1;
+            let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+            let roots = receipt["selection"]["roots"]
+                .as_array()
+                .with_context(|| format!("receipt {} has no selected roots", path.display()))?;
+            for root in roots {
+                let leaked = root["rustflags"]
+                    .as_array()
+                    .with_context(|| format!("receipt {} root has no rustflags", path.display()))?
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|flag| {
+                        *flag != UNVERIFIED_LANE_FLAG
+                            && originals.bootstrap_rustflags.iter().any(|own| own == flag)
+                    })
+                    .collect::<Vec<_>>();
+                ensure!(
+                    leaked.is_empty(),
+                    "the fixture compiled with bootstrap's tool-build flags {leaked:?} ({})",
+                    path.display()
+                );
+            }
+        }
+        ensure!(
+            receipts > 0,
+            "the fixture builds left no receipt in this world's build directory"
         );
         Ok(())
     }
@@ -317,8 +496,38 @@ mod supported {
                 )
                 .env(FIXED_HANDOFF_ENV, "requires-live-ancestor-v1");
         }
-        // Keep ordinary environment, fixed/native couriers, actual compiler,
-        // linker and selected GNU descriptions. No blanket env_clear/removal.
+        // Keep ordinary environment, fixed/native couriers, linker and selected
+        // GNU descriptions. No blanket env_clear/removal: only the compiler
+        // selection is pinned to the one main selected, with no wrapper, so a
+        // bootstrap shim this binary inherited never compiles the fixture, and
+        // under bootstrap its tool build's Cargo configuration is removed.
+        command
+            .env("RUSTC", &originals.compiler)
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER");
+        if originals.bootstrap {
+            for key in BOOTSTRAP_CARGO_CONFIGURATION {
+                command.env_remove(key);
+            }
+            for (key, _) in std::env::vars_os() {
+                if let Some(key) = key.to_str()
+                    && bootstrap_configuration_key(key)
+                {
+                    command.env_remove(key);
+                }
+            }
+            // The environment the child actually receives, not the removals
+            // asked for: no bootstrap configuration key may remain in it.
+            let reached = command
+                .get_effective_envs()?
+                .into_keys()
+                .filter(|key| key.to_str().is_some_and(bootstrap_configuration_key))
+                .collect::<Vec<_>>();
+            ensure!(
+                reached.is_empty(),
+                "bootstrap's tool-build configuration {reached:?} would reach the fixture"
+            );
+        }
         Ok(command)
     }
 

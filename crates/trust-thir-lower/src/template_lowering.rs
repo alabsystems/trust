@@ -54,12 +54,12 @@ use rustc_middle::thir::{BodyTy, ExprId, Thir};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::LocalDefId;
 use trust_ir::template::{
-    TEMPLATE_BODY_NAME, Template, TemplateError, TemplateHeader, TemplateParam,
-    HoleDef, HoleKind, TemplateArg, hole_row_name,
+    HoleDef, HoleKind, TEMPLATE_BODY_NAME, Template, TemplateArg, TemplateError, TemplateHeader,
+    TemplateParam, hole_row_name,
 };
 use trust_ir::{
-    Constant, ConstantG, DialectTy, FatPtrKind, FuncId, FuncTy, FuncTyId, HoleId, Module, ModuleG, ParamId,
-    TemplateRef, Ty, TyG, TyId,
+    Constant, ConstantG, DialectTy, FatPtrKind, FuncId, FuncTy, FuncTyId, HoleId, Module, ModuleG,
+    ParamId, TemplateRef, Ty, TyG, TyId,
 };
 use trust_ir_build::template::TemplateViolation;
 
@@ -109,12 +109,13 @@ pub struct CalleeHole {
     pub dependencies: Vec<(u32, TemplateArg)>,
 }
 
-/// A type requested from an actual Rust source type. Its opaque contract permits
-/// transport only; it supplies no field, width, layout or destructor judgement.
+/// A type requested from an actual Rust source type. Its retained contract
+/// constrains representation; it grants no source or destructor judgement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeHole {
     pub id: HoleId,
     pub key: crate::template_key::HoleKey,
+    pub contract: trust_ir::template::TypeContract,
     pub dependencies: Vec<(u32, TemplateArg)>,
 }
 
@@ -285,12 +286,30 @@ fn dialect_sentinel(d: &DialectTy) -> Sentinel {
     if d.namespace != SENTINEL_NAMESPACE {
         return Sentinel::Foreign;
     }
-    if d.version != SENTINEL_VERSION { return Sentinel::Malformed; }
+    if d.version != SENTINEL_VERSION {
+        return Sentinel::Malformed;
+    }
     if let Some(p) = sentinel_index(&d.name, TYPE_PARAM_SENTINEL_PREFIX) {
         Sentinel::Param(p)
     } else if let Some(h) = sentinel_index(&d.name, TYPE_HOLE_SENTINEL_PREFIX) {
         Sentinel::Hole(h)
-    } else { Sentinel::Malformed }
+    } else {
+        Sentinel::Malformed
+    }
+}
+
+/// The spelling alone is insufficient: this lane must own the exact hole
+/// under the exact thin-pointer representation contract.
+pub(crate) fn is_thin_pointer_hole(ty: &Ty, holes: &[TypeHole]) -> bool {
+    let Ty::Dialect(d) = ty else {
+        return false;
+    };
+    let Sentinel::Hole(index) = dialect_sentinel(d) else {
+        return false;
+    };
+    holes.iter().any(|hole| {
+        hole.id.index() == index && hole.contract == trust_ir::template::TypeContract::ThinPointer
+    })
 }
 
 fn symbol_sentinel(c: &Constant) -> Sentinel {
@@ -322,22 +341,27 @@ fn constant_mentions_sentinel(c: &Constant) -> bool {
         ConstantG::Int(_)
         | ConstantG::U128(_)
         | ConstantG::Bytes { .. }
+        // Content digest and literal extents contain no generic sentinel.
+        // Tensor weights are refused separately by constant_untransported_carrier.
+        | ConstantG::TensorBlob { .. }
         | ConstantG::Float(_)
         | ConstantG::Bool(_)
         | ConstantG::FnDef(_)
+        // Nominal function identity contains no textual parameter sentinel.
+        | ConstantG::FnItem(_)
         | ConstantG::PhantomData
-        | ConstantG::Uninit
-        // A trust-ir v70 weight names its bytes by digest, never by symbol, so it spells no
-        // sentinel. It is refused by name on its own (`constant_names_tensor_blob`).
-        | ConstantG::TensorBlob { .. } => false,
+        | ConstantG::Uninit => false,
         ConstantG::Ext(never) => match *never {},
     }
 }
 
-/// The name of a trust-ir v67-v69 tensor instruction, or `None` for any other instruction.
-fn tensor_inst_name(inst: &trust_ir::Inst) -> Option<&'static str> {
+/// Carriers whose tensor semantics or box-validity facts this template lane cannot transport.
+fn template_inst_refusal(inst: &trust_ir::Inst) -> Option<String> {
     use trust_ir::Inst;
-    Some(match inst {
+    let name = match inst {
+        Inst::BoxDeref { .. } => {
+            return Some("a Box deref in a template".to_string());
+        }
         Inst::TensorContract { .. } => "TensorContract",
         Inst::TensorMap { .. } => "TensorMap",
         Inst::TensorReduce { .. } => "TensorReduce",
@@ -345,15 +369,22 @@ fn tensor_inst_name(inst: &trust_ir::Inst) -> Option<&'static str> {
         Inst::TensorGather { .. } => "TensorGather",
         Inst::TensorScatter { .. } => "TensorScatter",
         _ => return None,
-    })
+    };
+    Some(format!("a tensor instruction `{name}` in a template"))
 }
 
-/// Does `c` (the root or any child) carry a trust-ir v70 `Constant::TensorBlob`? A template
-/// carries no blob table (the escape check requires it empty), so such a constant could only
-/// dangle: the lane refuses it by name wherever it meets one.
-fn constant_names_tensor_blob(c: &Constant) -> bool {
-    let mut found = false;
-    c.visit_constants(|child| found |= matches!(child, ConstantG::TensorBlob { .. }));
+/// Blob tables need a transport owner not supplied by this lane.
+/// Function-item identities use the maintained module/template function relocation owner.
+fn constant_untransported_carrier(c: &Constant) -> Option<&'static str> {
+    let mut found = None;
+    c.visit_constants(|child| {
+        if found.is_none() {
+            found = match child {
+                ConstantG::TensorBlob { .. } => Some("tensor weight blob"),
+                _ => None,
+            };
+        }
+    });
     found
 }
 
@@ -401,6 +432,8 @@ impl<'m> SentinelWalk<'m> {
 
     fn ty(&mut self, ty: &Ty) -> bool {
         match ty {
+            // Module-local function IDs are transported by the existing template owner.
+            TyG::FnItem(_) => false,
             TyG::Dialect(d) => d.namespace == SENTINEL_NAMESPACE,
             TyG::Vector(inner, _)
             | TyG::Ref(inner)
@@ -451,6 +484,8 @@ impl<'m> SentinelWalk<'m> {
             | TyG::Never
             // Geometry has no type children, row ids or generic sentinels.
             | TyG::Storage(_)
+            // A nominal function identity has no type children or sentinel spelling.
+            | TyG::FnItem(_)
             // A struct, enum, record or closure row is checked as a row of its own table.
             | TyG::Struct(_)
             | TyG::Enum(_)
@@ -582,15 +617,13 @@ fn escape_check(sentinel: &Module, facts: &LaneFacts) -> Result<(), EntryRefusal
     }
     // trust-ir v67-v69 tensor instructions, named whatever type they are spelled at (the level
     // map refuses a tensor-typed one through `abstract_ty`): no 6.5.1 rule carries them.
-    if let Some(name) = functions
+    if let Some(reason) = functions
         .iter()
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.body)
-        .find_map(|node| tensor_inst_name(&node.inst))
+        .find_map(|node| template_inst_refusal(&node.inst))
     {
-        return Err(EntryRefusal::TemplateUnsupported(format!(
-            "a tensor instruction `{name}` in a template"
-        )));
+        return Err(EntryRefusal::TemplateUnsupported(reason));
     }
     if structs.iter().any(|row| row.origin.is_some())
         || enums.iter().any(|row| row.origin.is_some())
@@ -674,11 +707,16 @@ fn escape_check(sentinel: &Module, facts: &LaneFacts) -> Result<(), EntryRefusal
             "a tensor type in a template table".to_string(),
         ));
     }
-    if globals.iter().any(|g| g.initializer.as_ref().is_some_and(constant_names_tensor_blob)) {
-        return Err(EntryRefusal::TemplateUnsupported(
-            "a tensor weight blob in a template global initializer".to_string(),
-        ));
+    if let Some(kind) = globals
+        .iter()
+        .filter_map(|g| g.initializer.as_ref())
+        .find_map(constant_untransported_carrier)
+    {
+        return Err(EntryRefusal::TemplateUnsupported(format!(
+            "a {kind} in a template global initializer"
+        )));
     }
+
     if !facts.param_adt_structs.is_empty() || !facts.param_adt_enums.is_empty() {
         return Err(EntryRefusal::TemplateUnsupported(
             "parameter-dependent ADT row (6.5.2)".to_string(),
@@ -759,6 +797,7 @@ fn abstract_ty(ty: &Ty, facts: &LaneFacts) -> Result<TyG<TemplateRef>, EntryRefu
         TyG::Struct(id) => TyG::Struct(*id),
         TyG::Array(row, len) => TyG::Array(*row, *len),
         TyG::Enum(id) => TyG::Enum(*id),
+        TyG::FnItem(id) => TyG::FnItem(*id),
         TyG::Func(id) => TyG::Func(*id),
         TyG::Set(row, repr) => TyG::Set(*row, *repr),
         TyG::Sequence(row) => TyG::Sequence(*row),
@@ -802,15 +841,18 @@ fn abstract_root_const(
                 "the sentinel of parameter ${p}, which the lane does not carry"
             ))),
         },
-        Sentinel::Malformed | Sentinel::Hole(_) => Err(invalid("a malformed const sentinel".to_string())),
+        Sentinel::Malformed | Sentinel::Hole(_) => {
+            Err(invalid("a malformed const sentinel".to_string()))
+        }
         Sentinel::Foreign if constant_mentions_sentinel(c) => {
             Err(invalid("a const sentinel inside an aggregate constant".to_string()))
         }
-        // A trust-ir v70 weight blob names bytes in a table a template does not carry.
-        Sentinel::Foreign if constant_names_tensor_blob(c) => Err(EntryRefusal::TemplateUnsupported(
-            "a tensor weight blob constant in a template".to_string(),
-        )),
-        Sentinel::Foreign => Ok(c.embed()),
+        Sentinel::Foreign => match constant_untransported_carrier(c) {
+            Some(kind) => {
+                Err(EntryRefusal::TemplateUnsupported(format!("a {kind} constant in a template")))
+            }
+            None => Ok(c.embed()),
+        },
     }
 }
 
@@ -881,24 +923,34 @@ fn finish_template(
             return Err(invalid("callee holes have no owner or duplicate declarations".into()));
         }
         check_key_dependencies(facts, &hole.key, &hole.dependencies)?;
-        insert_hole(&mut holes, hole.id, HoleDef {
-            kind: HoleKind::Callee { decl: hole.decl },
-            key: crate::template_key::encode(&hole.key).map_err(|e| invalid(e.to_string()))?,
-            args: hole.dependencies.iter().map(|(_, a)| a.clone()).collect(),
-        })?;
+        insert_hole(
+            &mut holes,
+            hole.id,
+            HoleDef {
+                kind: HoleKind::Callee { decl: hole.decl },
+                key: crate::template_key::encode(&hole.key).map_err(|e| invalid(e.to_string()))?,
+                args: hole.dependencies.iter().map(|(_, a)| a.clone()).collect(),
+            },
+        )?;
     }
     for hole in &facts.type_holes {
         if facts.owner.is_none() || !matches!(hole.key, crate::template_key::HoleKey::Type(_)) {
             return Err(invalid("type hole has no owner or has a non-type key".into()));
         }
         check_key_dependencies(facts, &hole.key, &hole.dependencies)?;
-        insert_hole(&mut holes, hole.id, HoleDef {
-            kind: HoleKind::Type { contract: trust_ir::template::TypeContract::Opaque },
-            key: crate::template_key::encode(&hole.key).map_err(|e| invalid(e.to_string()))?,
-            args: hole.dependencies.iter().map(|(_, a)| a.clone()).collect(),
-        })?;
+        insert_hole(
+            &mut holes,
+            hole.id,
+            HoleDef {
+                kind: HoleKind::Type { contract: hole.contract.clone() },
+                key: crate::template_key::encode(&hole.key).map_err(|e| invalid(e.to_string()))?,
+                args: hole.dependencies.iter().map(|(_, a)| a.clone()).collect(),
+            },
+        )?;
     }
-    let holes = holes.into_iter().map(|h| h.ok_or_else(|| invalid("hole IDs are not dense".into())))
+    let holes = holes
+        .into_iter()
+        .map(|h| h.ok_or_else(|| invalid("hole IDs are not dense".into())))
         .collect::<Result<_, _>>()?;
     Ok(Template {
         header: TemplateHeader { identity, params: header_params(facts), holes },
@@ -906,9 +958,16 @@ fn finish_template(
     })
 }
 
-fn insert_hole(holes: &mut [Option<HoleDef>], id: HoleId, hole: HoleDef) -> Result<(), EntryRefusal> {
-    let slot = holes.get_mut(id.as_usize()).ok_or_else(|| invalid("hole ID is out of range".into()))?;
-    if slot.replace(hole).is_some() { return Err(invalid("duplicate hole ID".into())); }
+fn insert_hole(
+    holes: &mut [Option<HoleDef>],
+    id: HoleId,
+    hole: HoleDef,
+) -> Result<(), EntryRefusal> {
+    let slot =
+        holes.get_mut(id.as_usize()).ok_or_else(|| invalid("hole ID is out of range".into()))?;
+    if slot.replace(hole).is_some() {
+        return Err(invalid("duplicate hole ID".into()));
+    }
     Ok(())
 }
 
@@ -921,17 +980,26 @@ fn check_key_dependencies(
 ) -> Result<(), EntryRefusal> {
     if facts.parameter_indices.len() != facts.params.len()
         || facts.parameter_indices.windows(2).any(|w| w[0] >= w[1])
-    { return Err(invalid("hole key parameter map is not owner ordered".into())); }
+    {
+        return Err(invalid("hole key parameter map is not owner ordered".into()));
+    }
     let indices = crate::template_key::parameters(key).map_err(|e| invalid(e.to_string()))?;
-    if indices.is_empty() { return Err(invalid("a source hole has no owner parameter dependency".into())); }
+    if indices.is_empty() {
+        return Err(invalid("a source hole has no owner parameter dependency".into()));
+    }
     let mut expected = Vec::with_capacity(indices.len());
     for index in indices {
-        let p = facts.parameter_indices.iter().position(|i| *i == index)
+        let p = facts
+            .parameter_indices
+            .iter()
+            .position(|i| *i == index)
             .ok_or_else(|| invalid("hole key parameter is outside its owner map".into()))?;
         let param = TemplateRef::Param(ParamId::new(p as u32));
         let arg = match &facts.params[p] {
             LaneParam::Type => TemplateArg::Type(TyG::Ext(param)),
-            LaneParam::Const(ty) => TemplateArg::Const { value: ConstantG::Ext(param), ty: ty.clone() },
+            LaneParam::Const(ty) => {
+                TemplateArg::Const { value: ConstantG::Ext(param), ty: ty.clone() }
+            }
         };
         expected.push((index, arg));
     }
@@ -1154,7 +1222,10 @@ struct SourceCapture<'tcx> {
 }
 
 fn lower_stored<'tcx>(
-    tcx: TyCtxt<'tcx>, def: LocalDefId, thir: &Thir<'tcx>, root: ExprId,
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    thir: &Thir<'tcx>,
+    root: ExprId,
 ) -> Option<StoredTemplate> {
     let source = lower_capture(tcx, def, thir, root)?;
     Some(match source.lowered {
@@ -1164,7 +1235,10 @@ fn lower_stored<'tcx>(
 }
 
 fn lower_capture<'tcx>(
-    tcx: TyCtxt<'tcx>, def: LocalDefId, thir: &Thir<'tcx>, root: ExprId,
+    tcx: TyCtxt<'tcx>,
+    def: LocalDefId,
+    thir: &Thir<'tcx>,
+    root: ExprId,
 ) -> Option<SourceCapture<'tcx>> {
     let params = template_params(tcx, def);
     let body_kind = body_kind_of(tcx, def, thir);

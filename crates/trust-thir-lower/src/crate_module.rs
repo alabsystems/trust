@@ -8479,9 +8479,12 @@ fn assemble(
                 Err(error) => { table_refusals.push(format!("closure adapter signature: {error}")); continue; }
             };
             let ct = &module.closure_types[closure.as_usize()];
-            let name = format!("{}__trust_closure_adapter_{}", f.name, original.id.index());
+            // Trust: preserve a real empty ClosureOnce shim symbol minted from
+            // its rustc Instance. Captured adapters keep their private protocol name.
+            let name = if shape.borrowed_zero { original.name.clone() }
+                else { format!("{}__trust_closure_adapter_{}", f.name, original.id.index()) };
             let mut adapter = crate::closure_adapter::build(original.id, signature, name,
-                crate::closure_adapter::Shape { closure, body: shape.body }, ct, &apparent).unwrap();
+                crate::closure_adapter::Shape { closure, body: shape.body, borrowed_zero: shape.borrowed_zero }, ct, &apparent).unwrap();
             // Keep original IDs through the common operand rewrite below.
             adapter.id = adapter_ids[&(r.def_index, original.id)];
             adapters.push(adapter);
@@ -9735,7 +9738,7 @@ fn splice_refusal(r: &BodyRecord, records: &[BodyRecord]) -> Option<SpliceRefusa
         let Some(target) = targets.next() else { return Some(SpliceRefusal::ClosureAdapter); };
         let closure = &r.closure_types[shape.closure.as_usize()];
         let apparent = &r.func_types[closure.func.as_usize()];
-        let mut expected = vec![Ty::Closure(shape.closure)];
+        let mut expected = vec![if shape.borrowed_zero { Ty::Ptr } else { Ty::Closure(shape.closure) }];
         expected.extend(apparent.params.iter().cloned());
         if targets.next().is_some() || !target.is_local || target.force_havoc
             || !target.params.signature().is_some_and(|actual| actual == expected.as_slice())
@@ -9781,14 +9784,16 @@ fn splice_refusal(r: &BodyRecord, records: &[BodyRecord]) -> Option<SpliceRefusa
     }
     // Trust (B6): closure-type table — the `func` id must index the body's own
     // func_types snapshot (with table-free params/returns, re-interned at splice),
-    // and every capture must be table-free (the producer's thin-capture gate,
-    // CHECKED here, never assumed).
+    // and every capture must be table-free or name a strictly-earlier closure
+    // row. The latter preserves the concrete producer's nested FnOnce capture
+    // graph: all dependencies are checked before their owner and can be remapped
+    // through the already-built prefix, never through a forward/cyclic guess.
     // Trust (2026-09-23): `table_free_as_tuple_spelled`, not bare `ty_table_free`, for the
     // closure's call signature — a param `[(u8, u8); 2]` was table-free as
     // `Ty::Tuple([(u8, u8); 2])` and is a first-class `Ty::Array` now; the closure map in pass 1
     // remaps it through the types map either way.
     let tuple_spelled = tuple_spelled_table_free_entries(r);
-    for ct in &r.closure_types {
+    for (index, ct) in r.closure_types.iter().enumerate() {
         let func_ok = r.func_types.get(ct.func.as_usize()).is_some_and(|ft| {
             !ft.is_vararg
                 && ft
@@ -9797,7 +9802,10 @@ fn splice_refusal(r: &BodyRecord, records: &[BodyRecord]) -> Option<SpliceRefusa
                     .chain(ft.returns.iter())
                     .all(|t| table_free_as_tuple_spelled(r, t, &tuple_spelled))
         });
-        if !func_ok || !ct.captures.iter().all(ty_table_free) {
+        if !func_ok || !ct.captures.iter().all(|capture| match capture {
+            Ty::Closure(id) => id.as_usize() < index,
+            _ => ty_table_free(capture),
+        }) {
             return Some(SpliceRefusal::ClosureTable);
         }
     }
@@ -9944,7 +9952,7 @@ fn ty_spliceable(r: &BodyRecord, ty: &Ty) -> bool {
         Ty::Array(tid, _) => tid.as_usize() < r.types.len(),
         // Trust (B6): a first-class closure type is spliceable iff its id indexes the
         // body's closure_types snapshot (the table's own invariants — func in range,
-        // table-free captures — are checked once in `splice_ok`).
+        // ordered capture dependencies — are checked once in `splice_ok`).
         Ty::Closure(cid) => cid.as_usize() < r.closure_types.len(),
         // Trust (B2): a slice fat pointer is spliceable iff its element id indexes
         // the body's types snapshot (remapped in pass 1); id-less fat kinds fall to
@@ -11468,9 +11476,9 @@ fn prepare_body_tables(
     }
     // Trust (B6): closure-type table — after types (a ClosureTy's captures may reference
     // structs/types entries; its `func` indexes the BODY's func_types table and is
-    // re-interned into the assembled module here). Captures are table-free by the
-    // producer's thin-capture gate — re-checked in `splice_ok`, remapped defensively
-    // anyway (a `?`-decline refuses the body, never a guess).
+    // re-interned into the assembled module here). Captures satisfy the
+    // producer's scalar/thin-or-earlier-closure gate — re-checked in `splice_ok`,
+    // remapped defensively anyway (a `?`-decline refuses the body, never a guess).
     let mut closure_map: Vec<trust_ir::ClosureTyId> = Vec::with_capacity(r.closure_types.len());
     let mut closure_interner = crate::closure_layout::Interner::default();
     for (index, ct) in r.closure_types.iter().enumerate() {

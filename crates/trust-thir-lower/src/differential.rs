@@ -692,7 +692,13 @@ fn constant_materializes_uncomparable_identity(value: &Constant) -> bool {
         // Function and symbol identities are module/linker-local. Equal numeric `FuncId`s (or
         // equal synthetic interpreter addresses) across independently-built modules do not prove
         // that the referenced definitions are the same program object.
-        Constant::Closure { .. } | Constant::FnDef(_) | Constant::SymbolAddr { .. } => true,
+        Constant::Closure { .. }
+        | Constant::FnDef(_)
+        | Constant::FnItem(_)
+        | Constant::SymbolAddr { .. }
+        // Tensor inputs additionally need their module blob-table binding;
+        // a constant's digest/shape alone does not establish this oracle scope.
+        | Constant::TensorBlob { .. } => true,
         Constant::Aggregate(values)
         | Constant::Array(values)
         | Constant::Vector(values)
@@ -712,11 +718,6 @@ fn constant_materializes_uncomparable_identity(value: &Constant) -> bool {
         | Constant::PhantomData
         // v49 unwritten lane: no identity of any kind.
         | Constant::Uninit => false,
-        // Trust: a trust-ir v70 tensor weight names its bytes by digest in each module's
-        // own blob table. This comparator never compares the two tables, and neither
-        // producer mints a blob, so a body holding one is outside what it has been
-        // qualified on: held as uncomparable (coverage-only), never sampled.
-        Constant::TensorBlob { .. } => true,
         // Level R (trust-ir amendment S): a module constant has no extension.
         Constant::Ext(e) => e.unreachable(),
     }
@@ -3698,6 +3699,13 @@ fn tys_agree(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) -> Result<boo
              B6 migration residue)"
                 .to_string())
         }
+        // trust-ir v73: a `Ty::FnItem(func)` names its function by a module-local
+        // `FuncId`, minted independently by each module, so equal raw ids do not prove
+        // the same program object (the `FnDef` value refusal in `value_agree`). Either
+        // side, any pairing: coverage-only, never the raw-equality leaf below.
+        (Ty::FnItem(_), _) | (_, Ty::FnItem(_)) => {
+            Err("function-item identity comparison is not modeled".to_string())
+        }
         (Ty::Sequence(_), Ty::Sequence(_)) => {
             Err("sequence-typed comparison not modeled".to_string())
         }
@@ -3925,6 +3933,9 @@ fn value_agree(
         | (_, InterpretValueKind::Closure { .. })
         | (InterpretValueKind::FnDef(_), _)
         | (_, InterpretValueKind::FnDef(_))
+        // trust-ir v73: a function item's value names its `FuncId` exactly as `FnDef` does.
+        | (InterpretValueKind::FnItem(_), _)
+        | (_, InterpretValueKind::FnItem(_))
         // Trust (2026-09-20): `Frame` became a STRUCT variant (it carries
         // `lineage`) in the trust-ir the pin moved to. `{ .. }` matches exactly
         // the set `(_)` did, so this arm's meaning is unchanged — every frame
@@ -11462,6 +11473,29 @@ mod tests {
     }
 
     #[test]
+    fn compare_entries_nominal_function_items_need_definition_correspondence() {
+        let mut thir = returned_fndef_module("nominal_thir", 11);
+        let mut oracle = returned_fndef_module("nominal_oracle", 29);
+        for module in [&mut thir, &mut oracle] {
+            module.func_types[1].returns = vec![Ty::FnItem(FuncId::new(1))];
+            module.functions[0].blocks[0].body[0].inst = Inst::Const {
+                ty: Ty::FnItem(FuncId::new(1)),
+                value: Constant::FnItem(FuncId::new(1)),
+            };
+        }
+        let thir_out = Interpreter::with_module(&thir)
+            .execute_func(FuncId::new(0), vec![])
+            .expect("THIR nominal item interprets");
+        let oracle_out = Interpreter::with_module(&oracle)
+            .execute_func(FuncId::new(0), vec![])
+            .expect("oracle nominal item interprets");
+        assert_eq!(thir_out.returns, oracle_out.returns);
+        let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(report.mode, DiffMode::NotRun, "{:?}", report.notes);
+        assert!(!report.equal, "equal local nominal IDs cannot establish source agreement");
+    }
+
+    #[test]
     fn callable_gap_does_not_mask_later_return_or_sample_divergence() {
         let thir = sampled_callable_and_scalar_module("callable_sample_thir", 11);
         let oracle = sampled_callable_and_scalar_module("callable_sample_oracle", 29);
@@ -11921,14 +11955,19 @@ mod tests {
 
         let module = Module::new("frame_identity");
         // Trust (2026-09-20): `Frame` is a STRUCT variant in the trust-ir this
-        // tree now pins — `{ lineage, slots }` where the handle carries its own
+        // tree now pins — `{ lineage, origin, slots }` where the handle carries its own
         // immutable slot snapshot. The test's point is unchanged: two frames
         // with EQUAL synthetic lineage counters must still not establish
         // cross-execution identity, so build the same degenerate handle
-        // (lineage 0, no slots) the old `Frame(0)` denoted.
+        // (lineage 0, no slots) the old `Frame(0)` denoted. trust-ir's later `origin` is
+        // minted only by an executed OpenFrame, which this hand-built handle never ran.
         let frame = InterpretValue {
             ty: Ty::Ptr,
-            kind: InterpretValueKind::Frame { lineage: 0, slots: std::sync::Arc::from([]) },
+            kind: InterpretValueKind::Frame {
+                lineage: 0,
+                origin: None,
+                slots: std::sync::Arc::from([]),
+            },
         };
         assert!(
             value_agree(&module, &module, &frame, &frame, TY_CMP_DEPTH).is_err(),
@@ -11996,6 +12035,51 @@ mod tests {
         assert!(!constant_materializes_uncomparable_identity(&Constant::Aggregate(vec![
             Constant::Int(0),
         ])));
+    }
+
+    #[test]
+    fn nominal_function_item_identity_cannot_be_compared_by_local_id() {
+        let item = Constant::FnItem(FuncId::new(0));
+        assert!(constant_materializes_uncomparable_identity(&item));
+        assert!(constant_materializes_uncomparable_identity(&Constant::Splat {
+            elem: Box::new(Constant::Aggregate(vec![Constant::Int(0), item])),
+            len: u64::MAX,
+        }));
+        assert!(!constant_materializes_uncomparable_identity(&Constant::Splat {
+            elem: Box::new(Constant::Int(0)),
+            len: u64::MAX,
+        }));
+    }
+
+    #[test]
+    fn a_function_item_singleton_is_uncomparable_identity() {
+        let item = Constant::FnItem(FuncId::new(3));
+        assert!(constant_materializes_uncomparable_identity(&item));
+        assert!(constant_materializes_uncomparable_identity(&Constant::Aggregate(vec![
+            Constant::Int(0),
+            item,
+        ])));
+    }
+
+    /// trust-ir v73: two independently built modules whose function-item types carry the
+    /// same raw `FuncId` are not thereby the same function. Both the type comparison and the
+    /// value comparison refuse (coverage-only), so an entry parameter or return the
+    /// interpreter mints from the type alone never reaches the raw-equality leaves.
+    #[test]
+    fn equal_raw_function_item_ids_across_modules_are_refused_not_agreed() {
+        let am = Module::new("a");
+        let bm = Module::new("b");
+        let id = FuncId::new(0);
+        assert!(tys_agree(&am, &bm, &Ty::FnItem(id), &Ty::FnItem(id), 8).is_err());
+        assert!(tys_agree(&am, &bm, &Ty::FnItem(id), &Ty::Unit, 8).is_err());
+        assert!(tys_agree(&am, &bm, &Ty::Unit, &Ty::FnItem(id), 8).is_err());
+        let item = InterpretValue { ty: Ty::FnItem(id), kind: InterpretValueKind::FnItem(id) };
+        assert!(value_agree(&am, &bm, &item, &item.clone(), 8).is_err());
+        // The value arm stands on its own: a kind pair under an agreeing type still refuses.
+        let unit_typed = InterpretValue { ty: Ty::Unit, kind: InterpretValueKind::FnItem(id) };
+        assert!(value_agree(&am, &bm, &unit_typed, &unit_typed.clone(), 8).is_err());
+        let unit = InterpretValue { ty: Ty::Unit, kind: InterpretValueKind::Unit };
+        assert!(value_agree(&am, &bm, &unit, &unit.clone(), 8).unwrap());
     }
 
     #[test]
@@ -15987,4 +16071,25 @@ mod tests {
         );
         assert_eq!(aggregate_ptr_leaf_is_read(&module.functions[0], 0), Ok(false));
     }
+    #[test]
+    fn new_ir_carrier_fn_item_identity_is_not_cross_module_equality() {
+        let mut left = returned_fndef_module("nominal_left", 11);
+        let mut right = returned_fndef_module("nominal_right", 29);
+        for module in [&mut left, &mut right] {
+            let ty = Ty::FnItem(FuncId::new(1));
+            let signature = module.functions[0].ty;
+            module.func_types[signature.as_usize()].returns = vec![ty.clone()];
+            if let Inst::Const { ty: stored, value } = &mut module.functions[0].blocks[0].body[0].inst {
+                *stored = ty; *value = Constant::FnItem(FuncId::new(1));
+            } else { panic!("owned fixture constant"); }
+            assert!(trust_ir_build::validate_module(module).is_empty());
+        }
+        let report = compare_entries(&left, FuncId::new(0), &right, FuncId::new(0));
+        assert_eq!(report.mode, DiffMode::NotRun);
+        assert!(!report.equal, "equal module-local ids do not compare target identities");
+        let targets = compare_entries(&left, FuncId::new(1), &right, FuncId::new(1));
+        assert_eq!(targets.mode, DiffMode::MirOracle);
+        assert!(!targets.equal, "the two actual target bodies differ");
+    }
+
 }

@@ -67,6 +67,13 @@ pub(crate) struct Builder<'a> {
     /// The total amount of time we spent running [`Step`]s in [`Self::stack`].
     time_spent_on_dependencies: Cell<Duration>,
 
+    // Trust: the actual SelfCheck graph, not a second CLI path classifier,
+    // records whether this request will drive the separate library workspace.
+    selected_std_sources: Cell<bool>,
+    // Trust: actual selected ToolBuild manifests, recorded by the same
+    // SelfCheck traversal. Standalone tool workspaces have separate locks.
+    selected_tool_sources: RefCell<BTreeSet<PathBuf>>,
+
     /// The paths passed on the command line. Used by steps to figure out what
     /// to do. For example: with `./x check foo bar` we get `paths=["foo",
     /// "bar"]`.
@@ -778,16 +785,8 @@ impl Step for Libdir {
                 t!(fs::create_dir_all(&sysroot_target_libdir));
             }
 
-            if self.compiler.stage == 0 {
-                // The stage 0 compiler for the build triple is always pre-built. Ensure that
-                // `libLLVM.so` ends up in the target libdir, so that ui-fulldeps tests can use
-                // it when run.
-                dist::maybe_install_llvm_target(
-                    builder,
-                    self.compiler.host,
-                    &builder.sysroot(self.compiler),
-                );
-            }
+            // Trust: stage0's original native libraries arrive with StdLink's
+            // seed import, not this source tree's configured LLVM provider.
         }
 
         sysroot
@@ -1128,6 +1127,8 @@ impl<'a> Builder<'a> {
             cache: Cache::new(),
             stack: RefCell::new(Vec::new()),
             time_spent_on_dependencies: Cell::new(Duration::new(0, 0)),
+            selected_std_sources: Cell::new(false),
+            selected_tool_sources: RefCell::new(BTreeSet::new()),
             paths,
             submodule_paths_cache: Default::default(),
             log_cli_step_for_tests: None,
@@ -1170,6 +1171,24 @@ impl<'a> Builder<'a> {
             return;
         }
         self.run_step_descriptions(&Builder::get_step_descriptions(self.kind), &self.paths);
+    }
+
+    // Trust: called after the same SelfCheck traversal, before any real Step.
+    pub(crate) fn check_selected_sources(&self) -> Result<(), String> {
+        crate::utils::trust_preparation::check_selected_std_sources(
+            self.sess,
+            self.selected_std_sources.get(),
+        )?;
+        crate::utils::trust_preparation::check_selected_tool_sources(
+            self.sess,
+            &self.selected_tool_sources.borrow(),
+        )
+    }
+
+    pub(crate) fn record_selected_tool_sources(&self, manifest: PathBuf) {
+        if matches!(self.config.get_dry_run(), DryRun::SelfCheck) {
+            self.selected_tool_sources.borrow_mut().insert(manifest);
+        }
     }
 
     /// The steps this builder ran, for a test that inspects what a build did.
@@ -1455,6 +1474,12 @@ Alternatively, you can set `build.local-rebuild=true` and use a stage0 compiler 
 
     pub fn rustc_lib_paths(&self, compiler: Compiler) -> Vec<PathBuf> {
         let mut dylib_dirs = vec![self.rustc_libdir(compiler)];
+
+        // The seed's runtime belongs to its original sysroot. A loader-path
+        // lookup must not select or download this source tree's LLVM provider.
+        if compiler.is_snapshot(self) {
+            return dylib_dirs;
+        }
 
         // Ensure that the downloaded LLVM libraries can be found.
         // FIXME: the libraries should be added elsewhere, not in this function...

@@ -740,6 +740,23 @@ Run `{cmd}` to see possible targets."
         )
     }
 
+    /// The compiler's target-selection policy, without resolving a workspace
+    /// or constructing compiler inputs.
+    fn compile_filter(&self) -> CompileFilter {
+        CompileFilter::from_raw_arguments(
+            self.flag("lib"),
+            self._values_of("bin"),
+            self.flag("bins"),
+            self._values_of("test"),
+            self.flag("tests"),
+            self._values_of("example"),
+            self.flag("examples"),
+            self._values_of("bench"),
+            self.flag("benches"),
+            self.flag("all-targets"),
+        )
+    }
+
     fn compile_options(
         &self,
         gctx: &GlobalContext,
@@ -845,18 +862,7 @@ Run `{cmd}` to see possible targets."
             build_config,
             cli_features: self.cli_features()?,
             spec,
-            filter: CompileFilter::from_raw_arguments(
-                self.flag("lib"),
-                self._values_of("bin"),
-                self.flag("bins"),
-                self._values_of("test"),
-                self.flag("tests"),
-                self._values_of("example"),
-                self.flag("examples"),
-                self._values_of("bench"),
-                self.flag("benches"),
-                self.flag("all-targets"),
-            ),
+            filter: self.compile_filter(),
             target_rustdoc_args: None,
             target_rustc_args: None,
             target_rustc_crate_types: None,

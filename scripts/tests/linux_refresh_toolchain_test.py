@@ -127,6 +127,27 @@ class CloneTests(unittest.TestCase):
         self.assertEqual(git(worktree / "first-party/a/third_party/n", "remote", "get-url", "origin"),
                          str(store / "modules/third_party/n"))
 
+    def test_a_second_worktree_with_linked_submodules_is_cloned_from_the_shared_stores(self):
+        # What `submodule_sync.sh --restore` makes of a second worktree: no module store
+        # under its own git directory, each submodule checkout a linked worktree of the
+        # store the first checkout cloned.
+        second = self.root / "second"
+        git(self.fixture.source, "worktree", "add", "-q", "--detach", str(second), "HEAD")
+        store = self.fixture.source / ".git/modules/first-party/a"
+        for linked, shared in (("first-party/a", store),
+                               ("first-party/a/third_party/n", store / "modules/third_party/n")):
+            pin = git(self.fixture.source / linked, "rev-parse", "HEAD")
+            subprocess.run(["git", "--git-dir", str(shared), "worktree", "add", "-q", "--detach",
+                            str(second / linked), pin], check=True, capture_output=True, env=GIT_ENV)
+        self.assertFalse((Path(git(second, "rev-parse", "--absolute-git-dir")) / "modules").exists())
+        worktree = self.root / "w3"
+        done = refresh.clone_rung(second, self.fixture.commit, worktree)
+        self.assertEqual(done, ["first-party/a", "first-party/a/third_party/n"])
+        self.assertEqual(refresh.worktree_problems(worktree, self.fixture.commit), [])
+        self.assertEqual(git(worktree / "first-party/a", "remote", "get-url", "origin"), str(store))
+        self.assertEqual(git(worktree / "first-party/a/third_party/n", "remote", "get-url", "origin"),
+                         str(store / "modules/third_party/n"))
+
     def test_a_pin_the_store_lacks_is_refused_with_the_command_that_fetches_it(self):
         # The donor moves on and upstream pins the new commit; the source checkout's
         # superproject is pulled, but its module store is not.

@@ -160,6 +160,133 @@ fn selected_requests_and_dry_runs_do_not_launch_the_full_checker() {
 }
 
 #[test]
+fn selected_std_check_keeps_frozen_policy_and_the_selected_compiler() {
+    let mut command = super::selected_std_check_command(
+        Path::new("/tools/targo"),
+        Path::new("/tools/trustc"),
+        Path::new("/source"),
+    );
+    command.mark_as_executed();
+    assert_eq!(command.get_program(), OsStr::new("/tools/targo"));
+    assert_eq!(command.get_current_dir(), Some(Path::new("/source")));
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["fetch", "--frozen", "--manifest-path", "/source/library/Cargo.toml"].map(OsStr::new)
+    );
+    assert!(command.run_in_dry_run, "the SelfCheck discovery must really check inputs");
+    let environment = command.get_envs().collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(environment[OsStr::new("RUSTC")], Some(OsStr::new("/tools/trustc")));
+    assert_eq!(environment[OsStr::new("RUSTC_BOOTSTRAP")], Some(OsStr::new("1")));
+    assert_eq!(environment[OsStr::new("CARGO_BUILD_TARGET")], None);
+    assert!(!environment.contains_key(OsStr::new("CARGO_HOME")));
+    assert!(!environment.contains_key(OsStr::new("CARGO_NET_OFFLINE")));
+}
+
+#[test]
+fn selected_std_check_skips_unrequested_full_and_user_dry_run_graphs() {
+    use crate::core::config::DryRun;
+    use crate::core::session::Session;
+    use crate::utils::tests::TestCtx;
+
+    for (arguments, dry_run, requested) in [
+        (vec!["build", "--stage", "1", "library"], DryRun::SelfCheck, false),
+        (vec!["build", "--stage", "1", "library"], DryRun::UserSelected, true),
+        (vec!["build", "--stage", "2", "library"], DryRun::SelfCheck, true),
+    ] {
+        let context = TestCtx::new();
+        let mut session =
+            Session::new(context.config(arguments[0]).args(&arguments[1..]).create_config());
+        session.config.set_dry_run(dry_run);
+        session.initial_cargo = "/does-not-exist/targo".into();
+        super::check_selected_std_sources(&session, requested).unwrap();
+        let tools = if requested {
+            [Path::new("first-party/ay/crates/ay/Cargo.toml").to_owned()].into()
+        } else {
+            Default::default()
+        };
+        super::check_selected_tool_sources(&session, &tools).unwrap();
+    }
+}
+
+// Trust: the feature names an explicit actual CLI qualification. No optional
+// executable lookup or synthetic success stands in for the original driver.
+#[cfg(feature = "native-cli-tests")]
+#[test]
+fn selected_manifest_real_frozen_fetch_detects_a_cache_miss_hidden_by_no_deps_metadata() {
+    use crate::utils::exec::{ExecutionContext, command};
+    let targo = std::env::var_os("TRUST_BUILD_TREE_TARGO")
+        .expect("native-cli-tests requires the actual Targo executable");
+    let rustc = Path::new(env!("BOOTSTRAP_TEST_BUILD_RUSTC"));
+    for relative in ["library/Cargo.toml", "first-party/ay/crates/ay/Cargo.toml"] {
+        let relative = Path::new(relative);
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join(relative.parent().unwrap());
+        fs::create_dir_all(library.join("src")).unwrap();
+        fs::write(library.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+        let manifest = library.join("Cargo.toml");
+        let lock = library.join("Cargo.lock");
+        fs::write(&manifest, "[package]\nname='std-input-control'\nversion='0.0.0'\n[workspace]\n")
+            .unwrap();
+        fs::write(
+            &lock,
+            "version = 4\n[[package]]\nname = 'std-input-control'\nversion = '0.0.0'\n",
+        )
+        .unwrap();
+        // Actual bootstrap Cargo producers run in the source root. A nested
+        // config beside the manifest must not become an extra resolver input.
+        fs::create_dir(library.join(".cargo")).unwrap();
+        fs::write(library.join(".cargo/config.toml"), "invalid configuration [\n").unwrap();
+        let home = root.path().join("cargo-home");
+        let execution = ExecutionContext::new(0, false);
+        let run = |mut selected: crate::utils::exec::BootstrapCommand| {
+            selected.env("CARGO_HOME", &home).env_remove("TARGO_HOME");
+            selected.run_capture(&execution)
+        };
+        let positive = run(super::selected_manifest_check_command(
+            Path::new(&targo),
+            rustc,
+            root.path(),
+            relative,
+        ));
+        assert!(positive.is_success(), "{}", positive.stderr());
+        eprintln!("selected {relative:?} real empty-graph fetch: {:?}", positive.status());
+
+        fs::write(&manifest, "[package]\nname='std-input-control'\nversion='0.0.0'\n[workspace]\n[dependencies]\nwasip1='=1.0.0'\n").unwrap();
+        fs::write(&lock, concat!("version = 4\n[[package]]\nname='std-input-control'\nversion='0.0.0'\ndependencies=['wasip1']\n",
+        "[[package]]\nname='wasip1'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\n",
+        "checksum='b5e26842486624357dbeb8f0381cf1fb42f022291fd787d4a816768fec8cc760'\n")).unwrap();
+        let original_manifest = fs::read(&manifest).unwrap();
+        let original_lock = fs::read(&lock).unwrap();
+        let mut metadata = command(&targo).allow_failure();
+        metadata.metadata_scheduler();
+        metadata
+            .args(["metadata", "--frozen", "--no-deps", "--format-version", "1", "--manifest-path"])
+            .arg(&manifest)
+            .env("RUSTC", rustc)
+            .current_dir(root.path());
+        let old = run(metadata);
+        assert!(old.is_success(), "old startup control: {}", old.stderr());
+        let missing = run(super::selected_manifest_check_command(
+            Path::new(&targo),
+            rustc,
+            root.path(),
+            relative,
+        ));
+        eprintln!(
+            "selected {relative:?} old no-deps metadata: {:?}; frozen fetch: {:?}\n{}",
+            old.status(),
+            missing.status(),
+            missing.stderr()
+        );
+        assert!(!missing.is_success(), "the selected workspace index is absent");
+        assert!(missing.stderr().contains("wasip1"), "{}", missing.stderr());
+        assert!(missing.stderr().contains("offline"), "{}", missing.stderr());
+        assert_eq!(fs::read(&manifest).unwrap(), original_manifest);
+        assert_eq!(fs::read(&lock).unwrap(), original_lock);
+    }
+}
+
+#[test]
 fn early_flags_and_config_share_the_same_scope_without_a_python_classifier() {
     for args in [
         vec!["build"],

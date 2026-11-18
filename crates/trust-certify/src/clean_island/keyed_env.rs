@@ -550,6 +550,21 @@ impl KeyedEnv {
         }
     }
 
+    /// The source-only initializer is private typed producer custody, not a
+    /// caller-supplied environment or cached proof. An unkeyed initial context
+    /// cannot read, write or rebuild ordinary island facts.
+    pub(crate) fn for_pinned_source(
+        prelude: crate::lean_source_batch::ProducedSourcePrelude,
+    ) -> Self {
+        let mut fresh = Self::new();
+        let (environment, mut file_context) = prelude.into_parts();
+        file_context.disable_external_import_search();
+        fresh.env = OnceCell::from(environment);
+        fresh.file_ctx = file_context;
+        fresh.poison("pinned source initializer has its own complete context");
+        fresh
+    }
+
     /// Read facts through `facts` from here on. Only an untouched session
     /// may: a session whose environment already changed has history no key
     /// names.

@@ -505,6 +505,7 @@ impl InputWorkReporter<'_> {
 }
 
 pub use self::dep_info::Checksum;
+use self::dep_info::ChecksumAlgo;
 pub use self::dep_info::parse_dep_info;
 pub use self::dep_info::parse_rustc_dep_info;
 pub use self::dep_info::translate_dep_info;
@@ -543,7 +544,7 @@ pub fn prepare_target(
     unit: &Unit,
     force: bool,
 ) -> CargoResult<Job> {
-    prepare_target_with_recheck(build_runner, unit, force, false, None)
+    prepare_target_with_recheck(build_runner, unit, force, false, true, None)
 }
 
 /// Assemble the actual build-script work with its execution-window capture.
@@ -555,7 +556,7 @@ pub fn prepare_build_script(
     dirty: Work,
 ) -> CargoResult<Job> {
     assert!(unit.mode.is_run_custom_build());
-    prepare_target_with_recheck(build_runner, unit, false, false, Some(dirty))
+    prepare_target_with_recheck(build_runner, unit, false, false, true, Some(dirty))
 }
 
 // Trust: distinguish the one post-lock observation from initial preparation
@@ -570,12 +571,13 @@ fn prepare_target_with_recheck(
     unit: &Unit,
     force: bool,
     recheck: bool,
+    report: bool,
     dirty_work: Option<Work>,
 ) -> CargoResult<Job> {
     let bcx = build_runner.bcx;
     let loc = build_runner.files().fingerprint_file_path(unit, "");
 
-    let (fingerprint, dirty_reason) = inspect_target(build_runner, unit, force, recheck, true)?;
+    let (fingerprint, dirty_reason) = inspect_target(build_runner, unit, force, recheck, report)?;
 
     let Some(dirty_reason) = dirty_reason else {
         return Ok(Job::new_fresh());
@@ -584,7 +586,7 @@ fn prepare_target_with_recheck(
     // Trust: a live tool/cache observation may become dirty after the final
     // graph inspection. No source callback or cache mutation is allowed under
     // a read-only selected lease; refuse the request before constructing Work.
-    if bcx.gctx.cli_unstable().fine_grain_locking {
+    if bcx.fine_grain_locking {
         build_runner
             .lock_manager
             .require_selected_write(build_runner, unit)?;
@@ -631,9 +633,7 @@ fn prepare_target_with_recheck(
     // But the executable is corrupt and needs to be rebuilt. Clearing the
     // fingerprint at step 3 ensures that Cargo never mistakes a partially
     // written output as up-to-date.
-    if loc.exists()
-        && (!bcx.gctx.cli_unstable().fine_grain_locking || unit.mode.is_run_custom_build())
-    {
+    if loc.exists() && (!bcx.fine_grain_locking || unit.mode.is_run_custom_build()) {
         // Truncate instead of delete so that compare_old_fingerprint will
         // still log the reason for the fingerprint failure instead of just
         // reporting "failed to read fingerprint" during the next build if
@@ -683,7 +683,11 @@ fn prepare_target_with_recheck(
             None => publish,
         }
     } else {
-        Work::new(move |_| write_fingerprint(&loc, &fingerprint))
+        let build_root = build_root(build_runner, unit);
+        Work::new(move |_| {
+            write_extern_bytes(&build_root, &fingerprint)?;
+            write_fingerprint(&loc, &fingerprint)
+        })
     };
 
     Ok(Job::new_dirty(write_fingerprint, dirty_reason))
@@ -735,6 +739,22 @@ fn inspect_target(
         FingerprintComparison::Fresh => None,
         FingerprintComparison::Dirty { reason } => Some(reason),
     };
+    // Trust (DC-18b): a shared member's slot is named by what the unit is built
+    // from, its command included. A record there that does not hold for this
+    // build (other dependency bytes, damaged outputs) is never written over:
+    // the member is compiled privately, and the checkout records why until
+    // its sources, environment or compiler move. An empty record is a compile
+    // that did not finish, which the slot's next producer redoes.
+    if dirty_reason.is_some()
+        && bcx.shared_member(unit)
+        && loc.metadata().is_ok_and(|metadata| metadata.len() != 0)
+    {
+        tracing::debug!("shared member slot differs: {dirty_reason:?}");
+        return Err(bcx
+            .shared_eligibility
+            .recorder(unit)?
+            .refuse(crate::util::log_message::SharedDependencyExclusion::MemberSlotDiffers));
+    }
 
     if report && let Some(logger) = bcx.logger {
         let index = bcx.unit_to_index[unit];
@@ -785,6 +805,38 @@ pub fn invalidate_before_build(build_runner: &BuildRunner<'_, '_>, unit: &Unit) 
         }
         Ok(())
     })
+}
+
+/// Trust (DC-18b): where a shared member's compile records the SHA-256 of
+/// each library it consumed, beside its fingerprint in the slot.
+fn extern_bytes_record(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> PathBuf {
+    build_runner
+        .files()
+        .fingerprint_file_path(unit, "")
+        .with_extension("externs")
+}
+
+/// Trust (DC-18b): records the bytes of every extern a successful compile
+/// consumed, before the fingerprint that names the record is written. The
+/// dependencies are held under their unit locks, so the bytes hashed are the
+/// bytes the compiler read.
+fn write_extern_bytes(build_root: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
+    let local = fingerprint.local.lock().unwrap();
+    for item in local.iter() {
+        if let LocalFingerprint::ExternBytes { record, externs } = item {
+            let mut lines = String::new();
+            for path in externs {
+                let file = std::fs::File::open(build_root.join(path))?;
+                let checksum = Checksum::compute(ChecksumAlgo::Sha256, file)?;
+                let path = path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("an extern path is not UTF-8"))?;
+                lines.push_str(&format!("{checksum} {path}\n"));
+            }
+            paths::write_atomic(build_root.join(record), lines)?;
+        }
+    }
+    Ok(())
 }
 
 /// One dirty Work owns the live seal; persisted fingerprints cannot create it.
@@ -859,23 +911,91 @@ fn remove_output_receipt(path: &Path) -> CargoResult<()> {
 /// Repeat ordinary input and output validation after waiting for a producer.
 /// Cached filesystem state from graph preparation predates that producer and
 /// cannot establish freshness. Keep all normal force and proof-scope rules.
-pub fn recheck_after_lock(
+///
+/// Trust (DC-24a): for a shared unit of a build that names a unit source, a
+/// miss also carries the unit's key, the SHA-256 of the fingerprint record
+/// this check computed (the string a published record is compared with), so
+/// the worker can ask the source for it.
+///
+/// The check after a staged unit is placed ([`Check::Staged`]) logs no second
+/// fingerprint record: the unit source's decision records its outcome. The
+/// selected-graph lease forces every unit it reserved for writing, so that
+/// check judges the unit by its own fingerprint and receipt instead, with only
+/// the force the build asked for, where no dependency of the unit was compiled
+/// in this build. What makes a taken unit agree with its dependencies is that
+/// judgment: the fingerprint holds each dependency's fingerprint, and the
+/// dependencies' outputs must be no newer than the unit's. Where this build
+/// compiled a dependency, the lease's force stands, so the unit compiles as it
+/// would with no source, and the staged unit is refused (`stale`).
+///
+/// [`Check::Staged`]: super::unit_source::Check::Staged
+pub(crate) fn recheck_after_lock(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
     force: bool,
-) -> CargoResult<bool> {
+    check: super::unit_source::Check,
+) -> CargoResult<super::unit_source::Recheck> {
+    use super::unit_source::Check;
+    let report = matches!(check, Check::AfterLock);
+    let asks = build_runner
+        .bcx
+        .unit_source
+        .as_ref()
+        .is_some_and(|source| source.available())
+        && build_runner.bcx.shared_dependency_units.contains(unit);
     let loc = build_runner.files().fingerprint_file_path(unit, "");
     // A producer that never published a fingerprint cannot supply a hit.
-    // Avoid walking the dependency graph again for every cold-build unit.
-    if !loc.metadata().is_ok_and(|metadata| metadata.len() != 0) {
-        return Ok(false);
+    // Avoid walking the dependency graph again for every cold-build unit,
+    // unless a source may hold the unit: its key needs the fingerprint.
+    if !asks && !loc.metadata().is_ok_and(|metadata| metadata.len() != 0) {
+        return Ok(super::unit_source::Recheck {
+            fresh: false,
+            miss: None,
+        });
     }
     reset_plan_observations(build_runner);
-    Ok(
-        prepare_target_with_recheck(build_runner, unit, force, true, None)?
+    let dirty = if let Check::Staged {
+        dependency_compiled: false,
+    } = check
+        && let Some(requested) = build_runner.requested_forces.as_ref()
+    {
+        // Judge only, as lease selection does: the unit is about to be taken
+        // or compiled by this worker under the write lease it already holds.
+        let requested = requested.get(unit).copied().unwrap_or(false);
+        let leased = build_runner
+            .lease_forces
+            .as_mut()
+            .and_then(|forces| forces.insert(unit.clone(), requested));
+        let inspected = inspect_target(build_runner, unit, requested, true, false);
+        if let (Some(forces), Some(leased)) = (build_runner.lease_forces.as_mut(), leased) {
+            forces.insert(unit.clone(), leased);
+        }
+        inspected?.1
+    } else {
+        match prepare_target_with_recheck(build_runner, unit, force, true, report, None)?
             .freshness()
-            .is_fresh(),
-    )
+        {
+            super::Freshness::Fresh => None,
+            super::Freshness::Dirty(reason) => Some(reason.clone()),
+        }
+    };
+    let miss = match &dirty {
+        Some(reason) if asks => {
+            let fingerprint = calculate(build_runner, unit)?;
+            let record = serde_json::to_string(&*fingerprint)?;
+            Some(super::unit_source::miss(
+                build_runner,
+                unit,
+                &record,
+                reason.dispatch_cause(),
+            )?)
+        }
+        _ => None,
+    };
+    Ok(super::unit_source::Recheck {
+        fresh: dirty.is_none(),
+        miss,
+    })
 }
 
 /// Dependency edge information for fingerprints. This is generated for each
@@ -1186,6 +1306,18 @@ enum LocalFingerprint {
     /// filesystem dependence here, and if the values are changed the hash will
     /// change forcing a recompile.
     RerunIfEnvChanged { var: String, val: Option<String> },
+
+    /// Trust (DC-18b): a shared member is keyed on the bytes it consumed. The
+    /// `externs` (the libraries its command passes with `--extern`) and the
+    /// `record` that holds the SHA-256 of each as its compile read them are
+    /// relative to `target_root(...)`, the store. It is stale unless every
+    /// extern's bytes are still those, so two builds of one dependency are
+    /// never mixed in one program. The hash names the files only: the
+    /// fingerprint is computed before the dependencies are built.
+    ExternBytes {
+        record: PathBuf,
+        externs: Vec<PathBuf>,
+    },
 }
 
 /// See [`FsStatus::StaleItem`].
@@ -1472,6 +1604,40 @@ impl LocalFingerprint {
                 }),
             ),
 
+            LocalFingerprint::ExternBytes { record, externs } => {
+                let record = build_root.join(record);
+                let Ok(recorded) = paths::read(&record) else {
+                    return Ok(Some(StaleItem::MissingChecksum { path: record }));
+                };
+                let recorded: HashMap<&str, &str> = recorded
+                    .lines()
+                    .filter_map(|line| line.split_once(' '))
+                    .map(|(checksum, path)| (path, checksum))
+                    .collect();
+                for path in externs {
+                    let source = build_root.join(path);
+                    let Some(stored) = path
+                        .to_str()
+                        .and_then(|path| recorded.get(path))
+                        .and_then(|stored| stored.parse::<Checksum>().ok())
+                    else {
+                        return Ok(Some(StaleItem::MissingChecksum { path: source }));
+                    };
+                    let Ok(file) = std::fs::File::open(&source) else {
+                        return Ok(Some(StaleItem::MissingFile { path: source }));
+                    };
+                    let current = Checksum::compute(ChecksumAlgo::Sha256, file)?;
+                    if current != stored {
+                        return Ok(Some(StaleItem::ChangedChecksum {
+                            source,
+                            stored_checksum: stored,
+                            new_checksum: current,
+                        }));
+                    }
+                }
+                Ok(None)
+            }
+
             // These have no dependencies on the filesystem, and their values
             // are included natively in the `Fingerprint` hash so nothing
             // tocheck for here.
@@ -1487,6 +1653,7 @@ impl LocalFingerprint {
             LocalFingerprint::RerunIfChanged { .. } => "rerun-if-changed",
             LocalFingerprint::RerunIfChangedContent { .. } => "rerun-if-changed-content-v1",
             LocalFingerprint::RerunIfEnvChanged { .. } => "rerun-if-env-changed",
+            LocalFingerprint::ExternBytes { .. } => "extern-bytes-v1",
         }
     }
 }
@@ -1708,6 +1875,23 @@ impl Fingerprint {
                             name: a_key.clone(),
                             old_value: display(b_value),
                             new_value: display(a_value),
+                        };
+                    }
+                }
+                (
+                    LocalFingerprint::ExternBytes {
+                        record: a_record,
+                        externs: a_externs,
+                    },
+                    LocalFingerprint::ExternBytes {
+                        record: b_record,
+                        externs: b_externs,
+                    },
+                ) => {
+                    if a_record != b_record || a_externs != b_externs {
+                        return DirtyReason::PrecalculatedComponentsChanged {
+                            old: format!("extern-bytes-v1:{b_record:?}:{b_externs:?}"),
+                            new: format!("extern-bytes-v1:{a_record:?}:{a_externs:?}"),
                         };
                     }
                 }
@@ -2316,6 +2500,19 @@ pub(super) fn compilation_dependency_rebuilds(dep: &UnitDep) -> bool {
     !dep.unit.target.is_bin() || dep.unit.artifact.is_true()
 }
 
+/// Trust (DC-18c): a compiler-fingerprint edge from `parent`. A shared
+/// member's build-script run and proc macros stay per checkout: the member's
+/// slot is named by what they produced (`MemberInputs`), checked before its
+/// job uses the slot, so their fingerprints, freshness and rebuilds in this
+/// checkout are no edge of a slot two checkouts share.
+pub(super) fn dependency_rebuilds(
+    bcx: &super::BuildContext<'_, '_>,
+    parent: &Unit,
+    dep: &UnitDep,
+) -> bool {
+    compilation_dependency_rebuilds(dep) && !bcx.keyed_dependency(parent, &dep.unit)
+}
+
 /// Calculate a fingerprint for a "normal" unit, or anything that's not a build
 /// script execution. This includes compiling `build.rs` itself. This is an
 /// internal helper of [`calculate`], don't call directly.
@@ -2338,7 +2535,7 @@ fn calculate_normal(
         let deps = Vec::from(build_runner.unit_deps(unit));
         let mut deps = deps
             .into_iter()
-            .filter(compilation_dependency_rebuilds)
+            .filter(|dep| dependency_rebuilds(build_runner.bcx, unit, dep))
             .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?;
         deps.sort_by(|a, b| a.pkg_id.cmp(&b.pkg_id));
@@ -2398,6 +2595,48 @@ fn calculate_normal(
             "confined-command-v1:{}",
             inputs.digest()
         )));
+        if build_runner.bcx.shared_member(unit) {
+            // Trust (DC-18c): a proc macro the member loads is per checkout;
+            // its bytes name the slot (`MemberInputs`) and are no extern of
+            // the store's.
+            let member_inputs = build_runner
+                .files()
+                .member_slot(unit)
+                .and_then(|slot| slot.inputs.clone());
+            if let Some(member_inputs) = &member_inputs {
+                local.push(LocalFingerprint::Precalculated(format!(
+                    "member-inputs-v1:{}",
+                    member_inputs.digest()
+                )));
+            }
+            let externs = inputs
+                .externs()
+                .iter()
+                .filter(|path| {
+                    !member_inputs.as_ref().is_some_and(|member_inputs| {
+                        member_inputs
+                            .macro_libraries()
+                            .any(|library| library == path.as_path())
+                    })
+                })
+                .map(|path| {
+                    path.strip_prefix(&build_root)
+                        .map(Path::to_path_buf)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "a shared member's dependency is outside the store: {}",
+                                path.display()
+                            )
+                        })
+                })
+                .collect::<CargoResult<Vec<_>>>()?;
+            let record = extern_bytes_record(build_runner, unit);
+            let record = record
+                .strip_prefix(&build_root)
+                .map_err(|_| anyhow::anyhow!("a shared member's record is outside the store"))?
+                .to_path_buf();
+            local.push(LocalFingerprint::ExternBytes { record, externs });
+        }
     }
     if build_runner.bcx.shared_dependency_units.contains(unit) {
         let source = unit.pkg.package_id().source_id();
@@ -2530,10 +2769,17 @@ fn calculate_normal(
         platform.digest().hash(&mut config);
         let environment = build_runner
             .bcx
-            .action_environment
-            .as_ref()
+            .action_environment_for(unit)
             .ok_or_else(|| anyhow::anyhow!("confined action has no captured environment"))?;
-        environment.digest().hash(&mut config);
+        if build_runner.bcx.shared_member(unit) {
+            // Trust (DC-18b): a shared member's relocated command digest holds
+            // its effective environment with the checkout's path read as one
+            // token; the environment's own digest would name the checkout
+            // wherever a value does (a `PATH` entry into it, say).
+            "relocated-environment-in-command".hash(&mut config);
+        } else {
+            environment.digest().hash(&mut config);
+        }
         build_runner
             .bcx
             .rustc()

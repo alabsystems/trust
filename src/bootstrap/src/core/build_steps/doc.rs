@@ -1242,9 +1242,10 @@ tool_doc!(
         "mdman",
         "rustfix",
     ],
-    // Required because of the im-rc dependency of Cargo, which automatically opts into the
-    // "specialization" feature in its build script when it detects a nightly toolchain.
-    allow_features: "specialization"
+    // Trust: documenting Targo compiles the graph Targo's build compiles (ay-sat,
+    // trust-types, the controller client), so it takes that build's census-checked
+    // list, which still holds the "specialization" upstream allowed for im-rc.
+    allow_features: tool::TARGO_ALLOW_FEATURES
 );
 tool_doc!(Tidy, "src/tools/tidy", mode = Mode::ToolTarget, crates = ["tidy"]);
 tool_doc!(

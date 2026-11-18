@@ -1,12 +1,12 @@
 # Written by publish/transforms.sh T5 from the gitlinks of the exported commit
-# 1a5dddc3bfad0665869edb944c2dce59aa7bafe7, each pin projected FORWARD to its sibling's public release.
+# ee77cef372a40ea4db640d7241cd02859afc0649, each pin projected FORWARD to its sibling's public release.
 # Read by scripts/fetch-first-party.sh: <name> <public-git-url> <40-hex-revision>
-ay https://github.com/alabsystems/ay.git 8bbc43108643d475a81a89b2b4f262e817ee1724
-clean https://github.com/alabsystems/clean.git fae0c94829740c9ffe527eeeb4ea472f9c08001b
-ny https://github.com/alabsystems/ny.git 06a922fea1ecdd35e9c3438716c4c6b6c46b6da0
-trust-cg https://github.com/alabsystems/trust-cg.git bea55c6c3b6d586c129ab9ac3a4e1be016ad4bd9
-trust-ir https://github.com/alabsystems/trust-ir.git 8bae728257b123d6394b2dc049b3573ad885049f
-trust-mc https://github.com/alabsystems/trust-mc.git f16c9b24c2d86cafad8c72615909298111aa791c
-trust-vc https://github.com/alabsystems/trust-vc.git f1cf510d6f9c980b2d3bc55796b34ef463750d7a
-trust-wp https://github.com/alabsystems/trust-wp.git 71224f5980a173f0fb931a456635cd4cf8584436
-ty https://github.com/alabsystems/ty.git 54b55bcf11a1da0033ff04946fb2cb5eab0ac67a
+ay https://github.com/alabsystems/ay.git 12d411d420e27eea05099f8cd277eb288e8622c9
+clean https://github.com/alabsystems/clean.git e86b4b61e665f73b4737dd360773677561462f7e
+ny https://github.com/alabsystems/ny.git 4697f8b2253b957e68dce37c9e492b29f55b8efe
+trust-cg https://github.com/alabsystems/trust-cg.git 221f353fb0db8bab006db8034b968056bd2b6db9
+trust-ir https://github.com/alabsystems/trust-ir.git 899d46e7a303fad2b706a88a7a8eda41ec47dcfe
+trust-mc https://github.com/alabsystems/trust-mc.git 65cf7bf5aec10c13634c0324e864bd0e424d1bab
+trust-vc https://github.com/alabsystems/trust-vc.git 8be77087312f8be774b134c9cd929b989d24a501
+trust-wp https://github.com/alabsystems/trust-wp.git 3eba74cc1ca6c7ae4f49edca8a24600b2389fdb3
+ty https://github.com/alabsystems/ty.git 136a8e7534f3842a73aa157c54861e3fa946f415

@@ -15508,6 +15508,67 @@ fn selection_probes_carry_a_lane_and_pin_the_authenticated_compiler() {
     std::fs::remove_dir_all(root).expect("remove selection probe fixture");
 }
 
+/// DC-17a: `targo trust` never reads or writes the shared dependency store,
+/// and the trust-cg unit-graph preflight is an unverified child of it. A
+/// project that checks `build.shared-dependency-cache` in (or a caller that
+/// passes it) would have that plan-only build create and judge the store, so
+/// the preflight's last Cargo option, before any `--`, turns the key off.
+/// Cargo merges `--config` left to right; Targo's own
+/// `the_trust_preflight_override_leaves_the_store_untouched` shows that last
+/// option leaves a keyed project's store absent.
+#[cfg(unix)]
+#[test]
+fn trust_cg_preflight_runs_as_with_the_shared_dependency_cache_key_unset() {
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _target = TestEnvVar::unset("CARGO_BUILD_TARGET");
+    let root = temp_test_dir("preflight-shared-dependency-cache");
+    let (rustc, _, _) = write_env_logging_selection_targo(&root);
+    let argv = root.join("preflight-argv.log");
+    let script = r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >> '@ARGV@'; done
+exec /bin/cat '@UNIT_GRAPH@'
+"#
+    .replace("@ARGV@", &argv.display().to_string())
+    .replace("@UNIT_GRAPH@", &root.join("unit-graph.json").display().to_string());
+    let targo = write_checker_fixture_script(&root.join("argv-bin"), "targo", &script);
+
+    crate::pipeline::cargo_selection::preflight_trust_cg_cargo_targets_with_targo(
+        &[
+            "--config".to_string(),
+            "build.shared-dependency-cache=true".to_string(),
+            "--target".to_string(),
+            "x86_64-unknown-linux-gnu".to_string(),
+            "--".to_string(),
+            "--config".to_string(),
+            "build.shared-dependency-cache=true".to_string(),
+        ],
+        &targo,
+        &rustc,
+        false,
+    )
+    .expect("fixture rlib passes the unit-graph preflight");
+
+    let logged = std::fs::read_to_string(&argv).expect("preflight argv log");
+    let args = logged.lines().collect::<Vec<_>>();
+    let separator = args.iter().position(|arg| *arg == "--").expect("caller's separator kept");
+    let last_config = args[..separator]
+        .iter()
+        .rposition(|arg| *arg == "--config")
+        .expect("the preflight passes a --config");
+    assert_eq!(
+        args[last_config + 1],
+        crate::pipeline::cargo_selection::PREFLIGHT_SHARED_DEPENDENCY_CACHE_OFF,
+        "the caller's key, not the preflight's override, decided the preflight: {logged}"
+    );
+    assert_eq!(
+        args[separator..],
+        ["--", "--config", "build.shared-dependency-cache=true"],
+        "the preflight rewrote what follows the caller's separator: {logged}"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove preflight shared dependency fixture");
+}
+
 #[cfg(unix)]
 fn copied_real_targo_for_contract_e2e(root: &Path) -> PathBuf {
     let source = std::env::var_os("TRUST_REAL_TARGO_E2E").map(PathBuf::from).unwrap_or_else(|| {

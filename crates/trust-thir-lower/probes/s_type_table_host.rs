@@ -175,6 +175,37 @@ impl rustc_driver::Callbacks for Probe {
         let types = tcx.instantiate_bound_regions_with_erased(signature).inputs().to_vec();
         let mut rows = Vec::new();
         for instance in instances {
+            // Actual TCX substitution and the original type converter, with no
+            // layout-width inference from an R Ptr. Wide/unknown conversions
+            // may refuse earlier; neither path supplies thin-pointer evidence.
+            use trust_thir_lower::template_key::{HoleKey, KeyTy};
+            let mut pointer_shapes = Vec::new();
+            for (name, source, expected) in [
+                ("const-parameter", KeyTy::RawPtr { mutable: false,
+                    pointee: Box::new(KeyTy::Param(1)) }, true),
+                ("mut-parameter", KeyTy::RawPtr { mutable: true,
+                    pointee: Box::new(KeyTy::Param(1)) }, true),
+                ("str-pointer", KeyTy::RawPtr { mutable: false,
+                    pointee: Box::new(KeyTy::Str) }, false),
+                ("slice-pointer", KeyTy::RawPtr { mutable: false,
+                    pointee: Box::new(KeyTy::Slice(Box::new(KeyTy::Uint(8)))) }, false),
+                ("mut-str-reference", KeyTy::Ref { mutable: true,
+                    pointee: Box::new(KeyTy::Str) }, false),
+                ("pointer-sized-integer", KeyTy::Uint(0), false),
+            ] {
+                let key = trust_thir_lower::template_key::encode(&HoleKey::Type(source)).unwrap();
+                match trust_thir_lower::concrete_type_transport::from_key(tcx, instance, &key) {
+                    Ok(image) => {
+                        assert_eq!(image.root_is_thin_pointer(tcx, 0), expected, "{name}");
+                        assert!(!image.root_is_thin_pointer(tcx, 1), "no missing-root evidence");
+                        pointer_shapes.push(serde_json::json!({"case":name,"thin":expected}));
+                    }
+                    Err(reason) => {
+                        assert!(!expected, "actual thin pointer refused: {name}: {reason}");
+                        pointer_shapes.push(serde_json::json!({"case":name,"refused":reason}));
+                    }
+                }
+            }
             let image = lower(tcx, instance, &types).unwrap();
             let small = matches!(instance.args[1].as_type().unwrap().kind(), ty::Uint(ty::UintTy::U8));
             let concrete = named(tcx, if small { "concrete_u8" } else { "concrete_u16" }).as_local().unwrap();
@@ -201,8 +232,50 @@ impl rustc_driver::Callbacks for Probe {
             let direct = lower(tcx, instance, &types[1..2]).unwrap();
             assert_eq!(keyed.roots(), direct.roots());
             assert_eq!(keyed.module().stable_digest(), direct.module().stable_digest(), "actual nominal key resolution");
+            // An actual source fn-pointer now has a complete type-table image. This
+            // carries no callable body, physical ABI record, admission or proof token.
+            let signature = tcx.fn_sig(named(tcx, "bad_callable")).instantiate_identity().skip_normalization();
+            let callable_source = tcx.instantiate_bound_regions_with_erased(signature).inputs()[0];
+            let callable = lower(tcx, instance, &[callable_source]).expect("actual fn(u8)->u8 type image");
+            assert_eq!(callable.sources(), &[callable_source]);
+            let [trust_ir::Ty::Func(callable_id)] = callable.roots() else {
+                panic!("actual function pointer lost its checked signature");
+            };
+            let expected_callable = trust_ir::FuncTy {
+                params: vec![trust_ir::Ty::U8], returns: vec![trust_ir::Ty::U8],
+                is_vararg: false, abi: None,
+            };
+            assert_eq!(callable.module().func_type(*callable_id), Some(&expected_callable));
+            assert!(callable.module().functions.is_empty() && callable.module().globals.is_empty()
+                && callable.module().blobs.is_empty() && callable.module().proof_obligations.is_empty()
+                && callable.module().proof_certificates.is_empty()
+                && callable.module().obligation_diagnostics.is_empty()
+                && callable.module().spec_modules.is_empty());
+            // Force relocation away from the source signature's table context.
+            let mut callable_host = Module::new("prior-callable-type-context");
+            callable_host.target_info = callable.module().target_info.clone();
+            callable_host.add_func_type(FuncTy {
+                params: vec![Ty::U64], returns: vec![Ty::U64], is_vararg: false, abi: None,
+            }).unwrap();
+            let prior_callable_host = callable_host.clone();
+            let placed_callable = codec::type_host::merge(&callable_host, &callable).unwrap();
+            assert_eq!(callable_host, prior_callable_host, "canonical placement is read-only");
+            let [Ty::Func(placed_id)] = placed_callable.roots() else {
+                panic!("canonical placement lost the callable root");
+            };
+            assert_ne!(placed_id, callable_id, "the source-relative signature id cannot stand");
+            assert_eq!(placed_callable.module().func_type(*placed_id), Some(&expected_callable));
+            assert_eq!(placed_callable.module().func_types[..prior_callable_host.func_types.len()],
+                prior_callable_host.func_types);
+            assert!(placed_callable.module().functions.is_empty()
+                && placed_callable.module().globals.is_empty() && placed_callable.module().blobs.is_empty()
+                && placed_callable.module().proof_obligations.is_empty()
+                && placed_callable.module().proof_certificates.is_empty());
+            assert!(trust_ir_build::validate::validate_module(placed_callable.module()).is_empty());
+            let repeated_callable = codec::type_host::merge(placed_callable.module(), &callable).unwrap();
+            assert_eq!(repeated_callable.roots(), placed_callable.roots());
             let mut refusals = Vec::new();
-            for name in ["bad_union", "bad_fat", "bad_callable"] {
+            for name in ["bad_union", "bad_fat"] {
                 let sig = tcx.fn_sig(named(tcx, name)).instantiate_identity().skip_normalization();
                 let bad = tcx.instantiate_bound_regions_with_erased(sig).inputs()[0];
                 let error = match lower(tcx, instance, &[bad]) { Ok(_) => panic!("hostile type {name} was accepted"), Err(e) => e };
@@ -228,7 +301,7 @@ impl rustc_driver::Callbacks for Probe {
             refusals.push(serde_json::json!({"case":"callee-key-as-type","reason":error}));
             let repeated = lower(tcx, instance, &types).unwrap();
             assert_eq!(image.module().stable_digest(), repeated.module().stable_digest(), "failed requests cannot alter a later type image");
-            rows.push(serde_json::json!({"actual_type":format!("{}",instance.args[1].as_type().unwrap()),"roots":image.roots().len(),"struct_rows":image.module().structs.len(),"array_tuple_rows":image.module().types.len(),"tuple_layouts":image.module().tuple_layouts.len(),"actual_concrete_producer_tables_equal":true,"canonically_installed_roots":installed_roots,"owner_is_local":owner.is_local(),"official_S_admission":false,"refusals":refusals}));
+            rows.push(serde_json::json!({"actual_type":format!("{}",instance.args[1].as_type().unwrap()),"roots":image.roots().len(),"struct_rows":image.module().structs.len(),"array_tuple_rows":image.module().types.len(),"tuple_layouts":image.module().tuple_layouts.len(),"actual_concrete_producer_tables_equal":true,"actual_callable_type_image":true,"canonically_installed_callable_signature":true,"canonically_installed_roots":installed_roots,"owner_is_local":owner.is_local(),"official_S_admission":false,"pointer_shapes":pointer_shapes,"refusals":refusals}));
         }
         let host_owner = named(tcx, "host_owner");
         let (thir, _) = tcx.thir_body(main).unwrap(); let thir = thir.borrow();

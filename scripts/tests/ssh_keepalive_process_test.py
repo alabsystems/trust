@@ -18,6 +18,12 @@ PARSER.add_argument("--helper-dir", type=Path, default=Path(__file__).resolve().
 OPTIONS, TEST_ARGS = PARSER.parse_known_args()
 
 
+# A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces (atpkg's python
+# lives under `Application Support/`): exec splits it and the fake never runs. This sh/python
+# polyglot execs the interpreter quoted and keeps argv[0] as the fake's own path.
+PYTHON_SHEBANG = f'#!/bin/sh\n""":"\nexec "{sys.executable}" "$0" "$@"\n":"""\n'
+
+
 class ProbeProcesses(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="ssh-probe-process-")
@@ -28,7 +34,7 @@ class ProbeProcesses(unittest.TestCase):
         # The identity is published by rename, so the test, which signals the
         # wrapper once the file exists, never reads it half written (under load
         # a cancellation landed between create and write: JSONDecodeError).
-        self.wrapper.write_text(f"#!{sys.executable}\n" + '''import json,os,sys,time
+        self.wrapper.write_text(PYTHON_SHEBANG + '''import json,os,sys,time
 from pathlib import Path
 mode=os.environ['PROBE_CASE']
 if mode == 'positive':

@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -114,18 +115,96 @@ def submodule_paths(repo: Path) -> list[str]:
 
 
 def submodule_git_dir(repo: Path, path: str) -> Path | None:
-    """Return Git's per-worktree object store for an initialized submodule.
+    """Return the repository that holds an initialized submodule's objects and refs.
 
-    A linked worktree has a ``.git`` *file*, not a ``.git`` directory.  Asking
-    Git to resolve ``modules/<path>`` therefore matters: spelling the location
-    as ``repo/.git/modules/<path>`` silently classifies every initialized
-    submodule in a linked worktree as absent.
+    Three places can hold it, tried in this order:
+
+    * the checkout's own common directory, when ``<path>`` is a checkout. A
+      second worktree populated by ``scripts/submodule_sync.sh --restore`` has
+      linked submodule checkouts, whose git directories are
+      ``<common git dir>/modules/<path>/worktrees/<id>``; the store the audit
+      must read is the one they share, not a per-worktree directory that does
+      not exist;
+    * ``<this worktree's git dir>/modules/<path>``, which Git resolves (a linked
+      worktree has a ``.git`` *file*, so spelling it ``repo/.git/modules/<path>``
+      silently classifies every initialized submodule there as absent);
+    * ``<common git dir>/modules/<path>``, the first checkout's store, for a
+      second worktree whose submodule is not checked out.
+
+    When none holds a repository the per-worktree path is returned, so the
+    caller reports the directory Git would create.
     """
+    checkout = repo / path
+    if (checkout / ".git").exists():
+        top = git_result(checkout, ["rev-parse", "--show-toplevel"])
+        if top.returncode == 0 and top.stdout.strip() and (
+            Path(top.stdout.strip()).resolve() == checkout.resolve()
+        ):
+            common = git(
+                checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+            ).strip()
+            if common and (Path(common) / "HEAD").is_file():
+                return Path(common)
+    own = own_submodule_git_dir(repo, path)
+    if own is not None and (own / "HEAD").is_file():
+        return own
+    common = git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
+    if common and (Path(common) / "modules" / path / "HEAD").is_file():
+        return Path(common) / "modules" / path
+    return own
+
+
+def own_submodule_git_dir(repo: Path, path: str) -> Path | None:
+    """``<this worktree's git dir>/modules/<path>``, the store this checkout owns."""
     resolved = git(
         repo,
         ["rev-parse", "--path-format=absolute", "--git-path", f"modules/{path}"],
     ).strip()
     return Path(resolved) if resolved else None
+
+
+def store_view(store: Path) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    """A scratch repository that reads ``store``'s objects and holds a copy of its refs.
+
+    A second worktree's submodule store is the first checkout's
+    (``scripts/submodule_sync.sh --restore`` links its checkouts there).
+    Every fetch the audit makes, ``refs/audit-remote-view/*`` and the head
+    prune's ``refs/remotes/origin/*`` and force-moved ``refs/tags/*`` included,
+    would write into that store, with ``FETCH_HEAD`` and auto-maintenance, and
+    without the lock its fetches take. Here they write into the view instead:
+    its ``objects/info/alternates`` names the store's objects, and it holds
+    the store's refs and ``shallow`` roots, so every reachability walk and
+    every negotiation reads as it would in the store. It is deleted when the
+    audit ends.
+    """
+    holder = tempfile.TemporaryDirectory(prefix="audit-first-party-pins.")
+    view = Path(holder.name) / "view.git"
+    created = subprocess.run(
+        ["git", "init", "-q", "--bare", "--template=", str(view)],
+        capture_output=True, text=True, check=False,
+    )
+    if created.returncode != 0:
+        holder.cleanup()
+        raise RuntimeError(_git_failure("scratch view init failed", created))
+    info = view / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text(f"{(store / 'objects').resolve()}\n")
+    if (store / "shallow").is_file():
+        shutil.copyfile(store / "shallow", view / "shallow")
+    refs = git_result(
+        Path("."),
+        ["for-each-ref", "--format=create %(refname) %(objectname)"],
+        git_dir=store,
+    )
+    copied = (
+        git_result(Path("."), ["update-ref", "--stdin"], git_dir=view, input_text=refs.stdout)
+        if refs.returncode == 0
+        else refs
+    )
+    if copied.returncode != 0:
+        holder.cleanup()
+        raise RuntimeError(_git_failure("scratch view refs failed", copied))
+    return holder, view
 
 
 def _pins_from_log(out: str) -> set[str]:
@@ -754,6 +833,7 @@ def main() -> int:
             "findings is not evidence."
         )
 
+    views: list[tempfile.TemporaryDirectory[str]] = []
     for path in paths:
         git_dir = submodule_git_dir(repo, path)
         if git_dir is None or not git_dir.is_dir():
@@ -764,6 +844,20 @@ def main() -> int:
             else:
                 print(f"{path:<22} {detail}, skipped")
             continue
+        own = own_submodule_git_dir(repo, path)
+        shared = own is None or git_dir.resolve() != own.resolve()
+        if shared:
+            # Another checkout's store: read it, write only a view of it.
+            # NEGATIVE CONTROL (scripts/tests/audit_first_party_pins_test.py,
+            # test_a_second_worktree_writes_nothing_into_the_store_it_shares):
+            # without the view the fetches below land in the shared store.
+            try:
+                holder, git_dir = store_view(git_dir)
+            except RuntimeError as error:
+                print(f"{path:<22} ERROR {error}")
+                operational_failures.append((path, str(error)))
+                continue
+            views.append(holder)
         url = remote_url(repo, path)
         pins, error = pins_for_checked(repo, path, resolved_rev)
         if pins is None:
@@ -884,7 +978,12 @@ def main() -> int:
                 indeterminate_all.append((path, sha))
             continue
 
-        if args.fetch:
+        if args.fetch and shared:
+            # The refs --fetch refreshes are the first checkout's, and the
+            # verdict never reads them.
+            print(f"{path:<22} --fetch: not refreshed here; its store is another "
+                  f"checkout's ({submodule_git_dir(repo, path)}): run --fetch there")
+        elif args.fetch:
             error = refresh_remote_refs(git_dir)
             if error:
                 print(f"{path:<22} ERROR {error}")
@@ -985,6 +1084,9 @@ def main() -> int:
         for sha in indeterminate:
             print(f"    UNKNOWN {sha}  ({unknown_why})")
             indeterminate_all.append((path, sha))
+
+    for holder in views:
+        holder.cleanup()
 
     print()
     if operational_failures:

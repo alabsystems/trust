@@ -2,8 +2,11 @@
 """Actual operation lifetime controls; no remote or ancestry verdict is mocked."""
 import contextlib
 import errno
+import hashlib
+import io
 import json
 import os
+import random
 import shutil
 from pathlib import Path
 import signal
@@ -13,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zlib
 from unittest.mock import patch
 
 LIB = Path(__file__).resolve().parents[1] / "lib"
@@ -493,6 +497,142 @@ class SourceIntakeViewTests(unittest.TestCase):
         self.assertEqual((self.root / "untracked").read_text(), "preserve untracked\n")
         self.assertFalse(self.marker.exists())
         self.assertTrue(all(not view.parents[1].exists() for view in self.views))
+
+    def shared_payload(self, payload):
+        (self.root / "retained.bin").write_bytes(payload)
+        self.git(self.root, "add", "retained.bin")
+        self.git(self.root, "-c", "hook.ref-transaction.command=true", "commit", "-qm", "shared payload")
+        self.before = self.git(self.root, "rev-parse", "HEAD")
+        self.refs = self.git(self.root, "show-ref")
+        self.git(self.source, "fetch", "-q", str(self.root), "main")
+        self.git(self.source, "reset", "--hard", self.before)
+        (self.source / "source.txt").write_text("native fetched source\n")
+        self.git(self.source, "commit", "-qam", "new selected source")
+        self.oid = self.git(self.source, "rev-parse", "HEAD")
+        return self.git(self.root, "rev-parse", "HEAD:retained.bin")
+
+    def test_unchanged_large_blob_is_hashed_but_absent_from_actual_import_pack(self):
+        shared = self.shared_payload(random.Random(4321).randbytes(4 * 1024 * 1024))
+        packs = []
+        def inspect(arguments, kwargs, done):
+            if "pack-objects" not in arguments or done.returncode:
+                return
+            ids = set(kwargs["input_text"].splitlines())
+            self.assertNotIn(shared, ids)
+            prefix = str(arguments[-1]) + "-" + done.stdout.strip()
+            with Path(prefix + ".idx").open("rb") as index:
+                shown = subprocess.run(["git", "show-index"], stdin=index, env=self.env,
+                                       capture_output=True, text=True, check=True)
+            actual = {row.split()[1] for row in shown.stdout.splitlines()}
+            self.assertEqual(actual, ids)
+            self.assertNotIn(shared, actual)
+            packs.append(Path(prefix + ".pack").stat().st_size)
+        result = self.intake(after_local=inspect)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(packs), 1)
+        self.assertLess(packs[0], 128 * 1024)
+        self.assertEqual(self.git(self.root, "cat-file", "-s", shared), str(4 * 1024 * 1024))
+        self.assert_original_unchanged()
+
+    def test_present_blob_with_valid_zlib_but_wrong_raw_hash_refuses_before_import(self):
+        shared = self.shared_payload(b"retained selected body\n")
+        path = self.root / ".git/objects" / shared[:2] / shared[2:]
+        path.chmod(0o644)
+        wrong = b"X" * len(b"retained selected body\n")
+        corrupted = zlib.compress(b"blob " + str(len(wrong)).encode() + b"\0" + wrong)
+        path.write_bytes(corrupted)
+        result = self.intake()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("framing/hash differs", result.stderr)
+        self.assertIn("native-diagnostic", result.stderr)
+        self.assertFalse(self.intakes)
+        self.assertEqual(path.read_bytes(), corrupted)
+        self.assert_original_unchanged()
+
+    def test_corrupt_present_blob_is_not_accepted_as_a_missing_object(self):
+        shared = self.shared_payload(b"retained selected body\n")
+        path = self.root / ".git/objects" / shared[:2] / shared[2:]
+        path.chmod(0o644)
+        path.write_bytes(b"not a compressed Git object")
+        result = self.intake()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("native-diagnostic", result.stderr)
+        self.assertFalse(self.intakes)
+        self.assertEqual(path.read_bytes(), b"not a compressed Git object")
+        self.assert_original_unchanged()
+
+    def test_missing_ancestor_commit_header_is_imported_without_moving_original_head(self):
+        ancestor = self.before
+        raw = subprocess.check_output(["git", "-C", str(self.root), "cat-file", "commit", ancestor], env=self.env)
+        tree = self.git(self.root, "rev-parse", "HEAD^{tree}")
+        descendant = subprocess.run(["git", "-C", str(self.root), "commit-tree", tree, "-p", ancestor],
+                                    input="retained current head\n", text=True, env=self.env,
+                                    capture_output=True, check=True).stdout.strip()
+        self.git(self.root, "-c", "hook.ref-transaction.command=true", "update-ref", "HEAD", descendant)
+        self.before, self.refs = descendant, self.git(self.root, "show-ref")
+        (self.root / ".git/objects" / ancestor[:2] / ancestor[2:]).unlink()
+        result = self.intake()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        restored = subprocess.check_output(["git", "-C", str(self.root), "cat-file", "commit", ancestor], env=self.env)
+        self.assertEqual(restored, raw)
+        self.assertEqual(hashlib.sha1(b"commit " + str(len(raw)).encode() + b"\0" + restored).hexdigest(), ancestor)
+        self.assert_original_unchanged()
+
+    def test_zero_new_objects_skips_pack_and_import_but_rechecks_original_selected_closure(self):
+        first = self.intake()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.intakes.clear()
+        packed, checked = [], []
+        def inspect(arguments, kwargs, done):
+            if "pack-objects" in arguments:
+                packed.append(arguments)
+            if (arguments[:3] == ["git", "-C", str(self.root.resolve())]
+                    and "rev-list" in arguments and "--objects" in arguments and "--missing=error" in arguments):
+                checked.append(done.returncode)
+        second = self.intake(after_local=inspect)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(packed)
+        self.assertFalse(self.intakes)
+        self.assertEqual(checked, [0])
+        self.assert_original_unchanged()
+
+    def test_source_stream_budgets_are_exact_and_independent_of_metadata_limit(self):
+        bodies = [b"a" * 1024, b"b" * 1024]
+        ids = [hashlib.sha1(b"blob 1024\0" + body).hexdigest() for body in bodies]
+        raw = b"".join(oid.encode() + b" blob 1024\n" + body + b"\n" for oid, body in zip(ids, bodies))
+        expected = {oid: ("blob", 1024) for oid in ids}
+        with patch.object(rt, "MAX_OBJECT_READ_BYTES", 1):
+            rows = list(rt._verified_original_rows(io.BytesIO(raw), ids, expected=expected,
+                        retain_body=False, byte_budget=2048, object_limit=1024))
+        self.assertEqual([kind for _oid, kind, _body in rows], [b"blob", b"blob"])
+        self.assertTrue(all(body is None for _oid, _kind, body in rows))
+        for budget, maximum, message in ((2047, 1024, "source byte budget"),
+                                          (2048, 1023, "source object budget")):
+            with self.subTest(budget=budget, maximum=maximum), self.assertRaisesRegex(ValueError, message):
+                list(rt._verified_original_rows(io.BytesIO(raw), ids, expected=expected,
+                     retain_body=False, byte_budget=budget, object_limit=maximum))
+
+    def test_source_reader_deadline_stops_and_reaps_its_blocked_owned_child(self):
+        actual = subprocess.Popen
+        children = []
+        def blocked(arguments, **kwargs):
+            if arguments != ["git", "-C", str(self.root), "cat-file", "--batch"]:
+                return actual(arguments, **kwargs)
+            child = actual([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+            children.append(child)
+            return child
+        start = time.monotonic()
+        with patch.object(rt.subprocess, "Popen", side_effect=blocked):
+            result, held = rt._verified_present_objects(self.root,
+                {"1" * 40: ("blob", 4)}, env=self.env, timeout=0.1)
+        self.assertEqual(result.returncode, 124)
+        self.assertIsNone(held)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(children[0].pid, os.WNOHANG)
+        self.assert_original_unchanged()
 
     def test_new_objects_survive_private_cleanup_without_original_config_refs_or_checkout_changes(self):
         result = self.intake(call_env=dict(self.env, GIT_OBJECT_DIRECTORY="/not-the-object-output"))

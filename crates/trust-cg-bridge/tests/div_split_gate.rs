@@ -1018,8 +1018,10 @@ fn signed_requires_lean_semantics(ir: &str, subject: &str, rem: bool) {
                 unit_fixture(subject, opt),
                 "{subject} {triple} {opt:?}: original conjunction changed"
             );
-            assert!(report.ships(EmitPolicy::StrictProvenOnly).is_err(),
-                "{subject} {triple} {opt:?}: signed object shipped without Lean semantics");
+            assert!(
+                report.ships(EmitPolicy::StrictProvenOnly).is_err(),
+                "{subject} {triple} {opt:?}: signed object shipped without Lean semantics"
+            );
         }
     }
 }
@@ -1082,8 +1084,10 @@ fn an_unchecked_overflow_twin_still_requires_lean_semantics() {
             let fx = signed_fixture(SDIV_ZERO_GUARD_IR, &spec, triple, opt);
             let (report, calls) = report_recording(&fx);
             assert_eq!(calls, [false], "{triple} {opt:?}: signed evidence escaped");
-            assert!(report.ships(EmitPolicy::StrictProvenOnly).is_err(),
-                "{triple} {opt:?}: unchecked signed twin shipped");
+            assert!(
+                report.ships(EmitPolicy::StrictProvenOnly).is_err(),
+                "{triple} {opt:?}: unchecked signed twin shipped"
+            );
         }
     }
 }
@@ -1138,8 +1142,10 @@ fn a_raw_signed_remainder_twin_still_requires_lean_semantics() {
             let fx = signed_fixture(RAW_SREM_IR, RAW_SREM_IR, triple, opt);
             let (report, calls) = report_recording(&fx);
             assert_eq!(calls, [false], "{triple} {opt:?}: signed evidence escaped");
-            assert!(report.ships(EmitPolicy::StrictProvenOnly).is_err(),
-                "{triple} {opt:?}: raw signed remainder shipped");
+            assert!(
+                report.ships(EmitPolicy::StrictProvenOnly).is_err(),
+                "{triple} {opt:?}: raw signed remainder shipped"
+            );
         }
     }
 }
@@ -1179,22 +1185,77 @@ const ZERO_GUARD_REM_PIN: &str = "[VALIDATED] Proven { evidence: AyValidated } c
 /// `sdiv` made `udiv`; the `sdiv` operands swapped; for `%`, `msub` made `madd` and its Ra set to
 /// its Rm. IR, against the original bytes: the guard's `-1` made `-2`; its `MIN` made `MIN + 1`;
 /// the `-1` compare's `icmp ne` made `eq`; `sdiv`/`srem` made unsigned; the operands swapped.
+fn visit_signed_mutants(
+    fx: &Fixture,
+    ir: &str,
+    rem: bool,
+    mut not_proved: impl FnMut(&Fixture, &str),
+) {
+    let (at, w) = first_of(fx, "the branch on y != 0", 0, |w| is_cb(w) || is_bcond(w));
+    not_proved(&fx.patched(|o| patch_word(o, at, flipped_branch(w))), "zero guard flipped");
+    let (movn, w) = first_of(fx, "movn #0", 0, is_movn0);
+    not_proved(&fx.patched(|o| patch_word(o, movn, w | (1 << 5))), "movn #0 -> #1");
+    let (at, w) = first_of(fx, "movk #0x8000", 0, is_movk_8000_48);
+    let k = (w & !(0xffff << 5)) | (0x4000 << 5);
+    not_proved(&fx.patched(|o| patch_word(o, at, k)), "movk #0x8000 -> #0x4000");
+    let (at, w) = first_of(fx, "cmp x0, xd", 0, is_cmp_x0_reg);
+    not_proved(&fx.patched(|o| patch_word(o, at, with_field(w, 5, 1))), "MIN cmp reads x1");
+    let (at, w) = first_of(fx, "the branch after the -1 compare", movn, is_bcond);
+    not_proved(&fx.patched(|o| patch_word(o, at, flipped_branch(w))), "-1 branch flipped");
+    let (at, w) = the_one(fx, "sdiv", is_sdiv);
+    not_proved(&fx.patched(|o| patch_word(o, at, w & !(1 << 10))), "sdiv -> udiv");
+    let (rn, rm) = ((w >> 5) & 31, (w >> 16) & 31);
+    let swapped = with_field(with_field(w, 5, rm), 16, rn);
+    not_proved(&fx.patched(|o| patch_word(o, at, swapped)), "sdiv operands swapped");
+    if rem {
+        let (at, w) = the_one(fx, "msub", is_msub);
+        let rm = (w >> 16) & 31;
+        not_proved(&fx.patched(|o| patch_word(o, at, w & !(1 << 15))), "msub -> madd");
+        not_proved(&fx.patched(|o| patch_word(o, at, with_field(w, 10, rm))), "msub Ra := Rm");
+    }
+    let op = if rem { "srem" } else { "sdiv" };
+    let un = if rem { "urem" } else { "udiv" };
+    let ir_m = |from: &str, to: &str| against(fx, &replace_once(ir, from, to));
+    not_proved(&ir_m("%7 = const i64 -1", "%7 = const i64 -2"), "IR -1 -> -2");
+    not_proved(
+        &ir_m("%10 = const i64 -9223372036854775808", "%10 = const i64 -9223372036854775807"),
+        "IR MIN -> MIN + 1",
+    );
+    not_proved(&ir_m("%8 = icmp ne", "%8 = icmp eq"), "IR -1 icmp ne -> eq");
+    not_proved(
+        &ir_m(&format!("{op} i64 %0, %1"), &format!("{un} i64 %0, %1")),
+        "IR signed -> unsigned",
+    );
+    not_proved(
+        &ir_m(&format!("{op} i64 %0, %1"), &format!("{op} i64 %1, %0")),
+        "IR operands swapped",
+    );
+}
+
 fn signed_mutants(ir: &str, subject: &str, rem: bool) -> Vec<(String, String)> {
     let mut seen = Vec::new();
     for triple in BOTH {
         for opt in OPTS {
             let fx = signed_fixture(ir, ir, triple, opt);
             let (baseline, baseline_calls) = report_recording(&fx);
-            assert_eq!(baseline_calls, [false], "{subject} {triple} {opt:?}: signed baseline gained evidence");
-            assert!(baseline.ships(EmitPolicy::StrictProvenOnly).is_err(),
-                "{subject} {triple} {opt:?}: signed baseline shipped");
+            assert_eq!(
+                baseline_calls,
+                [false],
+                "{subject} {triple} {opt:?}: signed baseline gained evidence"
+            );
+            assert!(
+                baseline.ships(EmitPolicy::StrictProvenOnly).is_err(),
+                "{subject} {triple} {opt:?}: signed baseline shipped"
+            );
             let mut not_proved = |m: &Fixture, what: &str| {
                 let (report, calls) = verify_recording(m);
                 let report = report.unwrap_or_else(|refusal| {
                     panic!("{triple}: MUTANT `{subject} {what}`: object refused: {refusal}")
                 });
-                assert!(report.ships(EmitPolicy::StrictProvenOnly).is_err(),
-                    "{triple}: MUTANT `{subject} {what}` shipped without Lean semantics");
+                assert!(
+                    report.ships(EmitPolicy::StrictProvenOnly).is_err(),
+                    "{triple}: MUTANT `{subject} {what}` shipped without Lean semantics"
+                );
                 let c = report.certificate("rung").expect("certificate");
                 let kind = match &c.verdict {
                     OutputVerdict::Refuted { .. } => "Refuted".to_string(),
@@ -1204,51 +1265,7 @@ fn signed_mutants(ir: &str, subject: &str, rem: bool) -> Vec<(String, String)> {
                 };
                 seen.push((format!("{triple} {opt:?} {what}"), format!("{kind} calls {calls:?}")));
             };
-            let (at, w) = first_of(&fx, "the branch on y != 0", 0, |w| is_cb(w) || is_bcond(w));
-            not_proved(&fx.patched(|o| patch_word(o, at, flipped_branch(w))), "zero guard flipped");
-            let (movn, w) = first_of(&fx, "movn #0", 0, is_movn0);
-            not_proved(&fx.patched(|o| patch_word(o, movn, w | (1 << 5))), "movn #0 -> #1");
-            let (at, w) = first_of(&fx, "movk #0x8000", 0, is_movk_8000_48);
-            let k = (w & !(0xffff << 5)) | (0x4000 << 5);
-            not_proved(&fx.patched(|o| patch_word(o, at, k)), "movk #0x8000 -> #0x4000");
-            let (at, w) = first_of(&fx, "cmp x0, xd", 0, is_cmp_x0_reg);
-            not_proved(&fx.patched(|o| patch_word(o, at, with_field(w, 5, 1))), "MIN cmp reads x1");
-            let (at, w) = first_of(&fx, "the branch after the -1 compare", movn, is_bcond);
-            not_proved(&fx.patched(|o| patch_word(o, at, flipped_branch(w))), "-1 branch flipped");
-            let (at, w) = the_one(&fx, "sdiv", is_sdiv);
-            not_proved(&fx.patched(|o| patch_word(o, at, w & !(1 << 10))), "sdiv -> udiv");
-            let (rn, rm) = ((w >> 5) & 31, (w >> 16) & 31);
-            let swapped = with_field(with_field(w, 5, rm), 16, rn);
-            not_proved(&fx.patched(|o| patch_word(o, at, swapped)), "sdiv operands swapped");
-            if rem {
-                let (at, w) = the_one(&fx, "msub", is_msub);
-                let rm = (w >> 16) & 31;
-                not_proved(&fx.patched(|o| patch_word(o, at, w & !(1 << 15))), "msub -> madd");
-                not_proved(
-                    &fx.patched(|o| patch_word(o, at, with_field(w, 10, rm))),
-                    "msub Ra := Rm",
-                );
-            }
-            let op = if rem { "srem" } else { "sdiv" };
-            let un = if rem { "urem" } else { "udiv" };
-            let ir_m = |from: &str, to: &str| against(&fx, &replace_once(ir, from, to));
-            not_proved(&ir_m("%7 = const i64 -1", "%7 = const i64 -2"), "IR -1 -> -2");
-            not_proved(
-                &ir_m(
-                    "%10 = const i64 -9223372036854775808",
-                    "%10 = const i64 -9223372036854775807",
-                ),
-                "IR MIN -> MIN + 1",
-            );
-            not_proved(&ir_m("%8 = icmp ne", "%8 = icmp eq"), "IR -1 icmp ne -> eq");
-            not_proved(
-                &ir_m(&format!("{op} i64 %0, %1"), &format!("{un} i64 %0, %1")),
-                "IR signed -> unsigned",
-            );
-            not_proved(
-                &ir_m(&format!("{op} i64 %0, %1"), &format!("{op} i64 %1, %0")),
-                "IR operands swapped",
-            );
+            visit_signed_mutants(&fx, ir, rem, &mut not_proved);
         }
     }
     seen
@@ -1574,3 +1591,7 @@ obligation 0 arithmetic_safety pending "direct THIR Assert (div_by_zero) at L3C4
 
 obligation 1 arithmetic_safety pending "direct THIR Assert (overflow) at L3C4 of `rung::rung`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "rung::rung#L3C4#overflow#o0" range 0 3 4 3 9 site f0/bb0#9
 "#;
+
+#[cfg(feature = "fmrel")]
+#[path = "div_split_gate/fmrel.rs"]
+mod fmrel;

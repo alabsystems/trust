@@ -24,7 +24,24 @@ pub use graph::{
 pub use preparation_configuration::ClosedFullPreparationConfiguration;
 pub(crate) use preparation_configuration::capture_original_configuration;
 
-pub use crate::core::config::InputLayout;
+pub use crate::core::config::{InputLayout, SeedConfiguration};
+
+/// Observe configured stage0 overrides through Bootstrap's one typed parser
+/// and include/profile merger. The source classification must come from the
+/// caller's original source observation; neither it nor this result supplies
+/// read custody, a tool image, a seed, execution admission or completion.
+///
+/// This metadata gate has no --set surface, matching the existing freshness
+/// command. Every selected file is parsed from the exact bytes whose digest is
+/// returned. I/O refusal kinds survive; malformed TOML and cycles are invalid
+/// data. No Config, Session, child or source/output owner is constructed.
+pub fn seed_configuration(
+    source: &Path,
+    config: Option<PathBuf>,
+    source_is_tarball: bool,
+) -> std::io::Result<SeedConfiguration> {
+    Config::seed_configuration(source, config, source_is_tarball)
+}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod full;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

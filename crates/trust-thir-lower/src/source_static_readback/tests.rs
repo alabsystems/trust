@@ -42,7 +42,7 @@ fn memory() -> ConstantImageMemory {
 fn graph() -> Graph {
     let mut graph = Graph::default();
     let id = graph.reserve(allocation(1)).unwrap();
-    graph.nodes.insert(id, ConstantImageNode::Memory(memory()));
+    graph.nodes.insert(id, ConstantImageNode::Memory(memory()).into());
     graph
 }
 
@@ -58,7 +58,7 @@ fn allocation_identity_not_contents_controls_reservation() {
     let mut graph = graph();
     assert_eq!(graph.reserve(allocation(1)).unwrap(), 0);
     assert_eq!(graph.reserve(allocation(2)).unwrap(), 1);
-    graph.nodes.insert(1, ConstantImageNode::Memory(memory()));
+    graph.nodes.insert(1, ConstantImageNode::Memory(memory()).into());
     assert_eq!(graph.nodes[&0], graph.nodes[&1]);
     assert_ne!(graph.allocations[0], graph.allocations[1]);
     assert!(graph.validate().is_ok());
@@ -78,7 +78,7 @@ fn self_cycle_uses_reserved_identity_without_recursive_expansion() {
             shared_ref: true,
         },
     });
-    graph.nodes.insert(0, ConstantImageNode::Memory(memory));
+    graph.nodes.insert(0, ConstantImageNode::Memory(memory).into());
     assert!(graph.validate().is_ok());
     assert_eq!(graph.allocations.len(), 1);
     assert!(graph_json(&[], &graph, &BTreeSet::new()).contains("\"allocation_id\":0"));
@@ -130,7 +130,7 @@ fn unfinished_and_orphan_graphs_are_not_rendered_as_complete() {
     graph.reserve(allocation(2)).unwrap();
     assert!(graph.validate().unwrap_err().contains("incomplete"));
     assert!(graph_json(&[], &graph, &BTreeSet::new()).contains("\"nodes\":[]"));
-    graph.nodes.insert(1, ConstantImageNode::Memory(memory()));
+    graph.nodes.insert(1, ConstantImageNode::Memory(memory()).into());
     let mut memory = memory();
     memory.relocations.push(ConstantImageRelocation {
         offset_bytes: 0,
@@ -141,7 +141,7 @@ fn unfinished_and_orphan_graphs_are_not_rendered_as_complete() {
             shared_ref: false,
         },
     });
-    graph.nodes.insert(0, ConstantImageNode::Memory(memory));
+    graph.nodes.insert(0, ConstantImageNode::Memory(memory).into());
     assert!(graph.validate().unwrap_err().contains("orphan relocation"));
     let report = graph_json(&[], &graph, &BTreeSet::new());
     assert!(report.contains("\"capture_status\":\"refused\""));
@@ -262,4 +262,26 @@ fn coverage_append_is_opt_in_canonical_and_inside_the_existing_commit_marker() {
     assert!(append_to_coverage("{}".into(), Some("{}")).is_err());
     assert!(append_to_coverage("{}\r\n".into(), Some("{}")).is_err());
     assert_eq!(quoted("\"\\\n\r\t\u{1f}é"), "\"\\\"\\\\\\n\\r\\t\\u001fé\"");
+}
+
+#[test]
+fn untyped_nested_static_keeps_identity_mutability_and_cold_bytes() {
+    let mut graph = Graph::default();
+    let id = graph.reserve(allocation(1)).unwrap();
+    graph.nodes.insert(
+        id,
+        ReadbackNode::NestedStatic {
+            definition: definition_named("ROOT::{nested#0}", 23),
+            declared_mutable: true,
+            initializer: memory(),
+        },
+    );
+    assert!(graph.validate().is_ok());
+    let json = graph_json(&[], &graph, &BTreeSet::new());
+    assert!(json.contains("\"kind\":\"nested_static\""));
+    assert!(json.contains("ROOT::{nested#0}"));
+    assert!(json.contains("\"rust_type\":null,\"freeze\":null"));
+    assert!(json.contains("\"declared_mutable\":true"));
+    assert!(json.contains("[0,null,255,null]"));
+    assert!(!json.contains("\"kind\":\"memory\""));
 }

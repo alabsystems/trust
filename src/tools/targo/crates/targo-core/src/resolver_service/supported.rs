@@ -560,7 +560,8 @@ impl ProcessExecutor for Owner {
         self.execute(p)
     }
     fn status(&self, p: &ProcessBuilder) -> io::Result<ExitStatus> {
-        self.execute(p).map(|o| o.status)
+        self.execute(p)
+            .and_then(|output| p.report_captured_status(output))
     }
     fn streaming(
         &self,

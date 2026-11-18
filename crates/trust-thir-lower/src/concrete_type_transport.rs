@@ -30,6 +30,21 @@ impl<'tcx> ConcreteTypes<'tcx> {
     pub fn sources(&self) -> &[ty::Ty<'tcx>] {
         &self.sources
     }
+
+    /// Determine metadata from the retained substituted Rust source, independently
+    /// of the converter's historical unknown-to-Ptr fallback. This is a shape
+    /// observation only; no source refinement, provenance or memory right follows.
+    pub fn root_is_thin_pointer(&self, tcx: TyCtxt<'tcx>, index: usize) -> bool {
+        let Some(source) = self.sources.get(index) else {
+            return false;
+        };
+        let pointee = match source.kind() {
+            ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _) => *pointee,
+            _ => return false,
+        };
+        self.roots.get(index) == Some(&Ty::Ptr)
+            && crate::source_pointee_meta_and_tail(tcx, pointee).0 == crate::PointeeMeta::Thin
+    }
 }
 
 fn checked_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> Result<(), String> {
@@ -135,15 +150,10 @@ pub fn lower<'tcx>(
     {
         return Err("concrete type transport producer refused or confined a type".into());
     }
-    // Callable rows reserve signature slot0 for a body. They need their own
-    // authentic host table transport before this body-free image can carry them.
-    if !cx.pending_func_tys.is_empty()
-        || !cx.pending_closure_tys.is_empty()
-        || !cx.pending_closure_layouts.is_empty()
-        || !cx.pending_globals.is_empty()
-        || !cx.pending_adapters.is_empty()
-    {
-        return Err("concrete type transport requires callable/global table transport".into());
+    // Types may refer to callable signatures and physical closure frames;
+    // neither requires a callable body, adapter, global or destructor here.
+    if !cx.pending_globals.is_empty() || !cx.pending_adapters.is_empty() {
+        return Err("concrete type transport requires executable/global transport".into());
     }
     let mut module = Module::new("concrete_source_types");
     module.target_info = Some(crate::crate_module::source_target_info(tcx));
@@ -151,6 +161,21 @@ pub fn lower<'tcx>(
     module.structs = cx.pending_structs.clone();
     module.enums = cx.pending_enums.clone();
     module.tuple_layouts = cx.pending_tuple_layouts.clone();
+    if !cx.pending_func_tys.is_empty() {
+        // The original converter numbers pended signatures from one. Fill its
+        // reserved zero with this ordinary root carrier, exactly as canonical
+        // placement already does. It describes types and has no function body
+        // or source/native ABI claim. Do not renumber the converter's tables.
+        module.func_types.push(trust_ir::FuncTy {
+            params: roots.clone(),
+            returns: Vec::new(),
+            is_vararg: false,
+            abi: None,
+        });
+        module.func_types.extend(cx.pending_func_tys.iter().cloned());
+    }
+    module.closure_types = cx.pending_closure_tys.clone();
+    module.closure_layouts = cx.pending_closure_layouts.clone();
     let errors = trust_ir_build::validate::validate_module(&module);
     if !errors.is_empty() {
         return Err(format!("concrete type transport invalid producer tables: {errors:?}"));

@@ -629,6 +629,34 @@ fn abstraction_round_trips_through_the_embedding() {
     assert_eq!(again, t, "abstract . embed . abstract = abstract");
 }
 
+#[test]
+fn function_item_singletons_round_trip_with_their_exact_module_identity() {
+    let id = FuncId::new(0);
+    let mut module = sentinel_module(
+        vec![],
+        vec![Ty::FnItem(id)],
+        vec![
+            node_r(Inst::Const { ty: Ty::FnItem(id), value: Constant::FnItem(id) }, 0),
+            node(Inst::Return { values: vec![v(0)] }),
+        ],
+    );
+    module.functions[0].name = TEMPLATE_BODY_NAME.to_string();
+    assert!(trust_ir_build::validate_module(&module).is_empty());
+    let facts = LaneFacts::default();
+    let template = abstracted(&module, &facts).expect("nominal singleton abstracts");
+    assert_eq!(template.module.func_types[0].returns, [TyG::FnItem(id)]);
+    assert!(matches!(
+        &template.module.functions[0].blocks[0].body[0].inst,
+        InstG::Const { ty: TyG::FnItem(ty_id), value: ConstantG::FnItem(value_id) }
+            if *ty_id == id && *value_id == id
+    ));
+    assert_eq!(embed_template(&template), module);
+    let mut foreign = module.clone();
+    foreign.functions[0].blocks[0].body[0].inst =
+        Inst::Const { ty: Ty::FnItem(id), value: Constant::FnItem(FuncId::new(1)) };
+    assert!(!trust_ir_build::validate_module(&foreign).is_empty());
+}
+
 // ---------------------------------------------------------------------------------------- 5
 
 /// T7: the body row is named `!template_body` and every fact the host answers is left at its
@@ -834,7 +862,10 @@ fn sentinels_are_canonical() {
         Sentinel::Param(7)
     );
     assert_eq!(symbol_sentinel(&const_param_sentinel(12)), Sentinel::Param(12));
-    assert_eq!(dialect_sentinel(&DialectTy::new(SENTINEL_NAMESPACE, "hole_0", 1)), Sentinel::Hole(0));
+    assert_eq!(
+        dialect_sentinel(&DialectTy::new(SENTINEL_NAMESPACE, "hole_0", 1)),
+        Sentinel::Hole(0)
+    );
     for name in ["param_", "param_07", "param_x", "hole_", "hole_00", "hole_x"] {
         let d = DialectTy::new(SENTINEL_NAMESPACE, name, SENTINEL_VERSION);
         assert_eq!(dialect_sentinel(&d), Sentinel::Malformed, "{name}");
@@ -862,31 +893,102 @@ fn sentinels_are_canonical() {
 fn type_holes_require_owned_keys_arguments_and_dense_ids() {
     use crate::template_key::{HoleKey, KeyConst, KeyTy};
     let h = Ty::Dialect(Box::new(DialectTy::new(SENTINEL_NAMESPACE, "hole_0", 1)));
-    let module = sentinel_module(vec![h.clone()], vec![h], vec![node(Inst::Return { values: vec![v(0)] })]);
+    let module =
+        sentinel_module(vec![h.clone()], vec![h], vec![node(Inst::Return { values: vec![v(0)] })]);
     let mut facts = LaneFacts {
-        owner: Some((1, 2)), parameter_indices: vec![1, 3],
-        params: vec![LaneParam::Type, LaneParam::Const(Ty::Usize)], ..Default::default()
+        owner: Some((1, 2)),
+        parameter_indices: vec![1, 3],
+        params: vec![LaneParam::Type, LaneParam::Const(Ty::Usize)],
+        ..Default::default()
     };
     assert!(abstracted(&module, &facts).is_err(), "unowned sentinel");
     facts.type_holes.push(TypeHole {
         id: HoleId::new(0),
         key: HoleKey::Type(KeyTy::Array(Box::new(KeyTy::Param(1)), KeyConst::Param(3))),
-        dependencies: vec![(1, TemplateArg::Type(ext0())), (3, TemplateArg::Const {
-            value: ConstantG::Ext(TemplateRef::Param(ParamId::new(1))), ty: Ty::Usize,
-        })],
+        contract: trust_ir::template::TypeContract::Opaque,
+        dependencies: vec![
+            (1, TemplateArg::Type(ext0())),
+            (
+                3,
+                TemplateArg::Const {
+                    value: ConstantG::Ext(TemplateRef::Param(ParamId::new(1))),
+                    ty: Ty::Usize,
+                },
+            ),
+        ],
     });
     let template = abstracted(&module, &facts).unwrap();
     assert!(validate_template(&template).is_empty());
-    let mut changed = facts.clone(); changed.owner = None;
+    let mut changed = facts.clone();
+    changed.owner = None;
     assert!(abstracted(&module, &changed).is_err());
-    changed = facts.clone(); changed.type_holes[0].dependencies.reverse();
+    changed = facts.clone();
+    changed.type_holes[0].dependencies.reverse();
     assert!(abstracted(&module, &changed).is_err());
-    changed = facts.clone(); changed.parameter_indices[1] = 2;
+    changed = facts.clone();
+    changed.parameter_indices[1] = 2;
     assert!(abstracted(&module, &changed).is_err());
-    changed = facts.clone(); changed.type_holes[0].id = HoleId::new(1);
+    changed = facts.clone();
+    changed.type_holes[0].id = HoleId::new(1);
     assert!(abstracted(&module, &changed).is_err());
-    changed = facts.clone(); changed.type_holes.push(changed.type_holes[0].clone());
+    changed = facts.clone();
+    changed.type_holes.push(changed.type_holes[0].clone());
     assert!(abstracted(&module, &changed).is_err());
+}
+
+#[test]
+fn thin_pointer_operations_require_the_registered_contract_and_exact_sentinel() {
+    use trust_ir::template::TypeContract;
+
+    use crate::template_key::{HoleKey, KeyTy};
+    let mut hole = TypeHole {
+        id: HoleId::new(0),
+        key: HoleKey::Type(KeyTy::RawPtr { mutable: false, pointee: Box::new(KeyTy::Param(0)) }),
+        contract: TypeContract::ThinPointer,
+        dependencies: vec![(0, TemplateArg::Type(ext0()))],
+    };
+    let carrier =
+        |namespace, name, version| Ty::Dialect(Box::new(DialectTy::new(namespace, name, version)));
+    let actual = carrier(SENTINEL_NAMESPACE, "hole_0", SENTINEL_VERSION);
+    assert!(is_thin_pointer_hole(&actual, &[hole.clone()]));
+    assert!(!is_thin_pointer_hole(&actual, &[]));
+    for forged in [
+        carrier("other", "hole_0", SENTINEL_VERSION),
+        carrier(SENTINEL_NAMESPACE, "hole_0", SENTINEL_VERSION + 1),
+        carrier(SENTINEL_NAMESPACE, "hole_00", SENTINEL_VERSION),
+        carrier(SENTINEL_NAMESPACE, "hole_1", SENTINEL_VERSION),
+        carrier(SENTINEL_NAMESPACE, "param_0", SENTINEL_VERSION),
+        Ty::U64,
+    ] {
+        assert!(!is_thin_pointer_hole(&forged, &[hole.clone()]));
+    }
+    hole.contract = TypeContract::Opaque;
+    assert!(!is_thin_pointer_hole(&actual, &[hole]));
+}
+
+#[test]
+fn abstraction_preserves_the_owned_pointer_contract() {
+    use trust_ir::template::TypeContract;
+
+    use crate::template_key::{HoleKey, KeyTy};
+    let h = Ty::Dialect(Box::new(DialectTy::new(SENTINEL_NAMESPACE, "hole_0", 1)));
+    let module =
+        sentinel_module(vec![h.clone()], vec![h], vec![node(Inst::Return { values: vec![v(0)] })]);
+    let mut facts = type_facts();
+    facts.owner = Some((1, 2));
+    facts.parameter_indices = vec![0];
+    facts.type_holes.push(TypeHole {
+        id: HoleId::new(0),
+        key: HoleKey::Type(KeyTy::RawPtr { mutable: false, pointee: Box::new(KeyTy::Param(0)) }),
+        contract: TypeContract::ThinPointer,
+        dependencies: vec![(0, TemplateArg::Type(ext0()))],
+    });
+    let template = abstracted(&module, &facts).unwrap();
+    assert!(validate_template(&template).is_empty());
+    assert_eq!(
+        template.header.holes[0].kind,
+        HoleKind::Type { contract: TypeContract::ThinPointer }
+    );
 }
 
 // ---------------------------------------------------------------------------------------- 8
@@ -1015,4 +1117,135 @@ fn every_tensor_construct_is_refused_by_name() {
     // The control.
     let t = abstracted(&ident_module(), &type_facts()).expect("abstracts");
     assert_eq!(validate_template(&t), Vec::new());
+}
+
+#[test]
+fn new_ir_carrier_templates_transport_nominal_targets_and_refuse_box_facts() {
+    use trust_ir::box_validity::{
+        BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+    };
+    let facts = type_facts();
+    assert!(abstracted(&ident_module(), &facts).is_ok());
+    let item = Ty::FnItem(FuncId::new(0));
+    let mapped = sentinel_module(
+        vec![item.clone()],
+        vec![item.clone()],
+        vec![node(Inst::Return { values: vec![v(0)] })],
+    );
+    let template = abstracted(&mapped, &facts).expect("native function-table transport");
+    let instance = trust_ir_build::template::skolem_instance(&template).expect("checked instance");
+    assert!(trust_ir_build::validate_module(&instance).is_empty());
+    assert!(instance.func_types.iter().any(|row| row.params == [Ty::FnItem(FuncId::new(0))]));
+    let mut ground = ident_module();
+    ground.structs.push(StructDef {
+        id: StructId::new(0),
+        name: "nominal_ground".into(),
+        fields: vec![FieldDef { name: "f".into(), ty: item, offset: None }],
+        repr: StructRepr::Rust,
+        size: None,
+        align: None,
+        origin: None,
+    });
+    let ground = abstracted(&ground, &facts).expect("ground function table stays bound");
+    assert!(validate_template(&ground).is_empty());
+    assert!(trust_ir_build::template::skolem_instance(&ground).is_ok());
+    let nested = sentinel_module(
+        vec![],
+        vec![Ty::I64],
+        vec![
+            node_r(
+                Inst::Const {
+                    ty: Ty::I64,
+                    value: Constant::Aggregate(vec![Constant::FnItem(FuncId::new(0))]),
+                },
+                0,
+            ),
+            node(Inst::Return { values: vec![v(0)] }),
+        ],
+    );
+    // Abstraction constructs unlicensed DATA; pending source and metadata
+    // publication both invoke this exact maintained validator before accepting it.
+    let forged = unchecked(&nested, &facts);
+    assert!(
+        !validate_template(&forged).is_empty(),
+        "wrong nominal constant at scalar type refuses"
+    );
+    let mut scalar = nested.clone();
+    let Inst::Const { value, .. } = &mut scalar.functions[0].blocks[0].body[0].inst else {
+        panic!("owned scalar fixture");
+    };
+    *value = Constant::Int(1);
+    let scalar = abstracted(&scalar, &facts).expect("same scalar lane with a scalar value");
+    assert!(validate_template(&scalar).is_empty(), "valid scalar twin keeps its admission");
+    let mut boxed = sentinel_module(
+        vec![Ty::Ptr],
+        vec![Ty::Ptr],
+        vec![
+            node_r(
+                Inst::BoxDeref {
+                    ptr_ty: Ty::Ptr,
+                    pointee: BoxPointee::Sized { ty: Ty::I64 },
+                    operand: v(0),
+                    fact: Box::new(BoxValidityFact::premise(
+                        BoxDerefSite { item: [0xab; 16], ordinal: 0 },
+                        BoxFactSession::PROOF_SNAPSHOT,
+                        PremiseRoot::ParamByValue,
+                    )),
+                },
+                1,
+            ),
+            node(Inst::Return { values: vec![v(1)] }),
+        ],
+    );
+    boxed.functions[0].body_gate = Some(trust_ir::BodyGate::Ungated);
+    assert!(trust_ir_build::validate_module(&boxed).is_empty());
+    assert!(matches!(abstracted(&boxed, &facts), Err(EntryRefusal::TemplateUnsupported(_))));
+}
+
+/// A trust-ir v73 function-item type and constant name a function by id, as `Ty::Func` and
+/// `Constant::FnDef` do: the level map carries both through (trust-ir-build's template
+/// machinery relocates the id with `FnDef`'s), and neither spells a sentinel.
+#[test]
+fn a_function_item_identity_is_carried_like_a_function_definition() {
+    let item = Ty::FnItem(FuncId::new(0));
+    assert_eq!(abstract_ty(&item, &type_facts()).expect("mapped"), TyG::FnItem(FuncId::new(0)));
+    assert!(!constant_mentions_sentinel(&Constant::FnItem(FuncId::new(0))));
+    let module = ident_module();
+    assert!(!SentinelWalk::new(&module).ty(&item));
+    // A sentinel beside it is still seen.
+    assert!(SentinelWalk::new(&module).ty(&Ty::Tuple(vec![item, t0()])));
+}
+
+/// A trust-ir v74 Box deref is refused BY NAME, `template-unsupported`: its validity fact is
+/// sited at one item and no 6.5.1 rule carries it into an instance. The control abstracts.
+#[test]
+fn a_box_deref_is_refused_by_name() {
+    use trust_ir::box_validity::{
+        BoxDerefSite, BoxFactSession, BoxPointeeG, BoxValidityFact, JudgedBody, PremiseRoot,
+        ProducingSession,
+    };
+    let fact = BoxValidityFact::premise(
+        BoxDerefSite { item: [0; 16], ordinal: 0 },
+        BoxFactSession {
+            judged: JudgedBody::VerificationSnapshot,
+            producing: ProducingSession::ProofSession,
+        },
+        PremiseRoot::ParamByValue,
+    );
+    let deref = Inst::BoxDeref {
+        ptr_ty: Ty::Ptr,
+        pointee: BoxPointeeG::Sized { ty: Ty::I32 },
+        operand: v(0),
+        fact: Box::new(fact),
+    };
+    let m = sentinel_module(
+        vec![Ty::Ptr],
+        vec![Ty::Ptr],
+        vec![node_r(deref, 1), node(Inst::Return { values: vec![v(1)] })],
+    );
+    assert_eq!(
+        abstracted(&m, &type_facts()).expect_err("refused").reason(),
+        "template-unsupported(a Box deref in a template)",
+    );
+    assert!(abstracted(&ident_module(), &type_facts()).is_ok(), "control");
 }

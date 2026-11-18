@@ -21,6 +21,7 @@ pub mod rust;
 pub mod target;
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use build::Build;
@@ -34,7 +35,7 @@ use target::TomlTarget;
 use crate::core::config::toml::pgo::Pgo;
 use crate::core::config::{Config, Merge, ReplaceOpt};
 use crate::utils::change_tracker::{find_recent_config_change_ids, human_readable_changes};
-use crate::utils::helpers::{self, t};
+use crate::utils::helpers::t;
 
 /// Structure of the `bootstrap.toml` file that configuration is read from.
 ///
@@ -57,8 +58,34 @@ pub(crate) struct TomlConfig {
     pub(super) include: Option<Vec<PathBuf>>,
 }
 
-impl Merge for TomlConfig {
-    fn merge(
+// Trust: recursive includes use the same caller reader as the top-level
+// configuration/profile. Section merging remains pure; no hidden I/O reader
+// may bypass native input recording or a caller's original read scope.
+impl TomlConfig {
+    pub(super) fn merge_with_reader(
+        &mut self,
+        parent_config_path: Option<PathBuf>,
+        included_extensions: &mut HashSet<PathBuf>,
+        other: Self,
+        replace: ReplaceOpt,
+        get_toml: &impl Fn(&Path) -> Result<TomlConfig, toml::de::Error>,
+    ) {
+        self.try_merge_with_reader(
+            parent_config_path,
+            included_extensions,
+            other,
+            replace,
+            &|path| {
+                get_toml(path)
+                    .map_err(|error| super::config::configuration_parse_error(path, error))
+            },
+        )
+        .unwrap_or_else(|error| super::config::configuration_error(error));
+    }
+
+    // Trust: one recursive merger serves both ordinary Bootstrap diagnostics
+    // and callers that must retain an unavailable/invalid result as data.
+    pub(super) fn try_merge_with_reader(
         &mut self,
         parent_config_path: Option<PathBuf>,
         included_extensions: &mut HashSet<PathBuf>,
@@ -75,7 +102,8 @@ impl Merge for TomlConfig {
             include,
         }: Self,
         replace: ReplaceOpt,
-    ) {
+        get_toml: &impl Fn(&Path) -> io::Result<TomlConfig>,
+    ) -> io::Result<()> {
         fn do_merge<T: Merge>(x: &mut Option<T>, y: Option<T>, replace: ReplaceOpt) {
             if let Some(new) = y {
                 if let Some(original) = x {
@@ -119,33 +147,38 @@ impl Merge for TomlConfig {
         // keep the upper-level configuration to take precedence.
         for include_path in include.clone().unwrap_or_default().iter().rev() {
             let include_path = parent_dir.join(include_path);
-            let include_path = Config::canonicalize_toml_path(&include_path).unwrap_or_else(|e| {
-                eprintln!("ERROR: Failed to canonicalize '{}' path: {e}", include_path.display());
-                helpers::exit_process(2);
-            });
+            let include_path = Config::canonicalize_toml_path(&include_path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("Failed to canonicalize '{}' path: {error}", include_path.display()),
+                )
+            })?;
+            let included_toml = get_toml(&include_path)?;
 
-            let included_toml = Config::get_toml_inner(&include_path).unwrap_or_else(|e| {
-                eprintln!("ERROR: Failed to parse '{}': {e}", include_path.display());
-                helpers::exit_process(2);
-            });
+            if !included_extensions.insert(include_path.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Cyclic inclusion detected: '{}' is being included again before its previous inclusion was fully processed.",
+                        include_path.display()
+                    ),
+                ));
+            }
 
-            assert!(
-                included_extensions.insert(include_path.clone()),
-                "Cyclic inclusion detected: '{}' is being included again before its previous inclusion was fully processed.",
-                include_path.display()
-            );
-
-            self.merge(
+            let result = self.try_merge_with_reader(
                 Some(include_path.clone()),
                 included_extensions,
                 included_toml,
                 // Ensures that parent configuration always takes precedence
                 // over child configurations.
                 ReplaceOpt::IgnoreDuplicate,
+                get_toml,
             );
 
             included_extensions.remove(&include_path);
+            result?;
         }
+        Ok(())
     }
 }
 
@@ -200,23 +233,34 @@ impl Config {
     // from its retained source/file issuer before they are interpreted.
     pub(crate) fn get_toml_source(
         file: &Path,
-        mut observe: impl FnMut(&str),
+        observe: impl FnMut(&str),
     ) -> Result<TomlConfig, toml::de::Error> {
+        t!(
+            Self::try_get_toml_source(file, observe),
+            format!("config file {} not found", file.display())
+        )
+    }
+
+    // Trust: preserve I/O refusal kinds separately from TOML parse failures.
+    // Both entries observe the bytes supplied by the SAME original reader.
+    pub(crate) fn try_get_toml_source(
+        file: &Path,
+        mut observe: impl FnMut(&str),
+    ) -> io::Result<Result<TomlConfig, toml::de::Error>> {
         let mut parse = |contents: &str| {
             observe(contents);
             Self::parse_toml_contents(contents)
         };
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(result) =
-            t!(crate::utils::metadata_scheduler::host_graph::with_original_configuration(
-                file, &mut parse
-            ))
+            crate::utils::metadata_scheduler::host_graph::with_original_configuration(
+                file, &mut parse,
+            )?
         {
-            return result;
+            return Ok(result);
         }
-        let contents =
-            t!(Self::read_source_text(file), format!("config file {} not found", file.display()));
-        parse(&contents)
+        let contents = Self::read_source_text(file)?;
+        Ok(parse(&contents))
     }
 
     // Trust: native input binding parses the exact string whose digest it keeps.

@@ -637,6 +637,178 @@ pub(crate) fn frontend_runtime_sources(
     Ok(digest(record.as_bytes()))
 }
 
+/// Trust (DC-16a): whether the inputs at `inputs` (paths relative to the checkout at
+/// `src`, each a tree, a file or a submodule's gitlink) are the same at `source`, the
+/// commit a toolchain was built from, as in this checkout: the object HEAD (`head`)
+/// records at each, and no worktree departure under any of them. A submodule's input is
+/// its pin, and a departure under it is the submodule checked out at another commit or
+/// edited, at any depth ([`worktree_changes`]).
+///
+/// An error says which input differs, or why git cannot say: `source` is no commit this
+/// repository holds (it is never fetched), an input is absent on either side, a path
+/// cannot be read, or HEAD moved while the inputs were read. Every error means the
+/// inputs are not known to be equal.
+pub(crate) fn inputs_unchanged_since(
+    exec_ctx: &ExecutionContext,
+    src: &Path,
+    source: &str,
+    head: &Info,
+    inputs: &[&str],
+) -> Result<(), String> {
+    if object_id(source.as_bytes()).as_deref() != Some(source) {
+        return Err(format!("the source toolchain names no full commit: {source:?}"));
+    }
+    let mut git = helpers::git(Some(src)).allow_failure();
+    git.args(["rev-parse", "--verify", "--quiet"]).arg(format!("{source}^{{commit}}"));
+    let held = captured(git, exec_ctx, "git rev-parse --verify", src).ok();
+    if held.as_deref().and_then(object_id).as_deref() != Some(source) {
+        return Err(format!("this repository holds no commit {source}"));
+    }
+    for input in inputs {
+        let then = object_at(exec_ctx, src, source, input);
+        let now = object_at(exec_ctx, src, &head.sha, input);
+        if then.is_none() || then != now {
+            return Err(format!(
+                "{input} is {} at {source} and {} at HEAD {}",
+                then.as_deref().unwrap_or("absent"),
+                now.as_deref().unwrap_or("absent"),
+                head.sha
+            ));
+        }
+    }
+    let mut changes = Vec::new();
+    worktree_changes_under(exec_ctx, src, b"", false, inputs, &mut changes)?;
+    if let Some(change) = changes.first() {
+        return Err(format!("the worktree departs from HEAD under the inputs: {change}"));
+    }
+    let now = head_commit(exec_ctx, src)?;
+    if now != head.sha {
+        return Err(format!(
+            "HEAD moved from {} to {now} while bootstrap read the inputs",
+            head.sha
+        ));
+    }
+    Ok(())
+}
+
+/// Trust (DC-16a): whether every source Cargo can read for a package of the repository
+/// checked out at `root` (a submodule of the checkout at `src`, `root` relative to it)
+/// lies inside that repository, so that its pin names them all. Each tracked
+/// `Cargo.toml` and `.cargo/config(.toml)` is read, and each `path` (a path dependency,
+/// a patch, a target's source), `build` script, `workspace` root and `paths` entry (a
+/// path override) in it must resolve, lexically, inside `root`. A file a source names
+/// by `include!`-family macros is not a Cargo-listed source and is not read here. Registry and git sources are named by the
+/// repository's own lockfile, which its pin holds.
+///
+/// It reads the checkout's files, so it answers for the pin only when no departure
+/// under `root` exists ([`inputs_unchanged_since`]). An error names the first source
+/// outside `root`, or why the manifests cannot be read or parsed: a repository that is
+/// not checked out is not known to be closed.
+pub(crate) fn component_sources_closed(
+    exec_ctx: &ExecutionContext,
+    src: &Path,
+    root: &str,
+) -> Result<(), String> {
+    let dir = src.join(root);
+    if !dir.join(".git").exists() {
+        return Err(format!("{root} is not checked out"));
+    }
+    let mut git = helpers::git(Some(&dir)).allow_failure();
+    git.args(["ls-files", "-z", "--"]).args([
+        ":(glob)**/Cargo.toml",
+        ":(glob)**/.cargo/config.toml",
+        ":(glob)**/.cargo/config",
+    ]);
+    let listing = captured(git, exec_ctx, "git ls-files manifests", &dir)?;
+    let mut manifests = 0;
+    for name in listing.split(|&byte| byte == 0).filter(|name| !name.is_empty()) {
+        let relative = path_of(name)?;
+        let text = fs::read_to_string(dir.join(&relative))
+            .map_err(|error| format!("cannot read {root}/{}: {error}", relative.display()))?;
+        let document = text
+            .parse::<toml::Value>()
+            .map_err(|error| format!("cannot parse {root}/{}: {error}", relative.display()))?;
+        // Cargo resolves a manifest's paths against its directory, and a
+        // configuration's against the directory that holds its `.cargo`.
+        let mut base = relative.parent().unwrap_or(Path::new("")).to_path_buf();
+        if base.file_name().is_some_and(|name| name == ".cargo") {
+            base.pop();
+        }
+        let mut escape = None;
+        manifest_source_paths(&document, &mut |value| {
+            if escape.is_none() && !stays_inside(&base, value) {
+                escape = Some(value.to_owned());
+            }
+        });
+        if let Some(value) = escape {
+            return Err(format!(
+                "{root}/{} names the source {value:?} outside {root}",
+                relative.display()
+            ));
+        }
+        manifests += 1;
+    }
+    if manifests == 0 {
+        return Err(format!("{root} tracks no Cargo manifest"));
+    }
+    Ok(())
+}
+
+/// Calls `found` with every string a `path`, `build` or `workspace` key holds and
+/// every entry of a `paths` array, at any depth of `value`.
+fn manifest_source_paths(value: &toml::Value, found: &mut impl FnMut(&str)) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, value) in table {
+                match (key.as_str(), value) {
+                    // A dependency's, patch's or target's `path`, a package's build
+                    // script (`build`) and its workspace root (`workspace`).
+                    ("path" | "build" | "workspace", toml::Value::String(path)) => found(path),
+                    ("paths", toml::Value::Array(paths)) => {
+                        for path in paths {
+                            match path.as_str() {
+                                Some(path) => found(path),
+                                // Not a path Cargo reads: refuse it as one outside.
+                                None => found("/"),
+                            }
+                        }
+                    }
+                    _ => manifest_source_paths(value, &mut *found),
+                }
+            }
+        }
+        toml::Value::Array(values) => {
+            for value in values {
+                manifest_source_paths(value, &mut *found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `value`, resolved against `base` (both relative to a repository's root),
+/// stays inside that root by its components alone. An absolute path never does.
+fn stays_inside(base: &Path, value: &str) -> bool {
+    use std::path::Component;
+    let value = Path::new(value);
+    if value.has_root() || value.is_absolute() {
+        return false;
+    }
+    let mut depth = 0usize;
+    for component in base.components().chain(value.components()) {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return false,
+            },
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
 /// The file in a build directory that says what the version of its last dev stage-1
 /// build names: `head <commit>`, `identity <hash>` and `date <date>` lines, then the
 /// record whose digest the identity is ([`of_sources`]). It is how a reader of a dev
@@ -767,6 +939,19 @@ fn worktree_changes(
     omit_inert: bool,
     out: &mut Vec<String>,
 ) -> Result<(), String> {
+    worktree_changes_under(exec_ctx, dir, prefix, omit_inert, &[], out)
+}
+
+/// [`worktree_changes`] of the paths `under` (relative to `dir`; all of it when empty).
+/// A repository found there is read whole, as [`worktree_changes`] reads it.
+fn worktree_changes_under(
+    exec_ctx: &ExecutionContext,
+    dir: &Path,
+    prefix: &[u8],
+    omit_inert: bool,
+    under: &[&str],
+    out: &mut Vec<String>,
+) -> Result<(), String> {
     let mut git = helpers::git(Some(dir)).allow_failure();
     git.args([
         // Only the repository's own ignore rules decide what is untracked: a global
@@ -781,6 +966,10 @@ fn worktree_changes(
         "--untracked-files=all",
         "--no-renames",
     ]);
+    if !under.is_empty() {
+        // Literal paths: a name is never read as a glob or a pathspec magic word.
+        git.arg("--").args(under.iter().map(|path| format!(":(literal){path}")));
+    }
     // A reader: never take the index lock from a git command run beside this build.
     git.env("GIT_OPTIONAL_LOCKS", "0");
     let status = captured(git, exec_ctx, "git status", dir)?;
@@ -810,7 +999,7 @@ fn worktree_changes(
                     let head = head_commit(exec_ctx, &checkout).unwrap_or_else(|_| "unborn".into());
                     out.push(format!("repo {head}\t{label}"));
                 }
-                worktree_changes(exec_ctx, &checkout, &inner, omit_inert, out)?;
+                worktree_changes_under(exec_ctx, &checkout, &inner, omit_inert, &[], out)?;
             } else {
                 out.push(format!("path {}\t{label}", content(&checkout)?));
             }

@@ -1,10 +1,10 @@
-//! Trust: invocation-aware native admission policy without compiler execution.
+//! Trust: invocation-aware native admission policy without workload execution.
 
 use std::ffi::{OsStr, OsString};
 
 #[expect(
     clippy::print_stdout,
-    reason = "native resource discovery emits machine-readable JSON before a project or Shell is constructed"
+    reason = "native resource discovery emits machine-readable JSON before workload execution"
 )]
 pub(super) fn respond(args: &[OsString]) -> bool {
     if args
@@ -15,12 +15,40 @@ pub(super) fn respond(args: &[OsString]) -> bool {
     }
     // Fixed original-claim admission does not require or advertise a paired
     // compiler worker runtime. Discovery is not admission or Host readiness.
+    if args.get(1).is_some_and(|arg| arg == "--fixed-admission-v3") {
+        if args.len() == 2 && cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            println!(
+                "{{\"version\":3,\"fixed_admission\":\"original-fixed-v1\",\"execution_start\":\"loaded-before-go-v1\",\"output_member\":\"original-output-v2\",\"nested_execution_start\":\"original-output-before-go-v1\"}}"
+            );
+        } else {
+            println!(
+                "{{\"version\":3,\"fixed_admission\":null,\"execution_start\":null,\"output_member\":null,\"nested_execution_start\":null}}"
+            );
+        }
+        return true;
+    }
     if args.get(1).is_some_and(|arg| arg == "--fixed-admission-v1") {
         if args.len() == 2 && cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             println!("{{\"version\":1,\"fixed_admission\":\"original-fixed-v1\"}}");
         } else {
             println!("{{\"version\":1,\"fixed_admission\":null}}");
         }
+        return true;
+    }
+    // Separate protocol discovery preserves V1's exact response. These
+    // lifecycle/member facilities are not CPU, compiler, SDK or Host grants;
+    // actual native Root admission still authenticates all original inputs.
+    if args.get(1).is_some_and(|arg| arg == "--fixed-admission-v2") {
+        let supported = args.len() == 2 && cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": 2,
+                "fixed_admission": supported.then_some("original-fixed-v1"),
+                "execution_start": supported.then_some("loaded-before-go-v1"),
+                "output_member": supported.then_some("original-output-v2"),
+            })
+        );
         return true;
     }
     if args.get(1).is_some_and(|arg| arg == "--sealed-metadata-v1") {
@@ -35,7 +63,7 @@ pub(super) fn respond(args: &[OsString]) -> bool {
     // Driver-only discovery cannot prove the effective compiler cohort.
     // Native admission must supply the complete invocation and resolve its
     // configuration through the same parser as actual execution.
-    if args.get(1).is_some_and(|arg| arg == "--") && invocation_supported(&args[2..]) {
+    if args.get(1).is_some_and(|arg| arg == "--") {
         if let Ok(mut gctx) = targo::util::GlobalContext::default() {
             match super::cli::native_capability(&mut gctx, &args[2..]) {
                 Ok(()) => return true,
@@ -240,55 +268,6 @@ fn hold_selected_compiler(
     Ok(held)
 }
 
-pub(super) fn invocation_supported(mut args: &[OsString]) -> bool {
-    if args
-        .first()
-        .is_some_and(|arg| arg == "--resource-worker-v2")
-    {
-        args = &args[1..];
-    }
-    if args.len() < 2
-        || args[0] != "--unverified"
-        || args.iter().any(|arg| arg == "--resource-worker-v2")
-    {
-        return false;
-    }
-    match args[1].to_str() {
-        Some("build" | "check") => true,
-        Some("test") => {
-            let selection = args[2..]
-                .iter()
-                .take_while(|arg| arg.as_os_str() != OsStr::new("--"))
-                .collect::<Vec<_>>();
-            // rustdoc's independent compile/execute tree retains its existing
-            // route. Discovery never removes tests from the caller's request.
-            !selection
-                .iter()
-                .any(|arg| arg.as_os_str() == OsStr::new("--doc"))
-                && selection.iter().any(|arg| {
-                    arg.as_os_str() == OsStr::new("--no-run")
-                        || arg.to_str().is_some_and(|arg| {
-                            [
-                                "--lib",
-                                "--tests",
-                                "--test",
-                                "--bins",
-                                "--bin",
-                                "--examples",
-                                "--example",
-                                "--benches",
-                                "--bench",
-                                "--all-targets",
-                            ]
-                            .iter()
-                            .any(|name| arg == *name || arg.starts_with(&format!("{name}=")))
-                        })
-                })
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,37 +429,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn admission_query_preserves_the_complete_native_test_selection() {
-        for words in [
-            vec!["--unverified", "test", "--lib"],
-            vec!["--unverified", "test", "--test=native", "--", "filter"],
-            vec!["--unverified", "test", "--no-run"],
-            vec!["--resource-worker-v2", "--unverified", "test", "--tests"],
-        ] {
-            assert!(invocation_supported(
-                &words.into_iter().map(OsString::from).collect::<Vec<_>>()
-            ));
-        }
-        for words in [
-            vec!["--unverified", "test"],
-            vec!["--unverified", "test", "--doc", "--lib"],
-            vec!["--unverified", "test", "--", "--lib"],
-            vec!["trust", "test", "--lib"],
-            vec!["--unverified", "bench", "--lib"],
-            vec![
-                "--resource-worker-v2",
-                "--unverified",
-                "test",
-                "--resource-worker-v2",
-                "--lib",
-            ],
-        ] {
-            assert!(!invocation_supported(
-                &words.into_iter().map(OsString::from).collect::<Vec<_>>()
-            ));
-        }
     }
 }

@@ -1164,6 +1164,7 @@ fn test_workspace(
     options.cli_features = CliFeatures::new_all(false);
     options.build_config.test_plan = Some(Rc::new(resolved));
     let options = TestOptions {
+        child_supervision: None,
         no_run,
         no_fail_fast,
         required_test_bins: Vec::new(),

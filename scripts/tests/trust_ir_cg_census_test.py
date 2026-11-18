@@ -70,6 +70,12 @@ CANNED_STDERR = (
 )
 
 
+# A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces (atpkg's python
+# lives under `Application Support/`): exec splits it and the fake never runs. This sh/python
+# polyglot execs the interpreter quoted and keeps argv[0] as the fake's own path.
+PYTHON_SHEBANG = f'#!/bin/sh\n""":"\nexec "{sys.executable}" "$0" "$@"\n":"""\n'
+
+
 class FakeToolchain:
     """A temp dir holding a fake trustc and the sysroot it reports."""
 
@@ -86,7 +92,7 @@ class FakeToolchain:
         self.record = root / "invocation.json"
         self.trustc = root / "trustc"
         self.trustc.write_text(
-            f"#!{sys.executable}\n"
+            PYTHON_SHEBANG +
             "import json, os, sys\n"
             "args = sys.argv[1:]\n"
             "if args == ['--print', 'sysroot']:\n"

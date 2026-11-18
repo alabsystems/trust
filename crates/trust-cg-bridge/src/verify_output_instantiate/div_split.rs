@@ -134,6 +134,10 @@ const MAX_COND_LEAVES: usize = 32;
 pub(crate) const LABEL_TAIL: &str =
     "kernel atom case split, guarded symbolic division (DIV-SPLIT-1)";
 
+#[cfg(feature = "fmrel")]
+#[path = "div_split/source_advice.rs"]
+pub(crate) mod source_advice;
+
 // ── the pre-filter and the walk ──────────────────────────────────────────────
 
 fn has_var(f: &Formula) -> bool {
@@ -744,9 +748,20 @@ pub(crate) fn obligation(
     items: &[(Formula, Formula)],
     filter: BranchFilter,
 ) -> Result<Obligation, Decline> {
-    // G first, from the original items alone (the walk is part of it).
-    let (goal, sides, leaves) = goal_of(items).map_err(Decline::Filter)?;
-    let mut ctx = div_proving();
+    // The legacy goal and its signed refusals stay unchanged.
+    obligation_data(items, filter, goal_of(items), div_proving(), false)
+}
+
+// Shared proof construction. The extended caller returns DATA only; the
+// canonical source consumer must independently check its complete relation.
+fn obligation_data(
+    items: &[(Formula, Formula)],
+    filter: BranchFilter,
+    proposed: Result<Goal, String>,
+    mut ctx: ReflectCtx,
+    extended: bool,
+) -> Result<Obligation, Decline> {
+    let (goal, sides, leaves) = proposed.map_err(Decline::Filter)?;
     let mut views = Vec::with_capacity(items.len());
     for ((l, r), (gl, gr)) in items.iter().zip(&sides) {
         let (lb_, vl, pl) = reflect_value(l, &mut ctx).map_err(Decline::Filter)?;
@@ -760,6 +775,15 @@ pub(crate) fn obligation(
         views.push((vl, pl, vr, pr));
     }
     filtered(filter, !ctx.branch_cap_hit, "div: cap (steps)")?;
+    #[cfg(feature = "fmrel")]
+    if extended {
+        for ((vl, pl, vr, pr), (gl, gr)) in views.iter_mut().zip(&sides) {
+            (*vl, *pl) = source_advice::canonicalize(gl, vl.clone(), pl.clone());
+            (*vr, *pr) = source_advice::canonicalize(gr, vr.clone(), pr.clone());
+        }
+    }
+    #[cfg(not(feature = "fmrel"))]
+    debug_assert!(!extended);
     let mut all_atoms: Vec<Expr> = Vec::new();
     for (vl, _, vr, _) in &views {
         let mut found = Vec::new();

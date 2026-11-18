@@ -30,6 +30,110 @@ fn import(donor: &Path, destination: &Path, registry: Option<&str>) -> CargoResu
     super::import_selected(donor, destination, registry, None, selected(donor), &[])
 }
 
+#[test]
+fn selected_git_phase_does_not_lock_a_distinct_registry_donor() {
+    let (_git_world, root, donor) = fixture();
+    let checkout = complete_checkout(&donor);
+    let (_registry_world, _, registry) = fixture();
+    let held_registry = Cache::source(&registry).unwrap();
+    let destination = root.join("output");
+    let prepared = super::selected::prepare_selected_git(
+        &donor,
+        &destination,
+        Some("index-fixture"),
+        Some(&registry),
+        selected(&donor),
+        &[],
+    )
+    .unwrap();
+    assert!(!destination.exists(), "prepared DATA is not publication");
+    assert!(
+        Cache::source(&donor).is_err(),
+        "original Git locks must remain held"
+    );
+    drop(held_registry);
+    prepared.publish().unwrap();
+    assert_eq!(
+        std::fs::read(
+            destination
+                .join(checkout.strip_prefix(&donor).unwrap())
+                .join("lib.rs")
+        )
+        .unwrap(),
+        std::fs::read(checkout.join("lib.rs")).unwrap(),
+    );
+    assert_eq!(
+        std::fs::read(destination.join("registry/cache/index-fixture/example-1.0.0.crate"))
+            .unwrap(),
+        b"archive DATA",
+    );
+}
+
+#[test]
+fn selected_registry_phase_refuses_contention_without_publishing() {
+    let (_git_world, root, donor) = fixture();
+    let (_registry_world, _, registry) = fixture();
+    let held_registry = Cache::source(&registry).unwrap();
+    let destination = root.join("output");
+    let prepared = super::selected::prepare_selected_git(
+        &donor,
+        &destination,
+        Some("index-fixture"),
+        Some(&registry),
+        selected(&donor),
+        &[],
+    )
+    .unwrap();
+    assert!(prepared.publish().is_err());
+    assert!(!destination.exists());
+    drop(held_registry);
+    Cache::source(&donor).unwrap();
+}
+
+#[test]
+fn selected_registry_phase_keeps_the_original_directory_descriptor() {
+    let (_git_world, root, donor) = fixture();
+    let (_registry_world, registry_root, registry) = fixture();
+    let destination = root.join("output");
+    let prepared = super::selected::prepare_selected_git(
+        &donor,
+        &destination,
+        Some("index-fixture"),
+        Some(&registry),
+        selected(&donor),
+        &[],
+    )
+    .unwrap();
+    let (_replacement_world, _, replacement) = fixture();
+    std::fs::rename(&registry, registry_root.join("original-registry")).unwrap();
+    std::fs::rename(&replacement, &registry).unwrap();
+    // A fresh path lookup would accept this valid replacement cache. The
+    // prepared phase must retain and reject its displaced original instead.
+    drop(Cache::source(&registry).unwrap());
+    assert!(prepared.publish().is_err());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn selected_registry_phase_does_not_retire_original_git_bookends() {
+    let (_git_world, root, donor) = fixture();
+    let checkout = complete_checkout(&donor);
+    let (_registry_world, _, registry) = fixture();
+    let destination = root.join("output");
+    let prepared = super::selected::prepare_selected_git(
+        &donor,
+        &destination,
+        Some("index-fixture"),
+        Some(&registry),
+        selected(&donor),
+        &[],
+    )
+    .unwrap();
+    std::fs::write(checkout.join("lib.rs"), b"changed after completed Git copy").unwrap();
+    assert!(prepared.publish().is_err());
+    assert!(!destination.exists());
+}
+
 fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let world = super::super::super::tests::private_world();
     let root = world.path().canonicalize().unwrap();
@@ -657,6 +761,256 @@ fn selected_snapshot_ignores_unrelated_databases_and_derived_graphs_but_binds_ex
 }
 
 #[test]
+fn selected_snapshot_exports_exact_history_without_unreachable_packed_archives() {
+    let (_world, root, donor) = fixture();
+    let historical = super::super::super::locked_oid(source(&donor)).unwrap();
+    let checkout = complete_checkout(&donor);
+    let repository = git2::Repository::open_bare(database(&donor)).unwrap();
+    let current = repository
+        .find_commit(super::super::super::locked_oid(source(&donor)).unwrap())
+        .unwrap();
+    let parent = repository.find_commit(historical).unwrap();
+    let signature = git2::Signature::now("Original source", "fixture@example.invalid").unwrap();
+    let revision = repository
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "retain both original parents",
+            &current.tree().unwrap(),
+            &[&current, &parent],
+        )
+        .unwrap();
+    std::fs::write(donor.join("revision"), revision.to_string()).unwrap();
+    let selected_checkout = checkout.parent().unwrap().join(
+        crate::sources::git::utils::checkout_short_id(&repository.odb().unwrap(), revision)
+            .unwrap(),
+    );
+    std::fs::rename(&checkout, &selected_checkout).unwrap();
+    std::fs::write(selected_checkout.join(".git/HEAD"), format!("{revision}\n")).unwrap();
+
+    // Real original objects share one native pack. The unrelated root is not a
+    // selected parent; filtering repositories alone cannot exclude its archive.
+    let mut state = 0x2ff0_9774_7b18_9e35_u64;
+    let archive = (0..8 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect::<Vec<_>>();
+    let archive_blob = repository.blob(&archive).unwrap();
+    let mut builder = repository.treebuilder(None).unwrap();
+    builder
+        .insert("removed-history.bin", archive_blob, 0o100644)
+        .unwrap();
+    let archive_tree = builder.write().unwrap();
+    drop(builder);
+    let archive_commit = repository
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "unrelated original archived root",
+            &repository.find_tree(archive_tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+    let mut originals = std::collections::BTreeSet::new();
+    repository
+        .odb()
+        .unwrap()
+        .foreach(|oid| {
+            originals.insert(*oid);
+            true
+        })
+        .unwrap();
+    let mut pack = repository.packbuilder().unwrap();
+    for oid in &originals {
+        pack.insert_object(*oid, None).unwrap();
+    }
+    pack.write(&repository.path().join("objects/pack"), 0)
+        .unwrap();
+    drop(pack);
+    drop(parent);
+    drop(current);
+    drop(repository);
+    for entry in std::fs::read_dir(database(&donor).join("objects")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().len() == 2 {
+            std::fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
+    let destination = root.join("selected-history");
+    let stats = import(&donor, &destination, None).unwrap();
+    let copied = git2::Repository::open_bare(
+        destination
+            .join("git/db")
+            .join(crate::sources::git::source::ident(&source(&donor))),
+    )
+    .unwrap();
+    let mut exported = std::collections::BTreeSet::new();
+    copied
+        .odb()
+        .unwrap()
+        .foreach(|oid| {
+            exported.insert(*oid);
+            true
+        })
+        .unwrap();
+    for unwanted in [archive_blob, archive_tree, archive_commit] {
+        assert!(originals.remove(&unwanted));
+        assert!(
+            !exported.contains(&unwanted),
+            "unreachable object {unwanted}"
+        );
+    }
+    assert_eq!(exported, originals);
+    assert_eq!(copied.find_commit(revision).unwrap().parent_count(), 2);
+    let historical_blob = std::fs::read_to_string(donor.join("blob-id")).unwrap();
+    assert_eq!(
+        copied
+            .find_blob(historical_blob.parse().unwrap())
+            .unwrap()
+            .content(),
+        b"actual original DATA"
+    );
+    assert!(stats.bytes < archive.len() as u64 / 16);
+    assert_eq!(stats.bytes, stats.cloned_bytes + stats.streamed_bytes);
+    let output_checkout = destination.join(selected_checkout.strip_prefix(&donor).unwrap());
+    assert_eq!(
+        std::fs::read(output_checkout.join("lib.rs")).unwrap(),
+        std::fs::read(selected_checkout.join("lib.rs")).unwrap()
+    );
+    assert_eq!(
+        git2::Repository::open(output_checkout)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target(),
+        Some(revision)
+    );
+}
+
+#[test]
+fn selected_snapshot_streams_required_oversized_base_blobs_outside_the_native_small_pack() {
+    let (_world, root, donor) = fixture();
+    let repository = git2::Repository::open_bare(database(&donor)).unwrap();
+    let parent = repository
+        .find_commit(super::super::super::locked_oid(source(&donor)).unwrap())
+        .unwrap();
+    let parent_oid = parent.id();
+    let body = vec![0x7b; super::super::super::MAX_OBJECT_BYTES + 1];
+    let blob = repository.blob(&body).unwrap();
+    let mut builder = repository.treebuilder(None).unwrap();
+    builder.insert("large.bin", blob, 0o100644).unwrap();
+    let tree = builder.write().unwrap();
+    drop(builder);
+    let signature = git2::Signature::now("Original source", "fixture@example.invalid").unwrap();
+    let revision = repository
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "original required oversized body",
+            &repository.find_tree(tree).unwrap(),
+            &[&parent],
+        )
+        .unwrap();
+    let mut pack = repository.packbuilder().unwrap();
+    pack.set_threads(1);
+    pack.insert_object(blob, None).unwrap();
+    pack.write(&repository.path().join("objects/pack"), 0)
+        .unwrap();
+    drop(pack);
+    drop(parent);
+    drop(repository);
+    let hex = blob.to_string();
+    std::fs::remove_file(
+        database(&donor)
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]),
+    )
+    .unwrap();
+    std::fs::write(donor.join("revision"), revision.to_string()).unwrap();
+    let destination = root.join("large-body");
+    import(&donor, &destination, None).unwrap();
+    let copied = git2::Repository::open_bare(
+        destination
+            .join("git/db")
+            .join(crate::sources::git::source::ident(&source(&donor))),
+    )
+    .unwrap();
+    assert_eq!(copied.find_blob(blob).unwrap().content(), body.as_slice());
+    assert_eq!(
+        copied.find_commit(revision).unwrap().parent_id(0).unwrap(),
+        parent_oid
+    );
+    assert!(
+        copied
+            .path()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..])
+            .is_file()
+    );
+}
+
+#[test]
+fn selected_snapshot_refuses_missing_original_history_before_publication() {
+    for missing in ["commit", "tree", "body"] {
+        let (_world, root, donor) = fixture();
+        let original = super::super::super::locked_oid(source(&donor)).unwrap();
+        complete_checkout(&donor);
+        let repository = git2::Repository::open_bare(database(&donor)).unwrap();
+        let parent = repository.find_commit(original).unwrap();
+        let current = repository
+            .find_commit(super::super::super::locked_oid(source(&donor)).unwrap())
+            .unwrap();
+        let signature = git2::Signature::now("Original source", "fixture@example.invalid").unwrap();
+        let revision = repository
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "selected source with required original history",
+                &current.tree().unwrap(),
+                &[&parent],
+            )
+            .unwrap();
+        let oid = match missing {
+            "commit" => original,
+            "tree" => parent.tree_id(),
+            "body" => std::fs::read_to_string(donor.join("blob-id"))
+                .unwrap()
+                .parse()
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        drop(parent);
+        drop(current);
+        drop(repository);
+        let hex = oid.to_string();
+        std::fs::remove_file(
+            database(&donor)
+                .join("objects")
+                .join(&hex[..2])
+                .join(&hex[2..]),
+        )
+        .unwrap();
+        std::fs::write(donor.join("revision"), revision.to_string()).unwrap();
+        let destination = root.join(missing);
+        let error = import(&donor, &destination, None).unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains(&format!("missing locked Git object {oid}")));
+        assert!(diagnostic.contains(&revision.to_string()));
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
 fn explicit_original_object_selector_is_checked_and_unused_selection_refuses() {
     let (_world, root, donor) = fixture();
     let objects = database(&donor).join("objects");
@@ -736,6 +1090,242 @@ fn selected_snapshot_recurses_the_actual_gitlink_and_missing_child_cannot_publis
     std::fs::rename(child_path, root.join("retained-child")).unwrap();
     assert!(import(&donor, &root.join("incomplete"), None).is_err());
     assert!(!root.join("incomplete").exists());
+}
+
+#[test]
+fn selected_checkout_keeps_submodule_git_status_clean_and_tracked_marker_data() {
+    for (tracked_marker, legacy_marker) in [(false, false), (false, true), (true, false)] {
+        let (_world, root, donor) = fixture();
+        let child_url = url::Url::parse("https://example.invalid/child").unwrap();
+        let preliminary = SourceId::for_git(&child_url, GitReference::Rev("0".repeat(40))).unwrap();
+        let child_path = donor
+            .join("git/db")
+            .join(crate::sources::git::source::ident(&preliminary));
+        let mut options = git2::RepositoryInitOptions::new();
+        options.bare(true).external_template(false);
+        let child = git2::Repository::init_opts(&child_path, &options).unwrap();
+        let data = b"actual submodule DATA\n";
+        let marker = b"Git-declared submodule marker DATA\n";
+        let mut builder = child.treebuilder(None).unwrap();
+        builder
+            .insert("data", child.blob(data).unwrap(), 0o100644)
+            .unwrap();
+        if tracked_marker {
+            builder
+                .insert(".cargo-ok", child.blob(marker).unwrap(), 0o100644)
+                .unwrap();
+        }
+        let tree_id = builder.write().unwrap();
+        drop(builder);
+        let tree = child.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Child DATA", "fixture@example.invalid").unwrap();
+        let child_commit = child
+            .commit(None, &signature, &signature, "child DATA", &tree, &[])
+            .unwrap();
+        drop(tree);
+        drop(child);
+
+        let parent = git2::Repository::open_bare(database(&donor)).unwrap();
+        let modules = format!("[submodule \"child\"]\npath = child\nurl = {child_url}\n");
+        let mut builder = parent.treebuilder(None).unwrap();
+        builder
+            .insert(
+                ".gitmodules",
+                parent.blob(modules.as_bytes()).unwrap(),
+                0o100644,
+            )
+            .unwrap();
+        builder.insert("child", child_commit, 0o160000).unwrap();
+        let tree_id = builder.write().unwrap();
+        drop(builder);
+        let tree = parent.find_tree(tree_id).unwrap();
+        let revision = parent
+            .commit(None, &signature, &signature, "with child DATA", &tree, &[])
+            .unwrap();
+        std::fs::write(donor.join("revision"), revision.to_string()).unwrap();
+        let checkout = donor
+            .join("git/checkouts")
+            .join(crate::sources::git::source::ident(&source(&donor)))
+            .join(
+                crate::sources::git::utils::checkout_short_id(&parent.odb().unwrap(), revision)
+                    .unwrap(),
+            );
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(checkout.join(".git/HEAD"), format!("{revision}\n")).unwrap();
+        std::fs::write(checkout.join(".gitmodules"), modules).unwrap();
+        std::fs::create_dir_all(checkout.join("child/.git")).unwrap();
+        std::fs::write(
+            checkout.join("child/.git/HEAD"),
+            format!("{child_commit}\n"),
+        )
+        .unwrap();
+        std::fs::write(checkout.join("child/data"), data).unwrap();
+        if tracked_marker {
+            std::fs::write(checkout.join("child/.cargo-ok"), marker).unwrap();
+        } else if legacy_marker {
+            std::fs::write(checkout.join("child/.cargo-ok"), b"").unwrap();
+            std::fs::set_permissions(
+                checkout.join("child/.cargo-ok"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        drop(tree);
+        drop(parent);
+        let legacy_before = legacy_marker
+            .then(|| std::fs::symlink_metadata(checkout.join("child/.cargo-ok")).unwrap());
+
+        let destination = root.join("complete");
+        import(&donor, &destination, None).unwrap();
+        // The fixture-only legacy marker is observed, never changed or copied.
+        if legacy_marker {
+            assert!(
+                std::fs::read(checkout.join("child/.cargo-ok"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                std::fs::metadata(checkout.join("child/.cargo-ok"))
+                    .unwrap()
+                    .mode()
+                    & 0o7777,
+                0o644
+            );
+        }
+        let reimported = root.join("reimported");
+        super::import_selected(
+            &destination,
+            &reimported,
+            None,
+            None,
+            vec![source(&donor)],
+            &[],
+        )
+        .unwrap();
+        for output in [&destination, &reimported] {
+            let selected = output.join(checkout.strip_prefix(&donor).unwrap());
+            assert_eq!(std::fs::read(selected.join(".cargo-ok")).unwrap(), b"");
+            let parent = git2::Repository::open(&selected).unwrap();
+            assert_eq!(parent.head().unwrap().target(), Some(revision));
+            assert_eq!(
+                parent
+                    .index()
+                    .unwrap()
+                    .get_path(Path::new("child"), 0)
+                    .unwrap()
+                    .id,
+                child_commit
+            );
+            let selected_child = selected.join("child");
+            let child = git2::Repository::open(&selected_child).unwrap();
+            assert_eq!(child.workdir().unwrap(), selected_child);
+            assert_eq!(child.head().unwrap().target(), Some(child_commit));
+            assert_eq!(std::fs::read(selected.join("child/data")).unwrap(), data);
+            if tracked_marker {
+                assert_eq!(
+                    std::fs::read(selected.join("child/.cargo-ok")).unwrap(),
+                    marker
+                );
+            } else {
+                assert!(!selected.join("child/.cargo-ok").exists());
+            }
+            // Trust: exercise native Git's recursive worktree status, matching the
+            // dependency identity consumer that refuses dirty selected gitlinks.
+            for (path, expected) in [(&selected, "? .cargo-ok\n"), (&selected_child, "")] {
+                let status = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-c",
+                        "core.excludesFile=/dev/null",
+                        "status",
+                        "--porcelain=v2",
+                        "--untracked-files=all",
+                        "--ignore-submodules=none",
+                        "--ignored=matching",
+                    ])
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_COMMON_DIR")
+                    .env_remove("GIT_WORK_TREE")
+                    .env_remove("GIT_INDEX_FILE")
+                    .env_remove("GIT_OBJECT_DIRECTORY")
+                    .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                    .current_dir(path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    status.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&status.stderr)
+                );
+                assert_eq!(String::from_utf8(status.stdout).unwrap(), expected);
+            }
+            drop(child);
+            drop(parent);
+        }
+        if let Some(before) = legacy_before {
+            assert!(stamp(
+                &before,
+                &std::fs::symlink_metadata(checkout.join("child/.cargo-ok")).unwrap()
+            ));
+        }
+        // A submodule marker is source DATA, never an exemption from the tree
+        // join: nonempty untracked markers and changed tracked bytes refuse.
+        std::fs::write(checkout.join("child/.cargo-ok"), "different marker DATA").unwrap();
+        let rejected = root.join("changed-child-marker");
+        assert!(import(&donor, &rejected, None).is_err());
+        assert!(!rejected.exists());
+        if !tracked_marker {
+            for mutation in [
+                "symlink",
+                "executable",
+                "writable",
+                "special",
+                "hardlink",
+                "directory",
+                "unknown",
+            ] {
+                let marker_path = checkout.join("child/.cargo-ok");
+                std::fs::remove_file(&marker_path).unwrap();
+                match mutation {
+                    "symlink" => symlink("data", &marker_path).unwrap(),
+                    "directory" => std::fs::create_dir(&marker_path).unwrap(),
+                    "hardlink" => {
+                        let outside = root.join("marker-alias");
+                        std::fs::write(&outside, b"").unwrap();
+                        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644))
+                            .unwrap();
+                        std::fs::hard_link(outside, &marker_path).unwrap();
+                    }
+                    _ => {
+                        std::fs::write(&marker_path, b"").unwrap();
+                        let mode = match mutation {
+                            "executable" => 0o755,
+                            "writable" => 0o666,
+                            "special" => 0o1644,
+                            "unknown" => 0o644,
+                            _ => unreachable!(),
+                        };
+                        std::fs::set_permissions(
+                            &marker_path,
+                            std::fs::Permissions::from_mode(mode),
+                        )
+                        .unwrap();
+                        if mutation == "unknown" {
+                            std::fs::write(checkout.join("child/.cargo-ok-unknown"), b"").unwrap();
+                        }
+                    }
+                }
+                let rejected = root.join(format!("changed-child-{mutation}"));
+                assert!(import(&donor, &rejected, None).is_err(), "{mutation}");
+                assert!(!rejected.exists());
+                if mutation == "directory" {
+                    std::fs::remove_dir(&marker_path).unwrap();
+                    std::fs::write(&marker_path, b"").unwrap();
+                }
+            }
+        }
+    }
 }
 
 #[test]

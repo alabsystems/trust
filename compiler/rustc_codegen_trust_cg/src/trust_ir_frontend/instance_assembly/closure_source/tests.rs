@@ -124,3 +124,94 @@ fn actual_entry_and_apparent_call_signature_must_agree() {
         assert!(check(&module).is_err(), "signature mutation {change}");
     }
 }
+
+fn zero_origin_with_crate(stable_crate_id: u64) -> trust_ir::ty::TypeOrigin {
+    let mut def_path_hash = [0; 16];
+    def_path_hash[..8].copy_from_slice(&stable_crate_id.to_le_bytes());
+    def_path_hash[8..].copy_from_slice(&9u64.to_le_bytes());
+    trust_ir::ty::TypeOrigin::Rust {
+        stable_crate_id,
+        def_path_hash,
+        args_digest: trust_ir::ProofDigest::sha256_domain(
+            trust_ir::ty::RUST_TYPE_ARGS_DOMAIN,
+            b"fixture",
+        ),
+    }
+}
+fn zero_origin() -> trust_ir::ty::TypeOrigin {
+    zero_origin_with_crate(7)
+}
+
+fn zero_fixture() -> Module {
+    let mut module = fixture();
+    module.closure_types[0].captures.clear();
+    module.closure_layouts[0].origin = Some(zero_origin());
+    module.closure_layouts[0].size = 0;
+    module.closure_layouts[0].align = 1;
+    module.closure_layouts[0].capture_offsets.clear();
+    let signature = module.functions[0].ty;
+    module.func_types[signature.as_usize()].params[0] = Ty::Ptr;
+    module.functions[0].blocks[0].params[0].1 = Ty::Ptr;
+    module
+}
+
+#[test]
+fn owned_zero_body_retains_its_typed_frame_and_apparent_arguments() {
+    let mut module = zero_fixture();
+    let signature = module.functions[0].ty;
+    module.func_types[signature.as_usize()].params[0] = Ty::Closure(ClosureTyId::new(0));
+    module.functions[0].blocks[0].params[0].1 = Ty::Closure(ClosureTyId::new(0));
+    let before = module.clone();
+    validate(&module, FuncId::new(0), SYMBOL, 0, AUTHORITY).unwrap();
+    assert_eq!(module, before);
+    assert!(check_zero(&module).is_err(), "owned FnOnce must not acquire a borrowed Fn ABI");
+    module.closure_layouts[0].size = 8;
+    assert!(validate(&module, FuncId::new(0), SYMBOL, 0, AUTHORITY).is_err());
+}
+
+fn check_zero(module: &Module) -> Result<(), String> {
+    validate_borrowed_zero(module, FuncId::new(0), SYMBOL, &zero_origin(), AUTHORITY)
+}
+
+#[test]
+fn borrowed_zero_body_retains_actual_source_origin_and_pointer_signature() {
+    let module = zero_fixture();
+    let before = module.clone();
+    assert!(check_zero(&module).is_ok());
+    assert_eq!(module, before);
+    assert!(check(&module).is_err(), "borrowed Fn must not masquerade as by-value FnOnce");
+}
+
+#[test]
+fn borrowed_zero_refuses_lost_changed_or_ambiguous_source_frames() {
+    for change in 0..5 {
+        let mut module = zero_fixture();
+        match change {
+            0 => module.closure_layouts.clear(),
+            1 => module.closure_layouts[0].origin = None,
+            2 => module.closure_layouts[0].origin = Some(zero_origin_with_crate(8)),
+            3 => {
+                module.closure_layouts[0].size = 8;
+                module.closure_layouts[0].align = 8;
+            }
+            _ => module.closure_layouts.push(module.closure_layouts[0].clone()),
+        }
+        assert!(check_zero(&module).is_err(), "frame mutation {change}");
+    }
+}
+
+#[test]
+fn borrowed_zero_retains_source_body_signature_entry_and_gate_refusals() {
+    for change in 0..5 {
+        let mut module = zero_fixture();
+        let signature = module.functions[0].ty;
+        match change {
+            0 => module.functions[0].body_gate = None,
+            1 => module.functions[0].blocks[0].params[0].1 = Ty::Unit,
+            2 => module.func_types[signature.as_usize()].params[0] = Ty::Unit,
+            3 => module.func_types[signature.as_usize()].returns = vec![Ty::U32],
+            _ => module.functions[0].name.push_str("_wrong_source"),
+        }
+        assert!(check_zero(&module).is_err(), "source mutation {change}");
+    }
+}

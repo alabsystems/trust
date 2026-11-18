@@ -43,6 +43,9 @@ kernel-recheck = ["ay-proofs", "dep:clean-auto", "dep:clean-kernel", "dep:stacke
 clean-codegen = ["kernel-recheck", "dep:trust-clean-ir-gate", "dep:trust-certify"]
 # Conditional per-instruction SemR4.30 reference evidence; no function grade.
 frame-step-reference = ["kernel-recheck", "dep:clean-olean", "trust-ir/clean-expr"]
+# Original-byte Formula semantics through the fenced Lean-reference entry.
+# The existing signed goal/refusal and strict legacy routes remain separate.
+fmrel = ["frame-step-reference", "dep:clean-reflect"]
 # Data-only canonical SemR scalar claims over independently selected original
 # Compiler input; never a function/source/ABI grade or shipping capability.
 canonical-semr-scalar = ["frame-step-reference"]
@@ -131,6 +134,7 @@ clean-auto = { workspace = true, optional = true, features = ["ay-bv-blast"] }
 # Optional, pulled in only by `kernel-recheck` (same as `clean-auto`).
 clean-kernel = { workspace = true, optional = true }
 clean-olean = { workspace = true, optional = true }
+clean-reflect = { workspace = true, optional = true }
 # Trust: the O(1) and memory routes reflect a Formula by recursion, one frame per
 # node; they run on a stack grown on the calling thread (`verify_output_instantiate`).
 # The version rustc_data_structures already locks.

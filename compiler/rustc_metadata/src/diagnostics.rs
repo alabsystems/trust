@@ -473,6 +473,9 @@ pub(crate) struct CannotFindCrate {
     pub locator_triple: TargetTuple,
     pub is_ui_testing: bool,
     pub is_tier_3: bool,
+    /// Trust (TARGO-HOST-COMPILE-E0463-1): search directories, or entries of them, that
+    /// could not be read, each with its error.
+    pub unread: Vec<(std::path::PathBuf, String)>,
 }
 
 impl Diagnostic<'_> for CannotFindCrate {
@@ -486,6 +489,14 @@ impl Diagnostic<'_> for CannotFindCrate {
         diag.arg("locator_triple", self.locator_triple.tuple());
         diag.code(E0463);
         diag.span(self.span);
+        // Trust (TARGO-HOST-COMPILE-E0463-1): a directory the search could not read may hold
+        // the crate; say so rather than only that it is missing.
+        for (dir, error) in &self.unread {
+            diag.note(format!(
+                "the search directory `{}` could not be read: {error}",
+                dir.display()
+            ));
+        }
         if self.crate_name == sym::std || self.crate_name == sym::core {
             if self.missing_core {
                 diag.note(msg!("the `{$locator_triple}` target may not be installed"));
@@ -707,4 +718,22 @@ pub(crate) enum StaticLinkingNotSupported<'a> {
     )]
     #[help("ensure a shared library is available")]
     FromDependency { lib_name: Symbol, target: &'a str },
+}
+
+// Trust (DC-18a): `-Ztrust-path-free` refuses a unit whose metadata would carry a host
+// path. One error per compile; its note is the machine-readable record a build tool reads.
+#[derive(Diagnostic)]
+#[diag(
+    "refusing to write crate metadata that carries the absolute host path `{$path}` from {$origin}, which no `--remap-path-prefix` rule rewrote off this host"
+)]
+#[note("{$record}")]
+#[help(
+    "`-Ztrust-path-free` rewrites nothing: remap that prefix, or compile this unit without the option, privately"
+)]
+pub(crate) struct TrustPathFree {
+    #[primary_span]
+    pub span: Option<Span>,
+    pub path: String,
+    pub origin: String,
+    pub record: String,
 }

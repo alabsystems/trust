@@ -1367,6 +1367,35 @@ fn publish_clean_row(module: &mut Module, function: Function) -> Result<(), Stri
     }
 }
 
+/// Equality interning only appends to these two tables. A later refusal must
+/// discard those additions without cloning all existing function bodies.
+struct GeneralTypeTransaction<'a> {
+    destination: &'a mut Module,
+    function_types_before: usize,
+    types_before: usize,
+    committed: bool,
+}
+
+impl<'a> GeneralTypeTransaction<'a> {
+    fn new(destination: &'a mut Module) -> Self {
+        Self {
+            function_types_before: destination.func_types.len(),
+            types_before: destination.types.len(),
+            destination,
+            committed: false,
+        }
+    }
+}
+
+impl Drop for GeneralTypeTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.destination.func_types.truncate(self.function_types_before);
+            self.destination.types.truncate(self.types_before);
+        }
+    }
+}
+
 /// Merge the general lane's module into the crate Module (totality campaign).
 ///
 /// Fail-closed at MODULE granularity: any un-remappable table content or
@@ -1418,13 +1447,31 @@ fn merge_general_module(
     if !src.proof_obligations.is_empty()
         || !src.proof_certificates.is_empty()
         || !src.obligation_diagnostics.is_empty()
-        || src.functions.iter().any(|f| !f.proofs.is_empty() || f.summary.is_some())
+        || src.functions.iter().any(|function| {
+            !function.proofs.is_empty()
+                || function.summary.is_some()
+                || matches!(function.body_gate, Some(trust_ir::BodyGate::Gated { .. }))
+                || function.blocks.iter().flat_map(|block| &block.body).any(|node| {
+                    !node.proofs.is_empty() || node.proof_context.is_some()
+                })
+        })
     {
         refuse(
             summary,
             &compiled_names,
             "general module arrived with proof channels populated — the collector must strip them; refusing the merge keeps the published Module claim-free"
                 .to_string(),
+        );
+        return;
+    }
+    // Module-level assembly contributes definitions and effects even when
+    // no IR instruction mentions it. This join does not carry or emit those
+    // blocks; dropping them would also erase the normal backend refusal.
+    if !src.global_asm.is_empty() {
+        refuse(
+            summary,
+            &compiled_names,
+            "general module carries global_asm blocks this join cannot conserve; refusing the whole module before publishing any rows".to_string(),
         );
         return;
     }
@@ -1534,6 +1581,8 @@ fn merge_general_module(
     // here — the empty-tables belt above already refused any module that
     // could give their ids a referent — but the walk still names one on
     // sight rather than trusting that argument twice.
+    let mut type_transaction = GeneralTypeTransaction::new(dst);
+    let dst = &mut *type_transaction.destination;
     let mut functy_map: Vec<FuncTyId> = Vec::with_capacity(src.func_types.len());
     let mut types_map: Vec<TyId> = Vec::with_capacity(src.types.len());
     {
@@ -1592,7 +1641,8 @@ fn merge_general_module(
     // (a `Ty::Func` outside the general table; any TABLE-INDEXED type — `Struct`, `Enum`,
     // `Array`, `FatPtr(Slice)`, `Set`, `Sequence`, `Record`, `Closure`, `Refine` — whose id
     // could only dangle, since the src tables were refused non-empty above) runs in THIS
-    // pre-pass over `src`, before `dst` is touched, so a refusal still merges nothing.
+    // pre-pass over `src`, before computational rows are published. The transaction
+    // rolls back destination type interning on refusal, so it still merges nothing.
     {
         let mut failure: Option<String> = None;
         'funcs: for function in src.functions.iter_mut() {
@@ -1625,9 +1675,10 @@ fn merge_general_module(
             refuse(summary, &compiled_names, format!("general global `{}`: {reason}", global.name));
             return;
         }
-        // Trust: an initializer is a constant, so it gets the body's v70 blob check.
+        // Trust: an initializer is a constant, so it gets the body's v70 blob and v73
+        // function-item checks.
         if let Some(reason) =
-            global.initializer.as_ref().and_then(general_const_tensor_blob_refusal)
+            global.initializer.as_ref().and_then(general_const_refusal)
         {
             refuse(summary, &compiled_names, format!("general global `{}`: {reason}", global.name));
             return;
@@ -1641,6 +1692,9 @@ fn merge_general_module(
         refuse(summary, &compiled_names, reason);
         return;
     }
+    // Tuple-layout transfer is the last fallible operation and is itself
+    // transactional. All remaining publication/remapping has been checked.
+    type_transaction.committed = true;
     for mut global in src.globals.drain(..) {
         if let Some(value) = &mut global.initializer {
             remap_general_const(value, func_offset);
@@ -1658,6 +1712,7 @@ fn merge_general_module(
         for block in &mut function.blocks {
             for node in &mut block.body {
                 node.span = None;
+                node.scope = None;
                 match &mut node.inst {
                     Inst::Call { callee, .. } | Inst::Invoke { callee, .. } => {
                         *callee = FuncId::new(func_offset + callee.index());
@@ -1819,6 +1874,11 @@ fn remap_general_ty(
              join: no Clean-origin producer mints a trust-ir v67 tensor and no consumer of \
              the joined module has a layout for one"
         )),
+        // Trust: trust-ir v73's function-item singleton names a source function by its
+        // `FuncId`. This join re-mints every `FuncId`, and this type pass is not handed the
+        // offset, so a carried one would name whichever function holds the index. No
+        // Clean-origin producer mints one. Refused by name, never carried unrelocated.
+        Ty::FnItem(func) => Err(general_fn_item_refusal("body type Ty", *func)),
     }
 }
 /// Trust (v1.1): remap every `Ty` field of one instruction. EXHAUSTIVE over the `Inst`
@@ -1844,8 +1904,6 @@ fn remap_general_inst_tys(
         // v50 `Inst::ArraySplat` carries its `Array(e, n)` type the same way; its one
         // operand is a function-local register.
         | Inst::ArraySplat { ty, .. }
-        // v47 `Inst::Drop` names the dropped place's type.
-        | Inst::Drop { ty, .. }
         | Inst::BinOp { ty, .. }
         | Inst::UnOp { ty, .. }
         | Inst::Overflow { ty, .. }
@@ -1870,9 +1928,10 @@ fn remap_general_inst_tys(
         | Inst::SeqMapNot { ty, .. }
         | Inst::SeqMap { ty, .. }
         | Inst::LoadSlot { ty, .. } => remap_general_ty(ty, functy_map, types_map),
-        // Trust: a constant is also checked for a trust-ir v70 `Constant::TensorBlob`, at
-        // any depth, before its type is remapped (see `general_const_tensor_blob_refusal`).
-        Inst::Const { ty, value } => match general_const_tensor_blob_refusal(value) {
+        // Trust: a constant is also checked for a trust-ir v70 `Constant::TensorBlob` and a
+        // v73 `Constant::FnItem`, at any depth, before its type is remapped (see
+        // `general_const_refusal`).
+        Inst::Const { ty, value } => match general_const_refusal(value) {
             Some(refusal) => Err(refusal),
             None => remap_general_ty(ty, functy_map, types_map),
         },
@@ -1897,9 +1956,9 @@ fn remap_general_inst_tys(
         // policy, not module-relative types. Preserve all of them in this type-only pass.
         Inst::MemCopy { dst: _, src: _, bytes: _, overlap: _ }
         | Inst::MemSet { dst: _, byte: _, bytes: _ } => Ok(()),
-        // Trust: a case value is a constant too, so it gets the same v70 blob check.
+        // Trust: a case value is a constant too, so it gets the same v70 and v73 checks.
         Inst::Switch { cases, .. } => {
-            match cases.iter().find_map(|case| general_const_tensor_blob_refusal(&case.value)) {
+            match cases.iter().find_map(|case| general_const_refusal(&case.value)) {
                 Some(refusal) => Err(refusal),
                 None => Ok(()),
             }
@@ -1939,6 +1998,12 @@ fn remap_general_inst_tys(
                  outside the v1.1 remap"
                 .to_string())
         }
+        // Drop resolves through the containing module's type-keyed glue table.
+        // This join refuses the source table above; carrying an unresolved
+        // drop could instead bind to an unrelated destination destructor.
+        Inst::Drop { .. } => Err(
+            "general body carries a Drop — its source destructor binding is outside the general remap".to_string(),
+        ),
         Inst::AssertInvoke { .. }
         | Inst::CallCannotUnwind { .. }
         | Inst::CallIndirectCannotUnwind { .. }
@@ -1968,6 +2033,15 @@ fn remap_general_inst_tys(
              join does not admit",
             general_inst_name(inst)
         )),
+        // Trust: trust-ir v74's Box deref. Its validity fact must be validated by a consumer
+        // that models it, and is sited at one source item; no Clean-origin producer emits
+        // one and this join neither validates nor re-sites it. Refused by name, never
+        // carried with its fact unread.
+        Inst::BoxDeref { .. } => Err(format!(
+            "general body carries {} — a trust-ir v74 Box deref whose validity fact the \
+             Clean-origin join does not validate",
+            general_inst_name(inst)
+        )),
     }
 }
 /// The name of an instruction [`remap_general_inst_tys`] refuses by variant.
@@ -1984,27 +2058,40 @@ fn general_inst_name(inst: &Inst) -> &'static str {
         Inst::TensorView { .. } => "a TensorView",
         Inst::TensorGather { .. } => "a TensorGather",
         Inst::TensorScatter { .. } => "a TensorScatter",
+        Inst::BoxDeref { .. } => "a BoxDeref",
         _ => "an instruction",
     }
 }
-/// Trust: the refusal of a trust-ir v70 `Constant::TensorBlob` anywhere in `value` (the root
-/// or any child), or `None`. A blob constant names its bytes by digest in the module's blob
-/// table, which this join refuses non-empty, so here it could only dangle. This is the
-/// fallible half for constants: [`remap_general_const`] is infallible and runs after it.
-fn general_const_tensor_blob_refusal(value: &Constant) -> Option<String> {
-    let mut blob = None;
-    value.visit_constants(|c| {
-        if let Constant::TensorBlob { digest, dims } = c {
-            if blob.is_none() {
-                blob = Some(format!(
+fn general_fn_item_refusal(what: &str, func: FuncId) -> String {
+    format!(
+        "general {what}::FnItem({}) is not admitted by the Clean-origin join: it names a \
+         source function by id, this join re-mints every FuncId, and no Clean-origin producer \
+         mints a trust-ir v73 function item",
+        func.index()
+    )
+}
+/// Refuse constants whose module-bound payload this join cannot conserve.
+/// Walk only stored children, including a uniform array's single element.
+/// This fallible check precedes every infallible constant remap/drain.
+fn general_const_refusal(value: &Constant) -> Option<String> {
+    let mut refusal = None;
+    value.visit_constants(|constant| {
+        if refusal.is_none() {
+            refusal = match constant {
+                Constant::TensorBlob { digest, dims } => Some(format!(
                     "general constant carries Constant::TensorBlob({digest}, dims {dims:?}), \
                      a trust-ir v70 tensor weight the Clean-origin join does not admit: it \
                      names bytes in a blob table the join does not carry"
-                ));
-            }
+                )),
+                Constant::FnItem(function) => Some(format!(
+                    "general constant carries nominal Constant::FnItem({}): its source definition binding is outside the general remap",
+                    function.index(),
+                )),
+                _ => None,
+            };
         }
     });
-    blob
+    refusal
 }
 /// Trust (v1.1): rewrite the `FuncId`s a CONSTANT can carry (`FnDef`, `Closure { func }`)
 /// by the append offset, recursing through the aggregate constants. Every target
@@ -2045,8 +2132,11 @@ fn remap_general_const(value: &mut Constant, func_offset: u32) {
         // v49: an unwritten lane carries no function identity.
         | Constant::Uninit
         // Trust: a v70 blob names bytes by digest and carries no function identity. Every
-        // one was refused before the drain (`general_const_tensor_blob_refusal`).
-        | Constant::TensorBlob { .. } => {}
+        // one was refused before the drain (`general_const_refusal`).
+        | Constant::TensorBlob { .. }
+        // Nominal items are also refused before the infallible drain; neither
+        // the constant nor its corresponding source type may lose its binding.
+        | Constant::FnItem(_) => {}
         // Level R (trust-ir amendment S): a module constant has no extension.
         Constant::Ext(e) => e.unreachable(),
     }
@@ -2213,6 +2303,10 @@ fn remap_ty(
                  and no consumer of the joined module has a layout for one"
             ));
         }
+        // Trust: same refusal as `remap_general_ty`'s trust-ir v73 function-item arm. This
+        // lane runs FIRST, so without it the catch-all below would intern a source-relative
+        // `FuncId` into `dst` through a param, a return or a `types[i]` entry.
+        Ty::FnItem(func) => return Err(general_fn_item_refusal("signature type Ty", *func)),
         other => other.clone(),
     })
 }
@@ -2304,6 +2398,25 @@ pub fn link_clean_origin_edges(
     if matches.is_empty() {
         return;
     }
+
+    // Only selected declarations are rebound. Unrelated nominal targets remain
+    // exact; a selected nominal item needs its own typed transport validation,
+    // which the pointer-only edge owner below does not provide.
+    let mut nominal = false;
+    module.visit_types(|ty| {
+        if let trust_ir::Ty::FnItem(id) = ty {
+            nominal |= matches.iter().any(|(decl_id, ..)| id == decl_id);
+        }
+    });
+    if nominal {
+        errors.push("clean-origin link refused: selected nominal FnItem identity transport is unavailable; no edge was rewritten".into());
+        return;
+    }
+    // Original BoxDeref records carry stable source-item/ordinal sites, root
+    // categories and standing assumptions, not module FuncIds. This pass keeps
+    // their bodies/sites and the selected declaration's exact source identity;
+    // it neither imports nor remaps their facts. General imported BoxDeref is
+    // separately refused before its module-relative transport can occur.
 
     // Trust (WS5.2): `Function.name` is the LINK-TIME SYMBOL, and a Rust caller's declaration
     // of a Clean-origin item and the item's Clean definition carry ONE symbol — so they are ONE
@@ -3217,7 +3330,7 @@ mod unwind_and_site_refusal_tests;
 #[cfg(test)]
 mod tests {
     use trust_certify::clean_island::CleanIslandSession;
-    use trust_ir::BinOp;
+    use trust_ir::{BinOp, InstrNode};
     use trust_ir::ty::Ty;
 
     use super::*;
@@ -4138,6 +4251,93 @@ mod tests {
         assert!(remap_general_inst_tys(&mut scalar, &[], &[]).is_ok(), "positive control");
     }
 
+    #[test]
+    fn nominal_function_items_refuse_before_publishing_general_module() {
+        for in_signature in [false, true] {
+            let mut source = general_two_fn_module();
+            // Exercise rollback of BOTH append-only tables on the body-refusal path.
+            source.add_type(Ty::U64).expect("source type table");
+            if in_signature {
+                source.func_types.push(FuncTy {
+                    params: Vec::new(),
+                    returns: vec![Ty::FnItem(FuncId::new(0))],
+                    is_vararg: false,
+                    abi: None,
+                });
+            } else {
+                source.functions[0].blocks[0].body.insert(
+                    0,
+                    InstrNode::new(Inst::Const {
+                        ty: Ty::FnItem(FuncId::new(0)),
+                        value: Constant::FnItem(FuncId::new(0)),
+                    })
+                    .with_result(ValueId::new(42)),
+                );
+            }
+            let mut destination = Module::new("nominal_destination");
+            destination.add_func_type(FuncTy {
+                params: vec![Ty::I32], returns: vec![Ty::I32], is_vararg: false, abi: None,
+            }).unwrap();
+            destination.add_type(Ty::Bool).unwrap();
+            let before = trust_ir::binary::serialize_module(&destination).unwrap();
+            let mut errors = Vec::new();
+            let summary = append_clean_origin(
+                &mut destination, vec![general_outcome(Some(source))], &mut errors,
+            );
+            // The refusal disclosure is expected; no computational table may change.
+            destination.spec_modules.retain(|spec| spec.name != CLEAN_ORIGIN_DISCLOSURE_NAME);
+            assert_eq!(trust_ir::binary::serialize_module(&destination).unwrap(), before);
+            assert!(summary.general.iter().any(|(_, disposition, _, reason)|
+                *disposition == "merge-refused" && reason.contains("FnItem")),
+                "{:?}", summary.general);
+        }
+    }
+
+    #[test]
+    fn box_validity_fact_cannot_be_erased_by_general_module_join() {
+        use trust_ir::box_validity::{
+            BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+        };
+        let mut source = general_two_fn_module();
+        source.add_type(Ty::U64).expect("source type table");
+        source.func_types[0].params = vec![Ty::Ptr];
+        for function in &mut source.functions {
+            function.blocks[0].params[0].1 = Ty::Ptr;
+        }
+        source.functions[0].blocks[0].body = vec![
+            InstrNode::new(Inst::BoxDeref {
+                ptr_ty: Ty::Ptr,
+                pointee: BoxPointee::Sized { ty: Ty::U64 },
+                operand: ValueId::new(0),
+                fact: Box::new(BoxValidityFact::premise(
+                    BoxDerefSite { item: [7; 16], ordinal: 0 },
+                    BoxFactSession::PROOF_SNAPSHOT,
+                    PremiseRoot::ParamByValue,
+                )),
+            })
+            .with_result(ValueId::new(42)),
+            InstrNode::new(Inst::Const { ty: Ty::U64, value: Constant::Int(0) })
+                .with_result(ValueId::new(43)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(43)] }),
+        ];
+        let mut destination = Module::new("box_destination");
+            destination.add_func_type(FuncTy {
+                params: vec![Ty::I32], returns: vec![Ty::I32], is_vararg: false, abi: None,
+            }).unwrap();
+            destination.add_type(Ty::Bool).unwrap();
+        let before = trust_ir::binary::serialize_module(&destination).unwrap();
+        let mut errors = Vec::new();
+        let summary = append_clean_origin(
+            &mut destination, vec![general_outcome(Some(source))], &mut errors,
+        );
+        // The refusal disclosure is expected; no computational table may change.
+        destination.spec_modules.retain(|spec| spec.name != CLEAN_ORIGIN_DISCLOSURE_NAME);
+        assert_eq!(trust_ir::binary::serialize_module(&destination).unwrap(), before);
+        assert!(summary.general.iter().any(|(_, disposition, _, reason)|
+            *disposition == "merge-refused" && reason.contains("BoxDeref")),
+            "{:?}", summary.general);
+    }
+
     /// Trust: trust-ir v70's weight blobs are refused by name wherever the join can meet
     /// them: a `Constant::TensorBlob` at any depth of an `Inst::Const`, a switch case or a
     /// global initializer, and a non-empty `Module::blobs` table, which refuses the whole
@@ -4146,10 +4346,10 @@ mod tests {
     fn tensor_blob_constants_and_the_blob_table_are_refused_by_name() {
         let digest = trust_ir::blob::BlobDigest::of(&[1, 2, 3, 4]);
         let blob = Constant::TensorBlob { digest, dims: vec![1] };
-        assert!(general_const_tensor_blob_refusal(&blob).is_some_and(|r| r.contains("TensorBlob")));
+        assert!(general_const_refusal(&blob).is_some_and(|r| r.contains("TensorBlob")));
         let nested = Constant::Aggregate(vec![Constant::Int(0), blob.clone()]);
-        assert!(general_const_tensor_blob_refusal(&nested).is_some(), "the walk must be deep");
-        assert!(general_const_tensor_blob_refusal(&Constant::Int(0)).is_none(), "positive control");
+        assert!(general_const_refusal(&nested).is_some(), "the walk must be deep");
+        assert!(general_const_refusal(&Constant::Int(0)).is_none(), "positive control");
 
         // The body lane checks the value before the type, so a blob under a scalar type
         // (a shape `validate_module` refuses) is refused here too.
@@ -4217,6 +4417,129 @@ mod tests {
             "{:?}",
             summary.general
         );
+    }
+
+    /// Trust: trust-ir v73's function-item identity is refused by name wherever the join can
+    /// meet it, since the join re-mints every `FuncId` and its type pass is not handed the
+    /// offset: a `Ty::FnItem` in both general remap lanes, bare and nested, and a
+    /// `Constant::FnItem` at any depth of an `Inst::Const`, a switch case or a global
+    /// initializer (which refuses the module by the global's name). Nothing is interned on a
+    /// refusal, and the scalar twins still pass.
+    #[test]
+    fn function_item_identities_are_refused_by_name_in_every_general_lane() {
+        let func = FuncId::new(1);
+        let item = Ty::FnItem(func);
+
+        // Body lane, bare and nested.
+        let mut body_ty = item.clone();
+        let err = remap_general_ty(&mut body_ty, &[], &[])
+            .expect_err("body lane must refuse a function-item type");
+        assert!(err.contains("Ty::FnItem(1)") && err.contains("not admitted"), "{err}");
+        assert_eq!(body_ty, item, "a refusal rewrites nothing");
+        let mut nested = Ty::Tuple(vec![Ty::U64, item.clone()]);
+        let err = remap_general_ty(&mut nested, &[], &[])
+            .expect_err("body lane must reach a function item nested in a tuple");
+        assert!(err.contains("Ty::FnItem"), "{err}");
+
+        // Signature/table lane, which runs first and ends in a catch-all.
+        let mut dst = Module::new("crate_under_test");
+        let src_func_types: Vec<FuncTy> = Vec::new();
+        let src_types: Vec<Ty> = Vec::new();
+        let mut cx = GeneralTyRemap {
+            src_func_types: &src_func_types,
+            src_types: &src_types,
+            func_memo: Vec::new(),
+            func_in_progress: Vec::new(),
+            ty_memo: Vec::new(),
+            ty_in_progress: Vec::new(),
+        };
+        let err = remap_ty(&item, &mut cx, &mut dst)
+            .expect_err("signature lane must refuse a function-item type");
+        assert!(err.contains("signature type Ty::FnItem(1)"), "{err}");
+        let err = remap_ty(&Ty::Ref(Box::new(item.clone())), &mut cx, &mut dst)
+            .expect_err("signature lane must reach a function item nested in a reference");
+        assert!(err.contains("Ty::FnItem"), "{err}");
+        assert!(dst.func_types.is_empty() && dst.types.is_empty(), "a refusal interns nothing");
+
+        // Constants, at any depth, before the type.
+        let constant = Constant::FnItem(func);
+        assert!(general_const_refusal(&constant).is_some_and(|r| r.contains("Constant::FnItem(1)")));
+        let deep = Constant::Aggregate(vec![Constant::Int(0), constant.clone()]);
+        assert!(general_const_refusal(&deep).is_some(), "the walk must be deep");
+        assert!(general_const_refusal(&Constant::FnDef(func)).is_none(), "FnDef is relocated");
+        let mut inst = Inst::Const { ty: item.clone(), value: constant.clone() };
+        let err = remap_general_inst_tys(&mut inst, &[], &[])
+            .expect_err("a function-item constant must be refused");
+        assert!(err.contains("Constant::FnItem(1)"), "{err}");
+        let mut switch = Inst::Switch {
+            value: ValueId::new(0),
+            default: trust_ir::BlockId::new(0),
+            default_args: Vec::new(),
+            cases: vec![trust_ir::SwitchCase {
+                value: constant.clone(),
+                target: trust_ir::BlockId::new(0),
+                args: Vec::new(),
+            }],
+            exhaustive_enum_unreachable: false,
+        };
+        let err = remap_general_inst_tys(&mut switch, &[], &[])
+            .expect_err("a function-item switch case must be refused");
+        assert!(err.contains("Constant::FnItem"), "{err}");
+
+        // A global initializer refuses the whole general module, by the global's name.
+        let mut src = general_two_fn_module();
+        src.globals.push(trust_ir::Global {
+            name: "item".to_string(),
+            ty: Ty::U64,
+            mutable: false,
+            initializer: Some(Constant::Aggregate(vec![constant])),
+            linkage: trust_ir::Linkage::default(),
+            tls: None,
+            align: None,
+            section: None,
+            visibility: trust_ir::Visibility::default(),
+            retained: false,
+        });
+        let mut module = Module::new("crate_under_test");
+        let mut errors = Vec::new();
+        let summary =
+            append_clean_origin(&mut module, vec![general_outcome(Some(src))], &mut errors);
+        assert!(module.functions.is_empty() && module.globals.is_empty());
+        assert!(
+            summary.general.iter().any(|(_, d, _, r)| *d == "merge-refused"
+                && r.contains("general global `item`")
+                && r.contains("Constant::FnItem")),
+            "{:?}",
+            summary.general
+        );
+    }
+
+    /// Trust: trust-ir v74's Box deref is refused by name in the fallible body pass, before
+    /// any destination table is touched: the join neither validates nor re-sites its fact.
+    #[test]
+    fn a_box_deref_is_refused_by_name_in_the_body_lane() {
+        use trust_ir::box_validity::{
+            BoxDerefSite, BoxFactSession, BoxPointeeG, BoxValidityFact, JudgedBody, PremiseRoot,
+            ProducingSession,
+        };
+        let fact = BoxValidityFact::premise(
+            BoxDerefSite { item: [0; 16], ordinal: 0 },
+            BoxFactSession {
+                judged: JudgedBody::VerificationSnapshot,
+                producing: ProducingSession::ProofSession,
+            },
+            PremiseRoot::ParamByValue,
+        );
+        let mut inst = Inst::BoxDeref {
+            ptr_ty: Ty::Ptr,
+            pointee: BoxPointeeG::Sized { ty: Ty::U64 },
+            operand: ValueId::new(0),
+            fact: Box::new(fact),
+        };
+        assert_eq!(general_inst_name(&inst), "a BoxDeref");
+        let err = remap_general_inst_tys(&mut inst, &[], &[])
+            .expect_err("a Box deref must be refused");
+        assert!(err.contains("a BoxDeref") && err.contains("validity fact"), "{err}");
     }
 
     /// A minimal VALID emitted function shaped like trust-clean-ir's output:
@@ -5739,6 +6062,30 @@ mod tests {
         })
     }
 
+    fn assert_general_compiled_rows_admitted(summary: &CleanOriginJoinSummary) {
+        let classifications: Vec<_> = summary.general.iter()
+            .map(|(name, state, certified, _)| (name.as_str(), *state, *certified)).collect();
+        assert_eq!(classifications, vec![
+            ("genTheorem", "not-computational", false),
+            ("genCallee", "compiled", true),
+            ("genCaller", "compiled", false),
+        ]);
+        assert_eq!(summary.general_functions, ["gen_callee", "gen_caller"]);
+    }
+
+    fn assert_general_compiled_rows_refused(summary: &CleanOriginJoinSummary, reason: &str) {
+        let classifications: Vec<_> = summary.general.iter()
+            .map(|(name, state, certified, _)| (name.as_str(), *state, *certified)).collect();
+        assert_eq!(classifications, vec![
+            ("genTheorem", "not-computational", false),
+            ("genCallee", "merge-refused", false),
+            ("genCaller", "merge-refused", false),
+        ]);
+        assert!(summary.general.iter().filter(|(_, state, _, _)| *state == "merge-refused")
+            .all(|(_, _, _, detail)| detail.contains(reason)), "{:?}", summary.general);
+        assert!(summary.general_functions.is_empty());
+    }
+
     #[test]
     fn general_module_merges_offset_ids_and_repoints_internal_calls() {
         let mut module = Module::new("crate_under_test");
@@ -5759,13 +6106,20 @@ mod tests {
             ))
             .expect("Module::try_add_function: test fixture");
 
+        module.add_type(Ty::Bool).expect("pre-existing destination type");
+        let original_signature = module.func_types[0].clone();
+        let mut source = general_two_fn_module();
+        source.add_type(Ty::U64).expect("source type table");
         let mut errors = Vec::new();
         let summary = append_clean_origin(
             &mut module,
-            vec![general_outcome(Some(general_two_fn_module()))],
+            vec![general_outcome(Some(source))],
             &mut errors,
         );
         assert!(errors.is_empty(), "general merge must not error: {errors:?}");
+        assert_eq!(module.func_types[0], original_signature);
+        assert_eq!(module.func_types.len(), 2, "successful interning must be retained");
+        assert_eq!(module.types, vec![Ty::Bool, Ty::U64]);
         assert_eq!(module.functions.len(), 3);
         for (i, f) in module.functions.iter().enumerate() {
             assert_eq!(f.id.index() as usize, i, "dense id invariant broken at {i}");
@@ -5915,6 +6269,224 @@ mod tests {
     }
 
     #[test]
+    fn general_unresolved_drop_cannot_bind_an_unrelated_host_destructor() {
+        let dropped = Ty::Rc(Box::new(Ty::U64));
+        let mut source_builder = trust_ir_build::ModuleBuilder::new("source-with-no-destructor");
+        let signature = source_builder.add_func_type(vec![Ty::Ptr], vec![]);
+        let mut callee = source_builder.function("gen_callee", signature);
+        let entry = callee.create_block();
+        let pointer = callee.add_block_param(entry, Ty::Ptr);
+        callee.switch_to_block(entry);
+        callee.drop(dropped.clone(), pointer);
+        callee.ret(vec![]);
+        callee.build();
+        let mut caller = source_builder.function("gen_caller", signature);
+        let entry = caller.create_block();
+        let pointer = caller.add_block_param(entry, Ty::Ptr);
+        caller.switch_to_block(entry);
+        caller.call_void(FuncId::new(0), vec![pointer]);
+        caller.ret(vec![]);
+        caller.build();
+        let source = source_builder.build().expect("a valid unresolved source drop");
+        assert!(trust_ir_build::validate_module(&source).is_empty());
+        assert_eq!(trust_ir_build::validate_module_report(&source).unresolved_drops().len(), 1);
+        assert!(trust_ir_build::codegen_lowerability_errors(&source).iter().any(|error| {
+            matches!(error, trust_ir_build::ValidationError::UnlowerableForCodegen { inst: "Drop", .. })
+        }));
+
+        let mut host_builder = trust_ir_build::ModuleBuilder::new("unrelated-destructor-owner");
+        let signature = host_builder.add_func_type(vec![Ty::Ptr], vec![]);
+        let mut glue = host_builder.function("host_destructor", signature);
+        let entry = glue.create_block();
+        glue.add_block_param(entry, Ty::Ptr);
+        glue.switch_to_block(entry);
+        glue.ret(vec![]);
+        glue.build();
+        let mut destination = host_builder.build().expect("a valid independent host");
+        destination.set_drop_glue(dropped, FuncId::new(0)).unwrap();
+        assert!(trust_ir_build::validate_module(&destination).is_empty());
+        let before = trust_ir::binary::serialize_module(&destination).unwrap();
+        let mut errors = Vec::new();
+        let summary = append_clean_origin(&mut destination, vec![general_outcome(Some(source))], &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_general_compiled_rows_refused(&summary, "Drop");
+        assert_general_compiled_rows_refused(&summary, "destructor");
+        destination.spec_modules.retain(|spec| spec.name != CLEAN_ORIGIN_DISCLOSURE_NAME);
+        assert_eq!(trust_ir::binary::serialize_module(&destination).unwrap(), before);
+
+        // The destination's own destructor is preserved, and unrelated plain
+        // scalar functions remain eligible for the normal general join.
+        let glue = destination.drop_glue.clone();
+        let summary = append_clean_origin(&mut destination, vec![general_outcome(Some(general_two_fn_module()))], &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_general_compiled_rows_admitted(&summary);
+        assert_eq!(destination.functions.len(), 3);
+        assert_eq!(destination.drop_glue, glue);
+        assert!(trust_ir_build::validate_module(&destination).is_empty());
+    }
+
+    #[test]
+    fn general_assembly_is_never_dropped_to_bypass_the_consumer_refusal() {
+        let mut source = general_two_fn_module();
+        source.global_asm.push(".globl clean_assembly_symbol\nclean_assembly_symbol:\n.long 0".to_owned());
+        assert!(trust_ir_build::validate_module(&source).is_empty());
+        assert!(matches!(
+            trust_ir_build::codegen_global_asm_errors(&source).as_slice(),
+            [trust_ir_build::ValidationError::GlobalAsmNotConsumable { blocks: 1 }],
+        ));
+        let mut destination = Module::new("assembly_owner");
+        destination.add_type(Ty::Bool).unwrap();
+        destination.global_asm.push("original_host_assembly".to_owned());
+        let before = trust_ir::binary::serialize_module(&destination).unwrap();
+        let mut errors = Vec::new();
+        let summary = append_clean_origin(
+            &mut destination, vec![general_outcome(Some(source))], &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_general_compiled_rows_refused(&summary, "global_asm");
+        destination.spec_modules.retain(|spec| spec.name != CLEAN_ORIGIN_DISCLOSURE_NAME);
+        assert_eq!(trust_ir::binary::serialize_module(&destination).unwrap(), before);
+
+        // An ordinary assembly-free general module still joins, and the
+        // existing host's separate opaque assembly is conserved byte-for-byte.
+        let host_assembly = destination.global_asm.clone();
+        let summary = append_clean_origin(
+            &mut destination, vec![general_outcome(Some(general_two_fn_module()))], &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_general_compiled_rows_admitted(&summary);
+        assert_eq!(destination.functions.len(), 2);
+        assert_eq!(destination.global_asm, host_assembly);
+        assert!(trust_ir_build::validate_module(&destination).is_empty());
+        assert!(matches!(
+            trust_ir_build::codegen_global_asm_errors(&destination).as_slice(),
+            [trust_ir_build::ValidationError::GlobalAsmNotConsumable { blocks: 1 }],
+        ));
+    }
+
+    #[test]
+    fn general_scope_stripping_keeps_joined_metadata_valid_and_preserves_host_scopes() {
+        let mut source = general_two_fn_module();
+        for function in &mut source.functions {
+            function.scopes = Some(vec![
+                trust_ir::ScopeData::new(None, None),
+                trust_ir::ScopeData::new(Some(0), None),
+            ]);
+            for node in function.blocks.iter_mut().flat_map(|block| &mut block.body) {
+                node.scope = Some(1);
+            }
+        }
+        assert!(trust_ir_build::validate_module(&source).is_empty(), "valid source scopes");
+        let mut destination = general_two_fn_module();
+        for function in &mut destination.functions {
+            function.name = format!("host_{}", function.name);
+            function.scopes = Some(vec![trust_ir::ScopeData::new(None, None)]);
+            for node in function.blocks.iter_mut().flat_map(|block| &mut block.body) {
+                node.scope = Some(0);
+            }
+        }
+        assert!(trust_ir_build::validate_module(&destination).is_empty(), "valid host scopes");
+        let host = destination.functions.clone();
+        let mut errors = Vec::new();
+        let summary = append_clean_origin(
+            &mut destination, vec![general_outcome(Some(source))], &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(summary.general.iter().any(|(_, state, _, _)| *state == "compiled"));
+        assert_eq!(&destination.functions[..host.len()], host.as_slice());
+        assert!(destination.functions[host.len()..].iter().all(|function|
+            function.scopes.is_none() && function.blocks.iter().flat_map(|block| &block.body)
+                .all(|node| node.scope.is_none() && node.span.is_none())));
+        let errors = trust_ir_build::validate_module(&destination);
+        assert!(errors.is_empty(), "joined scope metadata must remain valid: {errors:?}");
+    }
+
+    #[test]
+    fn general_function_body_licenses_require_the_sealed_lane() {
+        use trust_ir::BodyGate;
+
+        for authority in ["clean-carrier-gate", "trust-direct-lane-structural"] {
+            let mut source = general_two_fn_module();
+            source.functions[1].body_gate = Some(BodyGate::Gated {
+                authority: authority.to_owned(),
+                evidence: None,
+            });
+            let mut destination = Module::new("original_license_owner");
+            destination.add_type(Ty::Bool).unwrap();
+            let before = trust_ir::binary::serialize_module(&destination).unwrap();
+            let mut errors = Vec::new();
+            let summary = append_clean_origin(
+                &mut destination, vec![general_outcome(Some(source))], &mut errors,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_general_compiled_rows_refused(&summary, "proof channels");
+            assert!(summary.gated.is_empty());
+            destination.spec_modules.retain(|spec| spec.name != CLEAN_ORIGIN_DISCLOSURE_NAME);
+            assert_eq!(trust_ir::binary::serialize_module(&destination).unwrap(), before);
+        }
+
+        // Ordinary general producers carry no positive license. Both legacy
+        // absence and the collector's explicit Ungated remain computational.
+        for gate in [None, Some(BodyGate::Ungated)] {
+            let mut source = general_two_fn_module();
+            for function in &mut source.functions {
+                function.body_gate = gate.clone();
+            }
+            let mut destination = Module::new("ordinary_general_owner");
+            let mut errors = Vec::new();
+            let summary = append_clean_origin(
+                &mut destination, vec![general_outcome(Some(source))], &mut errors,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(summary.general.iter().any(|(_, disposition, _, _)| *disposition == "compiled"));
+            assert!(summary.gated.is_empty());
+            assert!(destination.functions.iter().all(|function| function.body_gate == gate));
+        }
+    }
+
+    #[test]
+    fn general_instruction_proof_channels_cannot_capture_destination_claims() {
+        use trust_ir::proof::ProofContext;
+        use trust_ir::{ObligationKind, ProofAnnotation, ProofId, ProofObligation, ProofStatus};
+
+        for channel in 0..3 {
+            let mut source = general_two_fn_module();
+            let call = source.functions[1].blocks[0].body.iter_mut()
+                .find(|node| matches!(node.inst, Inst::Call { .. })).unwrap();
+            match channel {
+                0 => call.proofs.push(ProofAnnotation::Pure),
+                1 => call.proof_context = Some(ProofContext::default()),
+                _ => call.proof_context = Some(ProofContext {
+                    assumes: vec![ProofId::new(0)],
+                    establishes: vec![ProofId::new(0)],
+                }),
+            }
+            let mut destination = Module::new("destination_claim_owner");
+            destination.add_func_type(FuncTy {
+                params: vec![Ty::I32], returns: vec![Ty::I32], is_vararg: false, abi: None,
+            }).unwrap();
+            destination.add_type(Ty::Bool).unwrap();
+            // Arena-local ID0 belongs to this pending destination claim. A
+            // source call context must never silently acquire that binding.
+            destination.proof_obligations.push(ProofObligation::new(
+                ProofId::new(0), ObligationKind::MemorySafety, ProofStatus::Pending,
+                "original destination claim",
+            ));
+            let before = trust_ir::binary::serialize_module(&destination).unwrap();
+            let mut errors = Vec::new();
+            let summary = append_clean_origin(
+                &mut destination, vec![general_outcome(Some(source))], &mut errors,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(summary.general.iter().any(|(_, disposition, _, reason)|
+                *disposition == "merge-refused" && reason.contains("proof channels")),
+                "{:?}", summary.general);
+            destination.spec_modules.retain(|spec| spec.name != CLEAN_ORIGIN_DISCLOSURE_NAME);
+            assert_eq!(trust_ir::binary::serialize_module(&destination).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn general_proof_channels_and_table_content_each_refuse() {
         // Belt 1: populated proof channels (the collector must strip).
         let mut src = general_two_fn_module();
@@ -5981,4 +6553,46 @@ mod tests {
         assert_eq!(refused.len(), 2);
         assert!(refused[0].3.contains("withheld by the collector"));
     }
+    #[test]
+    fn new_ir_carrier_join_refuses_without_mutating_original() {
+        for selected in [false, true] {
+            let (mut module, record, owners) = rust_call_fixture();
+            let declaration = pending_clean_declaration(&mut module, "answer", ANSWER_SYMBOL, 42);
+            let target = if selected { declaration.func_id } else { module.functions[0].id };
+            module.types.push(Ty::FnItem(target));
+            let before = module.clone();
+            let mut errors = Vec::new();
+            let prepared = prepare_clean_origin_with_rust_callees(
+                &module, vec![CleanOriginIrOutcome::RustCalls(record)], &mut errors,
+                &owners, std::slice::from_ref(&declaration),
+            );
+            let summary = link_prepared_clean_origin(&mut module, prepared, &[declaration], &mut errors);
+            if selected {
+                assert!(errors.iter().any(|error| error.contains("FnItem identity")), "{errors:?}");
+                assert!(!summary.recorded);
+                assert_eq!(module, before, "a selected nominal identity cannot be rebound");
+            } else {
+                assert!(errors.is_empty(), "{errors:?}");
+                assert!(summary.recorded);
+                assert_eq!(module.types, before.types, "unrelated nominal target remains exact");
+                assert!(trust_ir_build::validate_module(&module).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn new_ir_carrier_general_nominal_constants_refuse_before_id_remap() {
+        let mut value = Inst::Const {
+            ty: Ty::Tuple(vec![Ty::FnItem(FuncId::new(7))]),
+            value: Constant::Aggregate(vec![Constant::FnItem(FuncId::new(7))]),
+        };
+        let before = value.clone();
+        let error = remap_general_inst_tys(&mut value, &[], &[]).unwrap_err();
+        assert!(error.contains("Constant::FnItem"), "{error}");
+        assert_eq!(value, before);
+        assert!(remap_general_inst_tys(&mut Inst::Const {
+            ty: Ty::I32, value: Constant::Int(7),
+        }, &[], &[]).is_ok());
+    }
+
 }

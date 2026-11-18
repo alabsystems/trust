@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use trust_ir::function_dependencies::{
     DependencyNode, DependencySite, inspect_defined_function_dependencies,
 };
-use trust_ir::{BinOp, Constant, FuncId, Function, Inst, Module, Producer, Ty, UnOp};
+use trust_ir::{BinOp, CastOp, Constant, FuncId, Function, Inst, Module, Producer, Ty, UnOp};
 
 /// One canonical reading of an immutable original module. This supplies no
 /// source, body or proof authority; the caller binds the exact retained Arc.
@@ -67,30 +67,51 @@ fn scalar(ty: &Ty) -> bool {
             | Ty::U32
             | Ty::U64
             | Ty::U128
+            | Ty::Isize
+            | Ty::Usize
+            | Ty::Char
     )
 }
 
-/// The source guard currently admits call-free primitive expressions only.
+fn scalar_or_pointer(ty: &Ty) -> bool {
+    scalar(ty) || *ty == Ty::Ptr
+}
+
+/// The source guard admits primitive expressions and scalar local cells.
 /// The dependency census independently checks the exact original row; zero
 /// explicit edges alone could not establish the absence of implicit services.
 fn primitive_body(module: &Module, function: &Function) -> bool {
     let Some(signature) = module.func_types.get(function.ty.as_usize()) else { return false };
     if function.blocks.is_empty()
         || function.producer != Some(Producer::TRust)
-        || !signature.params.iter().chain(&signature.returns).all(scalar)
+        || signature.is_vararg
+        || !signature.params.iter().chain(&signature.returns).all(scalar_or_pointer)
     {
         return false;
     }
     for block in &function.blocks {
-        if !block.params.iter().all(|(_, ty)| scalar(ty)) {
+        if !block.params.iter().all(|(_, ty)| scalar_or_pointer(ty)) {
             return false;
         }
         for node in &block.body {
             let admitted = match &node.inst {
                 Inst::Const { ty, value: Constant::Int(_) | Constant::Bool(_) } => scalar(ty),
-                Inst::BinOp { op: BinOp::And | BinOp::Or | BinOp::Xor, ty, .. }
-                | Inst::UnOp { op: UnOp::Not, ty, .. }
-                | Inst::ICmp { ty, .. } => scalar(ty),
+                Inst::BinOp {
+                    op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor,
+                    ty,
+                    ..
+                }
+                | Inst::UnOp { op: UnOp::Not, ty, .. } => scalar(ty),
+                Inst::ICmp { ty, .. } => scalar_or_pointer(ty),
+                Inst::Alloca { ty, count: None, .. }
+                | Inst::Load { ty, volatile: false, .. }
+                | Inst::Store { ty, volatile: false, .. } => scalar(ty),
+                Inst::Cast {
+                    op: CastOp::ZExt | CastOp::SExt | CastOp::Trunc,
+                    src_ty,
+                    dst_ty,
+                    ..
+                } => scalar(src_ty) && scalar(dst_ty),
                 Inst::Br { .. } | Inst::CondBr { .. } | Inst::Return { .. } => true,
                 _ => false,
             };
@@ -104,4 +125,5 @@ fn primitive_body(module: &Module, function: &Function) -> bool {
 
 #[cfg(test)]
 // Trust: out-of-line unit tests, as tidy's `unit_tests` check requires.
+#[path = "ir/tests.rs"]
 mod tests;

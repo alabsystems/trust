@@ -4,7 +4,8 @@
 //! `x.py build --stage 1 targo-build-tool`, and every `x.py check` that builds that Targo
 //! first, stopped compiling on 2026-11-09: a6a809eb08 and bc24b82698 linked
 //! `trust-certify`, and through it AY's solver crates, into Targo. `ay-sat` enables
-//! `allocator_api`, and the sandbox refused it (E0725) in a gate, not in a test.
+//! `allocator_api` (since ay 8e9b6785, `allocator_ext`), and the sandbox refused it
+//! (E0725) in a gate, not in a test.
 //!
 //! The census walks Targo's lockfile from `targo` along its resolved edges. Each
 //! path-sourced package is found where its dependent's manifest, or Targo's `[patch]`,
@@ -585,7 +586,7 @@ fn targo_allows_every_feature_its_linked_first_party_crates_enable() {
     // Positive controls: the unconditional feature this red was, and two conditional
     // ones the build takes (a build-script cfg and a default Cargo feature).
     for (package, feature) in [
-        ("ay-sat", "allocator_api"),
+        ("ay-sat", "allocator_ext"),
         ("trust-resource-controller", "trust_process_inherit_fds"),
         ("trust-types", "try_trait_v2"),
     ] {
@@ -650,4 +651,74 @@ fn targo_allows_nothing_its_graph_does_not_need() {
         .chain(BUILD_SCRIPT_PROBED.iter().map(|f| f.to_string()))
         .collect();
     assert_eq!(listed, needed, "{TARGO_ALLOW_FEATURES}");
+}
+
+/// Every source `lock` resolves `name` from, one per locked row: `None` for a path.
+fn locked_sources(lock: &Path, name: &str) -> Vec<Option<String>> {
+    read_toml(lock)
+        .get("package")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|package| str_at(package, "name") == Some(name))
+        .map(|package| str_at(package, "source").map(String::from))
+        .collect()
+}
+
+/// Trust: every allow-list whose build compiles the in-tree `ay-sat` allows each
+/// crate-level feature that crate enables: ay f1e9d1be6 renamed its gate to
+/// `allocator_ext`, and the AY, VF5, Targo and targo-trust builds refused it with E0725
+/// (`x.py doc src/tools/targo` takes Targo's list). ty and clean lock `ay-sat` from
+/// their own AY revisions, whose crate root enables `allocator_api`, so a relock of
+/// either fails here and names their list. AY's smartstring probes `allocator_api`
+/// from its build script.
+#[test]
+fn every_recipe_allows_the_allocator_gate_of_the_ay_sat_it_locks() {
+    let root = repo_root();
+    let source = std::fs::read_to_string(root.join("first-party/ay/crates/ay-sat/src/lib.rs"))
+        .expect("the in-tree ay-sat crate root");
+    let enabled: Vec<String> = crate_level_features(&source)
+        .into_iter()
+        .filter(|(condition, _)| condition.is_none())
+        .map(|(_, feature)| feature)
+        .collect();
+    assert!(enabled.iter().any(|feature| feature == "allocator_ext"), "{enabled:?}");
+    let allows = |list: &str, feature: &str| list.split(',').any(|allowed| allowed == feature);
+    for (lock, recipe, list) in [
+        ("first-party/ay/Cargo.lock", "ay", AY_ALLOW_FEATURES),
+        ("Cargo.lock", "prepare_vf5_inputs", VF5_RESOURCE_ALLOW_FEATURES),
+        ("Cargo.lock", "targo-trust", CARGO_TRUST_ALLOW_FEATURES),
+        ("src/tools/targo/Cargo.lock", "targo", TARGO_ALLOW_FEATURES),
+    ] {
+        let sources = locked_sources(&root.join(lock), "ay-sat");
+        assert_eq!(sources, [None], "{lock}: {recipe}'s ay-sat");
+        for feature in &enabled {
+            assert!(allows(list, feature), "{recipe} ({lock}) refuses ay-sat's {feature}: {list}");
+        }
+    }
+    for (lock, revision) in [
+        ("first-party/ty/Cargo.lock", "91d6b45ab17373b5381d6cdf4e6a97ee4e84dbcc"),
+        ("first-party/clean/Cargo.lock", "f528c4df13861950dfca570523b079a7fff69b4c"),
+    ] {
+        let lock = root.join(lock);
+        // A tree without this backend's source builds nothing that takes its list.
+        if !lock.exists() {
+            continue;
+        }
+        let sources = locked_sources(&lock, "ay-sat");
+        assert!(
+            matches!(sources.as_slice(), [Some(source)]
+                if source.starts_with("git+") && source.ends_with(&format!("#{revision}"))),
+            "{} relocked ay-sat ({sources:?}): allow the allocator gate its ay-sat enables \
+             there in VERIFIER_BACKEND_ALLOW_FEATURES, then pin that revision here",
+            lock.display()
+        );
+    }
+    // The ay-sat that ty and clean lock enables allocator_api.
+    assert!(allows(VERIFIER_BACKEND_ALLOW_FEATURES, "allocator_api"));
+    assert_eq!(
+        !locked_sources(&root.join("first-party/ay/Cargo.lock"), "smartstring").is_empty(),
+        allows(AY_ALLOW_FEATURES, "allocator_api"),
+        "AY allows allocator_api exactly while it builds smartstring"
+    );
 }

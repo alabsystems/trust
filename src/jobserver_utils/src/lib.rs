@@ -141,6 +141,18 @@ impl Jobserver {
         self.pipe.as_deref()
     }
 
+    /// Retain actual original GNU descriptions for identity/disjointness
+    /// checks, including named FIFOs. No environment is imported and no token
+    /// is acquired or created. These are not instructions to advertise numeric
+    /// descriptors for a named transport; ordinary configuration is unchanged.
+    #[cfg(unix)]
+    pub fn retain_transport_descriptors(&self) -> io::Result<[OwnedFd; 2]> {
+        match self.client.transport_witnesses()? {
+            jobserver::TransportWitnesses::NumericPipe { read, write }
+            | jobserver::TransportWitnesses::NamedFifo { read, write, .. } => Ok([read, write]),
+        }
+    }
+
     /// Allow unaware build scripts to hand this same pipe to Bootstrap shims.
     /// The caller must retain this owner through every relevant child wait.
     /// No tokens are acquired, created, replenished or proxied by this service.
@@ -203,6 +215,27 @@ impl Jobserver {
         }
         let flags = std::env::var_os("CARGO_MAKEFLAGS").unwrap_or_default();
         Self::from_authenticated_handoff(&advertisement, &flags).map(Some)
+    }
+
+    /// Retain ancestor-owned transport for an explicit descendant command.
+    /// No ambient numeric descriptor is imported, inspected or closed, so this
+    /// may be used after startup. Absence is not a private scheduler; malformed
+    /// advertisements refuse. Retain this owner through the child wait.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn retain_authenticated_env_handoff() -> io::Result<Option<Self>> {
+        let Some(advertisement) = std::env::var_os(DESCENDANT_HANDOFF_ENV) else {
+            return Ok(None);
+        };
+        if let Some(path) = Client::fifo_path_from_env()? {
+            return Self::from_fifo_handoff(&path, &advertisement).map(Some);
+        }
+        let flags = ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"]
+            .into_iter()
+            .find_map(std::env::var_os)
+            .unwrap_or_default();
+        let pipe = handoff::retain_originals(&advertisement, &flags)?;
+        use std::os::fd::AsFd;
+        Self::with_client(Client::from_pipe(pipe[0].as_fd(), pipe[1].as_fd())?).map(Some)
     }
 
     /// Capture an inherited server without acquiring or creating any tokens.

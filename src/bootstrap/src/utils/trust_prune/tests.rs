@@ -2251,7 +2251,10 @@ fn the_summary_names_units_gib_and_seconds() {
         f.warm_compiler_tree();
         let line = f.prune().line();
         assert!(
-            line.starts_with("Prune: removed 6 superseded units and 0 duplicate objects, "),
+            line.starts_with(
+                "Prune: removed 6 superseded units, 0 duplicate objects and 0 unused incremental \
+                 folders, "
+            ),
             "{line}"
         );
         assert!(line.contains(" GiB, in ") && line.contains(" s ("), "{line}");
@@ -2965,5 +2968,271 @@ fn manual_pruning_refuses_unknown_tree_census_and_preserves_cross_tree_stamp_roo
             assert_unit(&live, true);
             assert!(hidden.profile.join(".librustc-stamp").is_file());
         }
+    });
+}
+
+// ---- incremental folders (DC-12c) ----------------------------------------------------------
+//
+// The tracked bootstrap defaults compile nothing incrementally (`rust.incremental = false` in
+// every `src/bootstrap/defaults` profile; a local `bootstrap.toml` turns it on), so these
+// trees are written by hand: a compile is the wrapper's own `incremental::Before` read before
+// and noted after the folder changes, as `src/bin/rustc.rs` does around the compiler.
+
+/// One incremental compile of `unit` (crate `krate`) in `profile`, as the wrapper sees it: the
+/// compiler adds a session to each of `folders` (two at once is two compiles of one crate name
+/// running together) and the wrapper notes them. Each folder that was there keeps its time, as
+/// on a file system whose clock ticks coarser than a compile: the note must not hang on it.
+fn compile_incrementally(profile: &Path, krate: &str, unit: &str, folders: &[&str]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SESSION: AtomicUsize = AtomicUsize::new(0);
+    let dir = profile.join("incremental");
+    let args: Vec<std::ffi::OsString> = [
+        "--crate-name".to_owned(),
+        krate.to_owned(),
+        "-C".to_owned(),
+        format!("incremental={}", dir.display()),
+        "-C".to_owned(),
+        format!("extra-filename=-{unit}"),
+        "--out-dir".to_owned(),
+        profile.join("deps").display().to_string(),
+    ]
+    .map(Into::into)
+    .to_vec();
+    let before = incremental::Before::read(&args).unwrap();
+    for folder in folders {
+        let folder = dir.join(folder);
+        let was = fs::metadata(&folder).and_then(|meta| meta.modified()).ok();
+        let session = SESSION.fetch_add(1, Ordering::Relaxed);
+        write(&folder.join(format!("s-{session}-working/dep-graph.bin")), &[b'g'; 8192]);
+        if let Some(was) = was {
+            File::open(&folder).unwrap().set_modified(was).unwrap();
+        }
+    }
+    before.note().unwrap();
+}
+
+/// The warm compiler tree, with an incremental folder noted for each of `rustc_middle`'s and
+/// `rustc_driver`'s live and dead variants, a folder of the dead unfinished `rustc_ast` that no
+/// note names, a note whose unit is gone, and the session file the fixture keeps there.
+fn incremental_tree(f: &Fixture) -> (CargoTree, BTreeMap<&'static str, Made>, PathBuf) {
+    let (t, u) = f.warm_compiler_tree();
+    let p = t.profile.clone();
+    compile_incrementally(&p, "rustc_middle", "5555555555555555", &["rustc_middle-0old"]);
+    compile_incrementally(&p, "rustc_middle", "2222222222222222", &["rustc_middle-1live"]);
+    compile_incrementally(&p, "rustc_driver", "4444444444444444", &["rustc_driver-0dead"]);
+    compile_incrementally(&p, "rustc_driver", "3333333333333333", &["rustc_driver-1live"]);
+    write(&p.join("incremental/rustc_ast-0nobody/s-1-working/dep-graph.bin"), &[b'g'; 8192]);
+    write(&p.join("incremental/.trust-unit-9999999999999999"), b"rustc_ast-0nobody\n");
+    write(&p.join("incremental/cache.bin"), b"keep");
+    let incremental = p.join("incremental");
+    (t, u, incremental)
+}
+
+#[test]
+fn disk_custody_an_incremental_folder_no_live_unit_uses_goes_after_a_run() {
+    crate::utils::tests::isolated(|| {
+        let f = Fixture::new();
+        let (t, _u, inc) = incremental_tree(&f);
+        let unused = ["rustc_middle-0old", "rustc_driver-0dead", "rustc_ast-0nobody"];
+        let stale_notes = ["5555555555555555", "4444444444444444", "9999999999999999"]
+            .map(|id| inc.join(format!("{}{id}", incremental::NOTE_PREFIX)));
+        let all_there = || {
+            unused.iter().all(|n| inc.join(n).is_dir()) && stale_notes.iter().all(|n| n.is_file())
+        };
+        assert!(all_there());
+
+        // Negative controls first. A held cargo lock leaves the tree, its folders included.
+        {
+            let lock = File::open(t.profile.join(".cargo-lock")).unwrap();
+            lock.try_lock().unwrap();
+            let held = f.prune();
+            assert_eq!((held.units, held.incremental), (0, 0), "{}", left(&held));
+            assert!(all_there());
+        }
+        // A preview plans them and removes nothing; manual cleanup by objects alone does not
+        // judge them.
+        let options = Options { objects: true, observe: None };
+        let preview = prune_selected(&f.build, &f.host, &[], &options, true, true);
+        assert_eq!((preview.planned_incremental, preview.incremental), (3, 0));
+        let objects_only = prune_selected(&f.build, &f.host, &[], &options, false, false);
+        assert_eq!(objects_only.incremental, 0);
+        assert!(all_there());
+
+        // The run's prune removes each folder no live unit uses, with the notes of dead and
+        // gone units, and counts the folders in its line.
+        let summary = f.prune();
+        assert!(summary.skipped.is_empty() && summary.failures.is_empty(), "{}", left(&summary));
+        assert_eq!((summary.units, summary.incremental), (6, 3), "{:#?}", summary.listing);
+        for name in unused {
+            assert!(!inc.join(name).exists(), "{name}");
+        }
+        for note in &stale_notes {
+            assert!(!note.exists(), "{}", note.display());
+        }
+        let line = summary.line();
+        assert!(
+            line.starts_with(
+                "Prune: removed 6 superseded units, 0 duplicate objects and 3 unused incremental \
+                 folders, "
+            ),
+            "{line}"
+        );
+        let listed: Vec<&String> =
+            summary.listing.iter().filter(|l| l.starts_with("incremental ")).collect();
+        assert_eq!(listed.len(), 3, "{listed:#?}");
+        assert!(listed.iter().any(|l| l.contains("rustc_ast-0nobody")), "{listed:#?}");
+        // What a live unit uses, and what is no crate folder, stays.
+        assert!(inc.join("rustc_middle-1live").is_dir() && inc.join("rustc_driver-1live").is_dir());
+        assert!(inc.join("cache.bin").is_file());
+        // The tree's stamp was written after the removal, so the next run finds it unchanged.
+        assert_eq!(f.prune().unchanged, 1);
+    });
+}
+
+#[test]
+fn disk_custody_an_incremental_folder_a_live_unit_uses_stays() {
+    crate::utils::tests::isolated(|| {
+        let f = Fixture::new();
+        let (t, _u, inc) = incremental_tree(&f);
+        let p = t.profile.clone();
+        // A live unit compiled before the wrapper noted (serde, no note) keeps every folder of
+        // its crate name, even one only a dead variant's note names; an un-noted build script
+        // keeps the build scripts' folders.
+        compile_incrementally(&p, "serde", "6666666666666666", &["serde-0old"]);
+        write(&inc.join("serde-1unnoted/s-1-working/dep-graph.bin"), &[b'g'; 8192]);
+        write(&inc.join("build_script_build-0script/s-1-working/dep-graph.bin"), &[b'g'; 8192]);
+        // A note that names two folders (two compiles of one crate name at once) keeps both.
+        compile_incrementally(
+            &p,
+            "rustc_middle",
+            "2222222222222222",
+            &["rustc_middle-1live", "rustc_middle-2beside"],
+        );
+        // A link named like a folder is no folder, and is never followed.
+        let outside = f.root.join("outside-incremental");
+        write(&outside.join("keep.bin"), b"keep");
+        symlink(&outside, inc.join("rustc_ast-1link")).unwrap();
+
+        let summary = f.prune();
+        assert!(summary.skipped.is_empty() && summary.failures.is_empty(), "{}", left(&summary));
+        for kept in [
+            "rustc_middle-1live",
+            "rustc_middle-2beside",
+            "rustc_driver-1live",
+            "serde-0old",
+            "serde-1unnoted",
+            "build_script_build-0script",
+        ] {
+            assert!(inc.join(kept).is_dir(), "{kept}: {:#?}", summary.listing);
+        }
+        assert!(fs::symlink_metadata(inc.join("rustc_ast-1link")).unwrap().is_symlink());
+        assert!(outside.join("keep.bin").is_file());
+        for note in ["2222222222222222", "3333333333333333"] {
+            assert!(inc.join(format!("{}{note}", incremental::NOTE_PREFIX)).is_file(), "{note}");
+        }
+        // The negative control: the dead variants' folders went in the same run.
+        assert_eq!(summary.incremental, 3, "{:#?}", summary.listing);
+        assert!(!inc.join("rustc_middle-0old").exists());
+
+        // Once serde is compiled with the wrapper noting, its note says which folder it uses,
+        // and the folder only its dead variant used goes on the next run.
+        compile_incrementally(&p, "serde", "1111111111111111", &["serde-1unnoted"]);
+        let next = f.prune();
+        assert_eq!(next.incremental, 1, "{:#?}", next.listing);
+        assert!(!inc.join("serde-0old").exists());
+        assert!(inc.join("serde-1unnoted").is_dir());
+
+        // A note that cannot be read is no note: its live unit keeps every folder of its crate.
+        write(&inc.join("rustc_driver-3other/s-1-working/dep-graph.bin"), &[b'g'; 8192]);
+        write(&inc.join(format!("{}3333333333333333", incremental::NOTE_PREFIX)), b"not a/name\n");
+        let garbled = f.prune();
+        assert_eq!(garbled.incremental, 0, "{:#?}", garbled.listing);
+        assert!(
+            inc.join("rustc_driver-3other").is_dir() && inc.join("rustc_driver-1live").is_dir()
+        );
+    });
+}
+
+#[test]
+fn the_wrapper_reads_the_unit_and_its_incremental_directory_from_the_compiler_call() {
+    let args = |list: &[&str]| -> Vec<std::ffi::OsString> { list.iter().map(Into::into).collect() };
+    let call = args(&[
+        "--crate-name",
+        "serde",
+        "-Cincremental=/b/release/incremental",
+        "-C",
+        "extra-filename=-0123456789abcdef",
+    ]);
+    assert_eq!(incremental::codegen_value(&call, "incremental"), Some("/b/release/incremental"));
+    assert_eq!(incremental::unit_id(&call).as_deref(), Some("0123456789abcdef"));
+    // Without an extra file name, the unit's own output directory names it, in either layout.
+    let new_layout = args(&["--out-dir", "/b/release/build/serde/0123456789abcdef/out"]);
+    assert_eq!(incremental::unit_id(&new_layout).as_deref(), Some("0123456789abcdef"));
+    let legacy = args(&["--out-dir=/b/release/build/serde-0123456789abcdef"]);
+    assert_eq!(incremental::unit_id(&legacy).as_deref(), Some("0123456789abcdef"));
+    assert_eq!(incremental::unit_id(&args(&["--out-dir", "/b/release/deps"])), None);
+    // A call that compiles nothing incrementally is read as nothing.
+    assert!(incremental::Before::read(&args(&["--crate-name", "serde"])).is_none());
+    assert_eq!(incremental::folder_crate("rustc_middle-1x2y3z"), Some("rustc_middle"));
+    for no in ["rustc_middle", "-abc", "a-", "a-b-c", "s-1-working", "a-b.c", "a b-c"] {
+        assert!(incremental::folder_crate(no).is_none(), "{no}");
+    }
+}
+
+#[test]
+fn a_note_stage_a_wrapper_left_goes_with_the_prune() {
+    crate::utils::tests::isolated(|| {
+        let f = Fixture::new();
+        let (_t, _u, inc) = incremental_tree(&f);
+        // A wrapper killed between its stage's write and its rename, or out of room mid-write,
+        // left a stage; the prune runs under the tree's cargo locks, so no wrapper writes one.
+        let stage = write(
+            &inc.join(format!("{}2222222222222222.partial-4242", incremental::NOTE_PREFIX)),
+            b"rustc_middle-1",
+        );
+        // The controls: names that are no stage stay.
+        let others = [
+            "notes.partial-4242",
+            ".trust-unit-2222.partial-1",
+            ".trust-unit-2222222222222222.partial-",
+        ]
+        .map(|name| write(&inc.join(name), b"keep"));
+        let summary = f.prune();
+        assert!(summary.skipped.is_empty() && summary.failures.is_empty(), "{}", left(&summary));
+        assert!(!stage.exists(), "{:#?}", summary.listing);
+        for other in &others {
+            assert!(other.is_file(), "{}", other.display());
+        }
+        // A stage is no folder: the count is the folders'.
+        assert_eq!(summary.incremental, 3, "{:#?}", summary.listing);
+        // The live unit's note itself stays.
+        assert!(inc.join(format!("{}2222222222222222", incremental::NOTE_PREFIX)).is_file());
+    });
+}
+
+#[test]
+fn the_stamp_binds_whether_the_incremental_folders_were_judged() {
+    crate::utils::tests::isolated(|| {
+        let f = Fixture::new();
+        let (t, _u, inc) = incremental_tree(&f);
+        let tree = t.profile.parent().unwrap().parent().unwrap().to_owned();
+        let profiles = profile_dirs(&tree).unwrap();
+        let manual = selected_digest(&tree, &profiles, true, true, false).unwrap();
+        let automatic = selected_digest(&tree, &profiles, true, true, true).unwrap();
+        assert_ne!(manual, automatic);
+        // A manual `repo-prune --dead-variants --rlib-objects` judged the units and objects and
+        // stamped the tree; the next run's prune compiled nothing there, and still judges the
+        // incremental folders the manual one left.
+        let removal = remove_units(
+            &plan_tree_selected(&tree, &profiles, &[], true, true, false).unwrap().unit_paths(),
+        );
+        assert!(removal.failures.is_empty(), "{:?}", removal.failures);
+        write_stamp(&tree, &selected_digest(&tree, &profiles, true, true, false).unwrap()).unwrap();
+        let summary = f.prune();
+        assert!(summary.skipped.is_empty() && summary.failures.is_empty(), "{}", left(&summary));
+        assert_eq!((summary.unchanged, summary.incremental), (0, 3), "{:#?}", summary.listing);
+        assert!(!inc.join("rustc_middle-0old").exists());
+        // The control: the automatic prune's own stamp holds, and the run after it is unchanged.
+        assert_eq!(f.prune().unchanged, 1);
     });
 }

@@ -64,6 +64,32 @@ fn observed_scalar_and_pair_environments_keep_their_exact_images() {
         1
     );
 }
+
+#[test]
+fn ignored_environment_requires_the_exact_empty_source_frame() {
+    let frame = ObservedFrame { size: 0, align: 1, offsets: vec![], captures: vec![] };
+    let module = fixture(vec![], &frame);
+    let before = module.clone();
+    assert_eq!(closure_transport(&module, ClosureTyId::new(0), &frame, &Transport::Ignore).unwrap(), 0);
+    assert_eq!(module, before);
+    assert!(closure_transport(&module, ClosureTyId::new(0), &frame,
+        &Transport::Direct(lane(pointer()))).is_err());
+    for change in 0..5 {
+        let mut changed = module.clone();
+        match change {
+            0 => changed.closure_layouts.clear(),
+            1 => changed.closure_layouts[0].size = 8,
+            2 => changed.closure_layouts[0].align = 8,
+            3 => changed.closure_types[0].captures.push(Ty::Ptr),
+            _ => changed.closure_layouts.push(changed.closure_layouts[0].clone()),
+        }
+        assert!(closure_transport(&changed, ClosureTyId::new(0), &frame, &Transport::Ignore).is_err(),
+            "empty frame mutation {change}");
+    }
+    let (captured, _) = pair();
+    assert!(closure_transport(&fixture(vec![Ty::Ptr, Ty::U8], &captured),
+        ClosureTyId::new(0), &captured, &Transport::Ignore).is_err());
+}
 #[test]
 fn reordered_captures_follow_the_observed_physical_pair() {
     let (mut frame, mode) = pair();

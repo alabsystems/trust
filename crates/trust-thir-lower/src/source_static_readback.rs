@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 use rustc_abi::{Endian, Size};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_hir::def::DefKind;
 use rustc_middle::mir::interpret::{AllocId, Allocation, CtfeProvenance, GlobalAlloc, alloc_range};
 use rustc_middle::thir::{ExprKind, Thir};
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
@@ -143,13 +144,32 @@ pub(crate) fn record(tcx: TyCtxt<'_>, owner: LocalDefId, thir: &Thir<'_>) {
     tcx.sess.with_trust_compiler_state::<CaptureRegistry, _>(|state| state.insert(body));
 }
 
+// This diagnostic also visits compiler-created nested statics. They have no
+// Rust type: retain their nominal identity and cold initializer without minting
+// a type or a Freeze fact. This is not an executable ConstantMemoryImage node.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadbackNode {
+    Typed(ConstantImageNode),
+    NestedStatic {
+        definition: ConstantImageDefinition,
+        declared_mutable: bool,
+        initializer: ConstantImageMemory,
+    },
+}
+
+impl From<ConstantImageNode> for ReadbackNode {
+    fn from(node: ConstantImageNode) -> Self {
+        Self::Typed(node)
+    }
+}
+
 /// Reserve actual allocation identities before reading children. This is also
 /// the cycle/equal-bytes control surface used by rustc-free graph unit tests.
 #[derive(Default)]
 struct Graph {
     ids: FxHashMap<AllocId, u32>,
     allocations: Vec<AllocId>,
-    nodes: BTreeMap<u32, ConstantImageNode>,
+    nodes: BTreeMap<u32, ReadbackNode>,
     bytes: usize,
     relocations: usize,
 }
@@ -257,16 +277,32 @@ impl Graph {
         })
     }
 
-    fn node(&mut self, tcx: TyCtxt<'_>, allocation: AllocId) -> Result<ConstantImageNode, String> {
+    fn node(&mut self, tcx: TyCtxt<'_>, allocation: AllocId) -> Result<ReadbackNode, String> {
         match tcx.try_get_global_alloc(allocation) {
-            Some(GlobalAlloc::Memory(value)) => {
-                self.memory(tcx, value.inner()).map(ConstantImageNode::Memory)
-            }
+            Some(GlobalAlloc::Memory(value)) => self
+                .memory(tcx, value.inner())
+                .map(|memory| ConstantImageNode::Memory(memory).into()),
             Some(GlobalAlloc::Static(did)) => {
                 if tcx.is_foreign_item(did) || tcx.is_thread_local_static(did) {
                     return Err(
                         "source static readback foreign or thread-local static unsupported".into(),
                     );
+                }
+                if matches!(tcx.def_kind(did), DefKind::Static { nested: true, .. }) {
+                    let declared_mutable = tcx
+                        .static_mutability(did)
+                        .ok_or("source static readback nested static has no mutability")?
+                        .is_mut();
+                    let initializer = tcx.eval_static_initializer(did).map_err(|error| {
+                        format!(
+                            "source static readback nested initializer evaluation failed: {error:?}"
+                        )
+                    })?;
+                    return Ok(ReadbackNode::NestedStatic {
+                        definition: definition(tcx, did),
+                        declared_mutable,
+                        initializer: self.memory(tcx, initializer.inner())?,
+                    });
                 }
                 let static_ty = static_type(tcx, did)?;
                 let declared_mutable = tcx
@@ -288,7 +324,8 @@ impl Graph {
                     thread_local: false,
                     foreign: false,
                     initializer: self.memory(tcx, initializer.inner())?,
-                })
+                }
+                .into())
             }
             Some(GlobalAlloc::Function { instance }) => {
                 // Generic identity helper only: no MIR body/operand producer.
@@ -300,7 +337,8 @@ impl Graph {
                     instance_fingerprint: instance_fingerprint(tcx, instance),
                     instance_debug: format!("{instance:?}"),
                     callee_identity,
-                })
+                }
+                .into())
             }
             Some(GlobalAlloc::VTable(..)) => {
                 Err("source static readback vtable unsupported".into())
@@ -335,8 +373,9 @@ impl Graph {
                 return Err("source static readback allocation identity ledger mismatch".into());
             }
             let node = self.nodes.get(&id).ok_or("source static readback orphan allocation ID")?;
-            if let ConstantImageNode::Memory(memory)
-            | ConstantImageNode::Static { initializer: memory, .. } = node
+            if let ReadbackNode::Typed(ConstantImageNode::Memory(memory))
+            | ReadbackNode::Typed(ConstantImageNode::Static { initializer: memory, .. })
+            | ReadbackNode::NestedStatic { initializer: memory, .. } = node
             {
                 if memory.layout.size_bytes != memory.bytes.len() as u64
                     || !memory.layout.align_bytes.is_power_of_two()
@@ -368,6 +407,9 @@ fn definition(tcx: TyCtxt<'_>, did: DefId) -> ConstantImageDefinition {
 }
 
 fn static_type<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> Result<ty::Ty<'tcx>, String> {
+    if matches!(tcx.def_kind(did), DefKind::Static { nested: true, .. }) {
+        return Err("source static readback nested static has no Rust type".into());
+    }
     let ty = tcx
         .try_normalize_erasing_regions(
             ty::TypingEnv::fully_monomorphized(),
@@ -529,6 +571,17 @@ fn node_json(id: u32, node: &ConstantImageNode) -> String {
     }
 }
 
+fn readback_node_json(id: u32, node: &ReadbackNode) -> String {
+    match node {
+        ReadbackNode::Typed(node) => node_json(id, node),
+        ReadbackNode::NestedStatic { definition, declared_mutable, initializer } => format!(
+            "{{\"allocation_id\":{id},\"kind\":\"nested_static\",\"definition\":{},\"declared_mutable\":{declared_mutable},\"rust_type\":null,\"freeze\":null,\"initializer\":{}}}",
+            definition_json(definition),
+            memory_json(initializer)
+        ),
+    }
+}
+
 fn graph_json(roots: &[String], graph: &Graph, errors: &BTreeSet<String>) -> String {
     let mut errors = errors.clone();
     if errors.is_empty() {
@@ -538,7 +591,12 @@ fn graph_json(roots: &[String], graph: &Graph, errors: &BTreeSet<String>) -> Str
     }
     let complete = errors.is_empty();
     let nodes = if complete {
-        graph.nodes.iter().map(|(id, node)| node_json(*id, node)).collect::<Vec<_>>().join(",")
+        graph
+            .nodes
+            .iter()
+            .map(|(id, node)| readback_node_json(*id, node))
+            .collect::<Vec<_>>()
+            .join(",")
     } else {
         String::new()
     };

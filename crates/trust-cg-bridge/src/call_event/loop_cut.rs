@@ -726,6 +726,15 @@ fn spec_segments(
 
     // The loop segment: from `block`, its shared variables fresh.
     let (mut cx, mut env) = spec_entry(s.input, s.module, s.func, s.sig, s.place, s.decisions)?;
+    // Cut variables currently model 64-bit scalar lanes only. Do not turn
+    // Unit live-ins into arbitrary bits or reuse entry definedness at the cut.
+    for value in &shared {
+        let ty = s.func.typed_value(s.module, *value).ok_or("cut value has no declared type")?;
+        if ty.ty == trust_ir::Ty::Unit {
+            return Err("Unit live-in at a scalar loop cut is outside the fragment".into());
+        }
+    }
+    env.units.clear();
     env.scalars =
         shared.iter().map(|v| (*v, IrValue { f: cut_var(block, *v), width: 64 })).collect();
     env.aggs.clear();

@@ -55,6 +55,7 @@ impl LockManager {
             bail!("selected graph lease preparation already has unit leases");
         }
         build_runner.lease_forces = None;
+        build_runner.requested_forces = None;
         let mut pending = build_runner.bcx.roots.clone();
         let mut selected = HashSet::default();
         while let Some(unit) = pending.pop() {
@@ -90,6 +91,7 @@ impl LockManager {
             Self::refresh(build_runner)?;
             let writers = Self::compile_writers(build_runner, &units, &forces)?;
             if writers.is_empty() && !mtime_writes {
+                build_runner.requested_forces = Some(forces.clone());
                 build_runner.lease_forces = Some(forces);
                 *self.held.write().unwrap() = read_set;
                 return Ok(());
@@ -120,6 +122,7 @@ impl LockManager {
                     .map(|unit| (unit.clone(), forces[unit] || current.contains(unit)))
                     .collect(),
             );
+            build_runner.requested_forces = Some(forces);
             *self.held.write().unwrap() = owned;
             return Ok(());
         }
@@ -146,9 +149,10 @@ impl LockManager {
             if unit.skip_non_compile_time_dep || unit.mode.is_doc_test() {
                 continue;
             }
+            let bcx = build_runner.bcx;
             for dep in build_runner.unit_deps(unit).iter().filter(|dep| {
                 unit.mode.is_run_custom_build()
-                    || super::fingerprint::compilation_dependency_rebuilds(dep)
+                    || super::fingerprint::dependency_rebuilds(bcx, unit, dep)
             }) {
                 parents
                     .entry(dep.unit.clone())

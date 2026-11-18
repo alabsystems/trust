@@ -14,6 +14,11 @@ use trust_build_tree::admission::{
     Attempt, Coordinator, FixedClaim, Requirements, RunningFixedCommand, RunningFixedGroup,
 };
 
+// Shared admission may legitimately wait behind an earlier compiler epoch.
+// This is finite queue patience, not a larger CPU grant or execution timeout;
+// use the documented shared-machine 30-minute admission window.
+const ADMISSION_QUEUE_PATIENCE: Duration = Duration::from_secs(30 * 60);
+
 fn actual_claim(budget: u32) -> FixedClaim {
     actual_claim_mode(budget, false)
 }
@@ -42,7 +47,7 @@ fn actual_claim_mode(budget: u32, exclusive: bool) -> FixedClaim {
     let required =
         Requirements::new(None, slots, needed, exclusive, 8 * 1024 * 1024 * 1024).unwrap();
     let mut coordinator = Coordinator::for_current_user(required).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + ADMISSION_QUEUE_PATIENCE;
     loop {
         match coordinator
             .attempt_fixed(
@@ -263,6 +268,56 @@ fn actual_nested_fixed_frontdoor_reuses_the_parent_without_second_admission() ->
     nested_targo(true)
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn actual_selected_tool_root_uses_authenticated_fixed_continuation() -> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    let frontend = env!("CARGO_BIN_EXE_targo");
+    let mut command = Command::new(frontend);
+    command
+        .current_dir(root.path())
+        .args([
+            "--unverified",
+            "resource",
+            "fixed",
+            "--cpus",
+            "1",
+            "--wait-seconds",
+        ])
+        .arg(ADMISSION_QUEUE_PATIENCE.as_secs().to_string())
+        .args(["--", "fixed-tool", "--"])
+        .arg(frontend)
+        .args(["--unverified", "resource", "budget", "measure"])
+        .stdin(Stdio::null());
+    // The selected fixture is the known system-only frontend. Exercise that
+    // declared environment without Cargo's test-image loader search input;
+    // production retains/refuses every caller-supplied override instead.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the real system-only fixture deliberately excludes its test runner's loader search input without changing parent environment or original scheduling custody"
+    )]
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"DYLD_")
+            || name.as_encoded_bytes().starts_with(b"LD_")
+        {
+            command.env_remove(name);
+        }
+    }
+    let output = command.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(io::Error::other)?;
+    assert_eq!(report["cpu_scope"]["kind"], "original_fixed");
+    assert_eq!(report["cpu_scope"]["ceiling"], 1);
+    // No unmanaged budget fallback can impersonate the original fixed reader.
+    assert_eq!(report["authority"], "policy_data_only_no_admission");
+    Ok(())
+}
+
 fn nested_targo(frontdoor: bool) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let root = tempfile::tempdir()?;
@@ -312,6 +367,38 @@ fn main() {
     let measured=String::from_utf8(measured.stdout).unwrap();
     assert!(measured.contains("\"kind\":\"original_fixed\""),"{measured}");
     assert!(measured.contains("\"authority\":\"policy_data_only_no_admission\""),"{measured}");
+    if frontdoor {
+        // The selected native image must execute under this SAME courier and
+        // GNU continuation. A std Command in this build script closes direct
+        // packet FDs, so only the authenticated original importer can work.
+        let frontend=std::env::var_os("CARGO").unwrap();
+        let mut selected=std::process::Command::new(&frontend);
+        selected.args(["--unverified","resource","fixed-tool","--"])
+            .arg(&frontend)
+            .args(["--unverified","resource","budget","measure"]);
+        // Only this known system-only fixture's generated loader search is
+        // excluded. Original GNU/fixed/SDK transport is never cleared.
+        for (name,_) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"DYLD_") || name.as_encoded_bytes().starts_with(b"LD_") {
+                selected.env_remove(name);
+            }
+        }
+        let selected=selected.output().unwrap();
+        assert!(selected.status.success(),"{}",String::from_utf8_lossy(&selected.stderr));
+        let selected=String::from_utf8(selected.stdout).unwrap();
+        assert!(selected.contains("\"kind\":\"original_fixed\""),"{selected}");
+        let refused=std::process::Command::new(&frontend)
+            .args(["--unverified","resource","fixed-tool","--"])
+            .arg(&frontend)
+            .args(["--unverified","resource","budget","measure"])
+            .env("DYLD_LIBRARY_PATH","/missing-selected-tool-loader")
+            .output().unwrap();
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("nested command refuses loader overrides"),
+            "{}",String::from_utf8_lossy(&refused.stderr));
+        assert!(refused.stdout.is_empty(),"a selected tool ran under a refused loader override");
+        assert_eq!(std::fs::read(".git/build-slot.lock").unwrap(),original_record);
+    }
     for mode in [1,2] {
         let refused=observe(mode);
         assert!(!refused.status.success(),"uncaptured courier became successful policy data");
@@ -355,7 +442,9 @@ fn main() {
             "--cpus",
             if frontdoor { "2" } else { "1" },
             "--wait-seconds",
-            "60",
+        ])
+        .arg(ADMISSION_QUEUE_PATIENCE.as_secs().to_string())
+        .args([
             "--",
             "check",
             "--offline",

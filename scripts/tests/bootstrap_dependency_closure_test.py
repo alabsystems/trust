@@ -16,7 +16,7 @@ import types
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 REPO = Path(__file__).resolve().parents[2]
 HELPER = REPO / "scripts/bootstrap_dependency_closure.py"
@@ -211,7 +211,8 @@ fn unrelated() { fn ensure_verifier_tool_bins() { ToolBuild { path: "decoy", }; 
         with patch.object(closure, "_fetch") as fetch:
             self.run_closure()
         for call in fetch.call_args_list:
-            command, cwd, environment, _end = call.args
+            command, cwd, environment, _end, progress = call.args
+            self.assertIsNone(progress)  # no preparation hands this gate an item bound
             self.assertEqual(command[:4], [str(self.driver), "fetch", "--locked", "--offline"])
             self.assertEqual(cwd, self.root)
             self.assertEqual(environment["CARGO_NET_OFFLINE"], "true")
@@ -266,6 +267,54 @@ fn unrelated() { fn ensure_verifier_tool_bins() { ToolBuild { path: "decoy", }; 
         self.assertTrue(all(call.args[3] == end for call in fetch.call_args_list))
         self.assertTrue(all("--offline" not in c.args[0] for c in fetch.call_args_list[:8]))
         self.assertTrue(all("--offline" in c.args[0] for c in fetch.call_args_list[8:]))
+
+    def test_acquisition_returns_no_readiness_and_final_home_replays_every_recipe(self):
+        end = time.monotonic() + 30
+        with patch.object(closure, "_fetch") as fetch:
+            acquired = closure.acquire_dependency_inputs(self.root, str(self.driver), self.env, deadline=end)
+        self.assertIsInstance(acquired, closure.DependencyAcquisition)
+        report = acquired.report()
+        self.assertEqual(report["schema"], "trust.bootstrap-dependency-acquisition.v1")
+        self.assertEqual(len(fetch.call_args_list), 8)
+        self.assertTrue(all("--offline" not in c.args[0] and c.args[3] == end for c in fetch.call_args_list))
+        final_env = {**self.env, "CARGO_HOME": str(self.root / "safe-handoff"), "CARGO_NET_OFFLINE": "true"}
+        with patch.object(closure, "_fetch") as fetch:
+            final = closure.dependency_closure(self.root, str(self.driver), final_env, deadline=end)
+        self.assertEqual(len(fetch.call_args_list), 8)
+        self.assertTrue(all("--offline" in c.args[0] and c.args[3] == end for c in fetch.call_args_list))
+        self.assertEqual(final["manifests"], report["manifests"])
+        self.assertEqual(final["manifest_policy_sha256"], report["manifest_policy_sha256"])
+        for changed in ({**final_env, "RUSTC_WRAPPER": "/different"}, final_env):
+            if changed is final_env:
+                self.write("safe-handoff/config.toml", "[net]\nretry = 1\n")
+            with patch.object(closure, "_fetch"):
+                different = closure.dependency_closure(self.root, str(self.driver), changed, deadline=end)
+            self.assertNotEqual(different["manifest_policy_sha256"], report["manifest_policy_sha256"])
+
+    def test_acquisition_retains_source_config_driver_bookends_and_requires_explicit_home(self):
+        for selected in ("Cargo.lock", "cache/config.toml", "bin/targo"):
+            path = self.root / selected
+            original = path.read_bytes() if path.exists() else None
+            def change(*_args):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("changed during acquisition")
+            with self.subTest(selected=selected), patch.object(closure, "_fetch", side_effect=change):
+                with self.assertRaisesRegex(closure.DependencyClosureError, "inputs changed"):
+                    closure.acquire_dependency_inputs(self.root, str(self.driver), self.env)
+            if original is None:
+                path.unlink()
+            else:
+                path.write_bytes(original)
+        for home in (None, "", "relative"):
+            env = dict(self.env)
+            if home is None:
+                env.pop("CARGO_HOME")
+            else:
+                env["CARGO_HOME"] = home
+            with self.subTest(home=home), patch.object(closure, "_fetch") as fetch:
+                with self.assertRaisesRegex(closure.DependencyClosureError, "explicit absolute Cargo home"):
+                    closure.acquire_dependency_inputs(self.root, str(self.driver), env)
+                fetch.assert_not_called()
 
     def test_prepare_respects_explicit_offline_policy_without_silent_network_override(self):
         self.env["CARGO_NET_OFFLINE"] = "true"
@@ -726,14 +775,16 @@ fn ensure_user_facing_tools() { ToolBuild { path: "src/tools/targo", }; }
 
     def test_darwin_fetch_dispatches_only_to_the_retirement_custodian(self):
         # A Darwin fetch has one route: the per-fetch custodian, with the caller's
-        # command, root, environment and deadline. It never starts a raw child.
-        command, end = ["targo", "fetch"], time.monotonic() + 30
+        # command, root, environment, deadline and item bound. It never starts a raw child.
+        command, end, bound = ["targo", "fetch"], time.monotonic() + 30, object()
         with patch.object(closure.sys, "platform", "darwin"), \
                 patch.object(closure.subprocess, "Popen") as spawn, \
                 patch.object(closure.os, "posix_spawn", create=True) as native_spawn, \
                 patch.object(closure, "_fetch_darwin") as custodian:
             closure._fetch(command, self.root, self.env, end)
-        custodian.assert_called_once_with(command, self.root, self.env, end)
+            closure._fetch(command, self.root, self.env, end, bound)
+        self.assertEqual(custodian.call_args_list, [call(command, self.root, self.env, end, None),
+                                                    call(command, self.root, self.env, end, bound)])
         spawn.assert_not_called()
         native_spawn.assert_not_called()
 
@@ -1942,8 +1993,20 @@ class DarwinCustodianTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertIsNone(helper.poll(), "the helper ended, so it may have retired the group")
         self.assertEqual(self.live(pgid), [], "the custodian's deadline left its cohort running")
-        self.assert_lock_free(closure._DARWIN_FENCE)
-        self.assert_lock_free(closure._CARGO_MUTATE_LOCK)
+        # libproc can observe the final zombie before XNU finishes releasing
+        # its file locks. Both locks must still become free inside the same
+        # original deadline, without resuming the helper to perform cleanup.
+        while True:
+            try:
+                self.assert_lock_free(closure._DARWIN_FENCE)
+                self.assert_lock_free(closure._CARGO_MUTATE_LOCK)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= stop:
+                    raise
+                time.sleep(0.02)
+        self.assertLess(time.monotonic(), stop, "custody locks outlived the original deadline")
+        self.assertIsNone(helper.poll(), "the stopped helper must not release the locks")
         helper.send_signal(signal.SIGCONT)
         helper.wait(timeout=15)
 

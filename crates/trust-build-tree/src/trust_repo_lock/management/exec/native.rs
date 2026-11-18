@@ -22,6 +22,10 @@ unsafe extern "C" {
         actions: *mut libc::posix_spawn_file_actions_t,
         fd: libc::c_int,
     ) -> libc::c_int;
+    fn posix_spawn_file_actions_addfchdir_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        directory: libc::c_int,
+    ) -> libc::c_int;
 }
 
 fn check(code: libc::c_int) -> io::Result<()> {
@@ -106,6 +110,20 @@ pub(crate) struct Child {
     version_group: bool,
 }
 
+#[derive(Clone, Copy)]
+enum Launch {
+    Ordinary,
+    Version,
+    Group,
+    OutputDirectory(libc::c_int),
+}
+
+#[derive(Clone, Copy)]
+enum TerminalObservation {
+    OwningWait,
+    PreserveGroupAnchor,
+}
+
 impl Child {
     /// Only the native ordinary/nested builders call this: inherited console
     /// stdio, exact argv/environment and no arbitrary std::Command pre_exec.
@@ -114,7 +132,43 @@ impl Child {
         scheduler: &Jobserver,
         deadline: Instant,
     ) -> io::Result<Self> {
-        Self::spawn_with_originals(command, scheduler, &[], false, deadline, &mut false)
+        Self::spawn_with_originals(command, scheduler, &[], Launch::Ordinary, deadline, &mut false)
+    }
+
+    /// The fixed continuation retains this actual member directory through
+    /// the child wait. No pathname or ambient cwd substitutes for fchdir.
+    pub(crate) fn spawn_output_member_suspended(
+        command: &Command,
+        scheduler: &Jobserver,
+        directory: std::os::fd::BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        Self::spawn_with_originals(
+            command,
+            scheduler,
+            &[],
+            Launch::OutputDirectory(directory.as_raw_fd()),
+            deadline,
+            &mut false,
+        )
+    }
+
+    /// The fixed-group owner retains the actual stopped child before any
+    /// fallible observation, then owns group cancellation and the sole wait.
+    pub(crate) fn spawn_group_suspended(
+        command: &Command,
+        scheduler: &Jobserver,
+        originals: &[i32],
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        Self::spawn_with_originals(
+            command,
+            scheduler,
+            originals,
+            Launch::Group,
+            deadline,
+            &mut false,
+        )
     }
 
     /// Closed cache-version prelude only. The extra descriptor is its actual
@@ -131,21 +185,28 @@ impl Child {
             .chain(originals.iter().map(|fd| fd.as_raw_fd()))
             .collect::<Vec<_>>();
         let mut launched = false;
-        Self::spawn_with_originals(command, scheduler, &originals, true, deadline, &mut launched)
-            .map_err(|error| {
-                if launched {
-                    VersionSpawnError::Unresolved(error)
-                } else {
-                    VersionSpawnError::NotSpawned(error)
-                }
-            })
+        Self::spawn_with_originals(
+            command,
+            scheduler,
+            &originals,
+            Launch::Version,
+            deadline,
+            &mut launched,
+        )
+        .map_err(|error| {
+            if launched {
+                VersionSpawnError::Unresolved(error)
+            } else {
+                VersionSpawnError::NotSpawned(error)
+            }
+        })
     }
 
     fn spawn_with_originals(
         command: &Command,
         scheduler: &Jobserver,
         extra: &[i32],
-        version_stdio: bool,
+        launch: Launch,
         deadline: Instant,
         launched: &mut bool,
     ) -> io::Result<Self> {
@@ -205,13 +266,24 @@ impl Child {
         for fd in 0..3 {
             objects.inherit(fd)?;
         }
+        if let Launch::OutputDirectory(directory) = launch {
+            if directory < 3 {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            objects.inherit(directory)?;
+            // SAFETY: initialized private actions and the same actual held
+            // directory. Only the new child changes cwd, before selected exec.
+            unsafe {
+                check(posix_spawn_file_actions_addfchdir_np(&mut objects.actions, directory))?;
+            }
+        }
         for fd in extra {
             if *fd < 3 {
                 return Err(io::ErrorKind::InvalidInput.into());
             }
             objects.inherit(*fd)?;
         }
-        if version_stdio {
+        if matches!(launch, Launch::Version) {
             // SAFETY: exclusive initialized actions; neither parent FD nor OFD
             // is changed. No generic stdio/pre_exec callback is admitted.
             unsafe {
@@ -244,7 +316,8 @@ impl Child {
                     | libc::POSIX_SPAWN_SETSIGDEF
                     // Darwin's public spawn.h POSIX_SPAWN_SETSID. Only the
                     // private maintenance owner supports this new subgroup.
-                    | if version_stdio { 0x0400 } else { 0 }) as libc::c_short,
+                    | if matches!(launch, Launch::Version | Launch::Group) { 0x0400 } else { 0 })
+                    as libc::c_short,
             ))?;
         }
         time(deadline)?;
@@ -270,12 +343,12 @@ impl Child {
             owner: std::process::id(),
             status: None,
             resumed: false,
-            version_group: version_stdio,
+            version_group: matches!(launch, Launch::Version),
         };
         // The cache probe immediately installs this original Child in its
         // retaining owner. A post-spawn deadline error must not lose that
         // ownership or enter the ordinary Child Drop wait on this path.
-        if !version_stdio {
+        if matches!(launch, Launch::Ordinary) {
             time(deadline)?;
         }
         Ok(child)
@@ -290,8 +363,27 @@ impl Child {
     }
 
     pub(crate) fn stopped_identity(&mut self, deadline: Instant) -> io::Result<Identity> {
+        self.stopped_identity_with(deadline, TerminalObservation::OwningWait)
+    }
+
+    pub(crate) fn stopped_group_identity(&mut self, deadline: Instant) -> io::Result<Identity> {
+        self.stopped_identity_with(deadline, TerminalObservation::PreserveGroupAnchor)
+    }
+
+    fn stopped_identity_with(
+        &mut self,
+        deadline: Instant,
+        observation: TerminalObservation,
+    ) -> io::Result<Identity> {
         self.custody()?;
-        if self.resumed || self.try_wait()?.is_some() {
+        if self.resumed {
+            return Err(io::Error::other("original child is not awaiting GO"));
+        }
+        let terminal = match observation {
+            TerminalObservation::OwningWait => self.try_wait()?.is_some(),
+            TerminalObservation::PreserveGroupAnchor => self.group_terminal_pending(deadline)?,
+        };
+        if terminal {
             return Err(io::Error::other("original child is not awaiting GO"));
         }
         time(deadline)?;
@@ -319,7 +411,20 @@ impl Child {
     }
 
     pub(crate) fn resume(&mut self, identity: Identity, deadline: Instant) -> io::Result<()> {
-        if self.stopped_identity(deadline)? != identity {
+        self.resume_with(identity, deadline, TerminalObservation::OwningWait)
+    }
+
+    pub(crate) fn resume_group(&mut self, identity: Identity, deadline: Instant) -> io::Result<()> {
+        self.resume_with(identity, deadline, TerminalObservation::PreserveGroupAnchor)
+    }
+
+    fn resume_with(
+        &mut self,
+        identity: Identity,
+        deadline: Instant,
+        observation: TerminalObservation,
+    ) -> io::Result<()> {
+        if self.stopped_identity_with(deadline, observation)? != identity {
             return Err(io::Error::other("original stopped child changed before GO"));
         }
         time(deadline)?;
@@ -329,6 +434,50 @@ impl Child {
         }
         self.resumed = true;
         Ok(())
+    }
+
+    fn group_terminal_pending(&self, deadline: Instant) -> io::Result<bool> {
+        self.custody()?;
+        if self.status.is_some() {
+            return Err(io::Error::other("original group anchor was already reaped"));
+        }
+        loop {
+            time(deadline)?;
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: observe only this actual original child. WNOWAIT keeps
+            // its terminal anchor for the group owner's sole owning wait.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                // SAFETY: successful waitid initialized the observation.
+                let info = unsafe { info.assume_init() };
+                // SAFETY: successful waitid initialized this siginfo observation.
+                let observed = unsafe { info.si_pid() };
+                return if observed == 0 {
+                    Ok(false)
+                } else if observed == self.pid {
+                    // Preserve the actual stopped anchor: a nonterminal
+                    // exec-stop event is not an owning-wait permission.
+                    match info.si_code {
+                        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => Ok(true),
+                        libc::CLD_STOPPED | libc::CLD_CONTINUED | libc::CLD_TRAPPED => Ok(false),
+                        _ => Err(io::Error::other("unknown original group child wait event")),
+                    }
+                } else {
+                    Err(io::Error::other("group observation named another child"))
+                };
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
     }
 
     pub(crate) fn id(&self) -> u32 {

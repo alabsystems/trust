@@ -463,6 +463,18 @@ PROGRAM_TESTS = {
     # selects_on paths that are not validation programs) to this profile.
     "scripts/compiletest_census.py": ("scripts.tests.compiletest_census_test",),
     "scripts/tests/compiletest_census_test.py": ("scripts.tests.compiletest_census_test",),
+    # Preserve every declared validation owner of the train, including its
+    # bootstrap-reader, Python-floor and SDK-dispatch consumers. A source-main
+    # edit runs these whole modules; it earns no compiler/release qualification.
+    "scripts/daily_toolchain_stage.py": (
+        "scripts.tests.check_bootstrap_script_tests_test", "scripts.tests.daily_dependency_git_selection_test",
+        "scripts.tests.daily_toolchain_stage_test",
+        "scripts.tests.python_floor_test", "scripts.tests.sdk_diagnostic_test",
+    ),
+    "scripts/tests/daily_toolchain_stage_test.py": (
+        "scripts.tests.check_bootstrap_script_tests_test", "scripts.tests.daily_dependency_git_selection_test",
+        "scripts.tests.daily_toolchain_stage_test",
+    ),
     "scripts/trust_verify_cost.py": ("scripts.tests.trust_verify_cost_test",),
     "scripts/tests/trust_verify_cost_test.py": ("scripts.tests.trust_verify_cost_test",),
     "scripts/retain_development_emission.py": ("scripts.tests.retain_development_emission_test",),
@@ -1574,7 +1586,8 @@ def may_have_scope(paths):
     return all(path in ("Cargo.lock", ORACLE_WAIVERS, TARGO_LOCK, TARGO_TRIAGEBOT)
                or path in TARGO_BUILD_INPUT_SOURCES or path in TARGO_CHECKOUT_LAYOUT_PATHS
                or path in PROGRAM_TESTS or path in ls.VALIDATION_PROGRAM_TESTS
-               or any(path.startswith(owner + "/") for owner in COMPONENTS)
+               or any(path.startswith(owner + "/") for owner in COMPONENTS - {BOOTSTRAP_COMPONENT})
+               or bootstrap_library_source(path)
                or local_git_owner(path) is not None or path in LOCAL_GIT_BRIDGES
                or targo_source_owner(path) is not None
                or path in CONTROLLER_DESCRIPTOR_SOURCES

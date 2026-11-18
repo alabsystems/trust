@@ -162,7 +162,7 @@ covered = ["scripts/tests/*_test.py"]
 "scripts/tests/remote_tips_shallow_test.py" = ["validation.remote_tips_shallow_test"]
 "scripts/check_compiler_targets_build.sh" = ["validation.land_gate_test"]
 "scripts/tests/compiler_check_selector_consult_test.sh" = ["validation.land_development_test"]
-"scripts/lib/rust_lex.py" = ["validation.land_gate_test"]
+"scripts/lib/rust_lex.py" = ["validation.land_gate_test", "validation.temporal_fabric_source_identity_test"]
 # land_development_test's BootstrapFixtureAuditTests read three of its rows.
 "scripts/gates/land-escape-audits.toml" = ["validation.land_gate_test", "validation.land_development_test"]
 "scripts/lib/host_budget.py" = [
@@ -612,6 +612,16 @@ catches = "scripts/check_seed_freshness.py passing a stage0 seed that is not the
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
+id = "validation.check_std_objects_identical_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_std_objects_identical_test"]
+selects_on = [
+    "scripts/check_std_objects_identical.py",
+    "scripts/tests/check_std_objects_identical_test.py",
+]
+catches = "Refuse differing, missing, extra, renamed or malformed archive members and input mutation instead of accepting a same-sized or unstable standard-library object comparison."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
 id = "validation.check_tcb_panic_freedom_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_tcb_panic_freedom_test"]
 selects_on = [
@@ -804,6 +814,24 @@ catches = "Optional coordination failures stay visible through the real harness 
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
+id = "validation.daily_dependency_git_selection_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.daily_dependency_git_selection_test"]
+selects_on = [
+    "scripts/bootstrap_dependency_closure.py",
+    "scripts/daily_dependency_git.py",
+    "scripts/daily_toolchain_stage.py",
+    "scripts/recreate_bootstrap.py",
+    "scripts/seed_custody_source.py",
+    "scripts/source_working_cache.py",
+    "scripts/tests/daily_dependency_git_selection_test.py",
+    "scripts/tests/daily_toolchain_stage_test.py",
+    "scripts/verify_sysroot_libraries.py",
+    "src/bootstrap/stage0_identity.py",
+]
+catches = "Acquire only actual locked Source roots, refusing escaped or duplicated selections, stale source snapshots and mismatched component ownership rather than admitting unrelated recipe inputs or changed source data."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
 id = "validation.daily_toolchain_stage_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.daily_toolchain_stage_test"]
 selects_on = [
@@ -831,6 +859,17 @@ selects_on = [
     "x.py",
 ]
 catches = "Exercise orchestration with real temporary Git histories and fake pipeline owners."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.dependency_cycle_anchor_history_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.dependency_cycle_anchor_history_test"]
+selects_on = [
+    "first-party/trust-wp",
+    "scripts/check_dependency_cycle_anchor.py",
+    "scripts/tests/dependency_cycle_anchor_history_test.py",
+]
+catches = "Main's real history refused by terminal-policy v3: when the trust-wp gitlink moves, a landing whose history holds a merge that minted a TrustWP binding no admission names, or a recorded binding move that is no longer admissible."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
@@ -1085,6 +1124,9 @@ selects_on = [
     "crates/trust-clean/fixtures/trustir-oleans/MANIFEST.toml",
     "scripts/regen-trustir-oleans.sh",
     "scripts/tests/lean_bridge_roots_test.py",
+    # CoreManifestProvenanceTests holds this file's provenance origin to the
+    # producer's template.
+    "vendor/lean-core-oleans/MANIFEST.toml",
 ]
 catches = "Bridge build selection controls; fake tools never build or certify artifacts."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
@@ -2074,6 +2116,17 @@ catches = "Selected frontend preparation never becomes compiler-source readiness
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
+id = "validation.temporal_fabric_source_identity_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.temporal_fabric_source_identity_test"]
+selects_on = [
+    "scripts/check_cargo_manifest_alignment.py",
+    "scripts/lib/rust_lex.py",
+    "scripts/tests/temporal_fabric_source_identity_test.py",
+]
+catches = "A fabric lock-only Git repin being accepted without a reachable dependency declaration, including an archive-only history rewrite with unchanged code or a resolved commit different from the requested revision."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
 id = "validation.trust_analyzer_version_worktree_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_analyzer_version_worktree_test"]
 selects_on = [
@@ -2222,15 +2275,28 @@ catches = "scripts/trust_core/reanchor_citations.py moving a ledger citation it 
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
-id = "validation.trust_core_specr_regen_test"
-command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_specr_regen_test"]
+id = "validation.trust_core_specr_clean_check_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_specr_clean_check_test"]
 selects_on = [
-    "scripts/tests/trust_core_specr_regen_test.py",
+    "scripts/tests/trust_core_specr_clean_check_test.py",
+    "scripts/trust_core/specr/PreludeVectors.lean",
+    "scripts/trust_core/specr/SliceVectors.lean",
+    "scripts/trust_core/specr/SpecrPrelude.lean",
     "scripts/trust_core/specr/conformance/mrjson.py",
     "scripts/trust_core/specr/conformance/records2clean.py",
     "scripts/trust_core/specr/conformance/select_slice.py",
     "scripts/trust_core/specr/conformance/summarize.py",
+    "scripts/trust_core/specr/generated/MANIFEST.json",
+    "scripts/trust_core/specr/generated/MiniRustSlice.lean",
+    "scripts/trust_core/specr/generated/census.json",
+    "scripts/trust_core/specr/generated/conformance.lean.gz",
+    "scripts/trust_core/specr/generated/conformance_index.json",
+    "scripts/trust_core/specr/generated/schema.json",
+    "scripts/trust_core/specr/generated/selection.json",
+    "scripts/trust_core/specr/pinned/ast.json.gz",
+    "scripts/trust_core/specr/pinned/records.jsonl.gz",
     "scripts/trust_core/specr/regen.py",
+    "scripts/trust_core/specr/slice.json",
     "scripts/trust_core/specr/specr2clean/calls.py",
     "scripts/trust_core/specr/specr2clean/common.py",
     "scripts/trust_core/specr/specr2clean/emit_fns.py",
@@ -2240,7 +2306,42 @@ selects_on = [
     "scripts/trust_core/specr/specr2clean/specr2clean.py",
     "scripts/trust_core/specr/specr2clean/tyres.py",
 ]
-catches = "The committed specr-to-Clean translator output no longer regenerating byte for byte from its pinned inputs (RM1): a changed output byte, translator emission or pinned input, a stray file under generated/, or a non-deterministic encoding not reported as drift by scripts/trust_core/specr/regen.py."
+catches = "A generated MiniRust declaration, prelude or slice vector, or conformance theorem that Clean's kernel refuses, that goes missing from clean's report, that rests on sorry or an assumption, or a sibling copy that differs at the revision Trust pins, on the real tree: the regen test judges the driver only against canned clean reports, so without this row a translator or prelude change could land with a generated slice or K8 conformance theorem Clean does not accept."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_core_specr_regen_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_core_specr_regen_test"]
+selects_on = [
+    "scripts/tests/trust_core_specr_regen_test.py",
+    "scripts/trust_core/specr/PreludeVectors.lean",
+    "scripts/trust_core/specr/SliceVectors.lean",
+    "scripts/trust_core/specr/SpecrPrelude.lean",
+    "scripts/trust_core/specr/conformance/mrjson.py",
+    "scripts/trust_core/specr/conformance/records2clean.py",
+    "scripts/trust_core/specr/conformance/select_slice.py",
+    "scripts/trust_core/specr/conformance/summarize.py",
+    "scripts/trust_core/specr/generated/MANIFEST.json",
+    "scripts/trust_core/specr/generated/MiniRustSlice.lean",
+    "scripts/trust_core/specr/generated/census.json",
+    "scripts/trust_core/specr/generated/conformance.lean.gz",
+    "scripts/trust_core/specr/generated/conformance_index.json",
+    "scripts/trust_core/specr/generated/schema.json",
+    "scripts/trust_core/specr/generated/selection.json",
+    "scripts/trust_core/specr/pinned/ast.json.gz",
+    "scripts/trust_core/specr/pinned/records.jsonl.gz",
+    "scripts/trust_core/specr/regen.py",
+    "scripts/trust_core/specr/slice.json",
+    "scripts/trust_core/specr/specr2clean/calls.py",
+    "scripts/trust_core/specr/specr2clean/common.py",
+    "scripts/trust_core/specr/specr2clean/emit_fns.py",
+    "scripts/trust_core/specr/specr2clean/emit_types.py",
+    "scripts/trust_core/specr/specr2clean/items.py",
+    "scripts/trust_core/specr/specr2clean/lower.py",
+    "scripts/trust_core/specr/specr2clean/specr2clean.py",
+    "scripts/trust_core/specr/specr2clean/tyres.py",
+]
+catches = "The committed specr-to-Clean translator output no longer regenerating byte for byte from its pinned inputs (RM1): a changed output byte, translator emission or pinned input, a stray file under generated/, a non-deterministic encoding, a sibling copy (Clean's trust_sem and semr fixtures, trust-ir's lean/semr/MiniRust.lean) that differs from or is missing at the revision Trust's gitlink pins, a sibling comparison reported identical when it did not run, a conformance theorem counted as accepted though clean's report never names it, or a translator guard that lets an unconfigured generic instance through, none of them reported by scripts/trust_core/specr/regen.py."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
@@ -2560,7 +2661,7 @@ why = "harness: reads TRUST_PROBE_SCHEDULER_TEST_BIN and CARGO_MAKEFLAGS at impo
 id = "validation.historical_seed_surface_test"
 path = "scripts/tests/historical_seed_surface_test.py"
 kind = "red"
-why = "a Linux-host test, red on this aarch64-apple-darwin host: 2 FAIL, 3 ERROR: ValueError: historical Linux daemon probe needs kernel peer credentials"
+why = "a Linux-host test, red on this aarch64-apple-darwin host: 2 FAIL, 2 ERROR: ValueError: historical Linux daemon probe needs kernel peer credentials"
 
 [[not_run]]
 id = "validation.linux_root_custody_test"
@@ -2602,7 +2703,7 @@ why = "a Linux-host test, red on this aarch64-apple-darwin host: 33 ERROR: FileN
 id = "validation.seed_staircase_test"
 path = "scripts/tests/seed_staircase_test.py"
 kind = "red"
-why = "a Linux-host test, red on this aarch64-apple-darwin host: 3 ERROR: FileNotFoundError: '/bin/true' (copying /usr/bin/true instead fails with EPERM on its flags)"
+why = "a Linux-host test, red on this aarch64-apple-darwin host under atpkg's python3.14, whose path holds white space (2026-11-17): 8 FAIL, 13 ERROR, among them FileNotFoundError: '/bin/true' (copying /usr/bin/true instead fails with EPERM on its flags) and the make adapter's #! line naming that python, which `run --fifo-jobserver` refuses on purpose and MakeAdapterTests reaches directly"
 
 [[not_run]]
 id = "validation.trust_core_semantics_retirement_test"

@@ -622,6 +622,96 @@ class StaleRemoteTrackingRefTests(unittest.TestCase):
             self.assertIn("OK=1", self._run(superproject).stdout)
             _ = pinned, remote
 
+    def test_a_second_worktree_is_audited_from_the_store_it_shares(self) -> None:
+        """A second worktree's submodule has no store under its own git directory.
+
+        ``scripts/submodule_sync.sh --restore`` makes its checkout a linked
+        worktree of the first checkout's store. Reading only
+        ``<this worktree's git dir>/modules/<path>`` printed "gitdir absent ---
+        not materialized, skipped" for every module there: the release row
+        passed having audited nothing, and ``--anchor`` anchored nothing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            superproject, _sibling, remote, pinned = self._fixture(tmp)
+            store = (superproject / ".git/modules/first-party/example").resolve()
+            second = Path(tmp) / "second"
+            _git("-C", str(superproject), "worktree", "add", "-q", "--detach", str(second), "HEAD")
+            own = Path(_git(
+                "-C", str(second), "rev-parse", "--path-format=absolute",
+                "--git-path", "modules/first-party/example",
+            ).stdout.strip())
+            self.assertFalse(own.exists())
+
+            # Not checked out there yet: the first checkout's store answers.
+            unpopulated = audit.submodule_git_dir(second, "first-party/example")
+            assert unpopulated is not None
+            self.assertEqual(unpopulated.resolve(), store)
+
+            _git(
+                "--git-dir", str(store), "worktree", "add", "-q", "--detach",
+                str(second / "first-party/example"), pinned,
+            )
+            self.assertFalse(own.exists())
+            linked = audit.submodule_git_dir(second, "first-party/example")
+            assert linked is not None
+            self.assertEqual(linked.resolve(), store)
+
+            # The same verdicts as the first checkout's, from the second worktree.
+            _git("--git-dir", str(remote), "update-ref", "-d", "refs/heads/topic")
+            fresh = self._run(second)
+            self.assertNotIn("not materialized", fresh.stdout)
+            self.assertIn(f"ORPHAN  {pinned}", fresh.stdout)
+            anchored = self._run(second, "--anchor")
+            self.assertEqual(anchored.returncode, 0, anchored.stdout + anchored.stderr)
+            self.assertIn("ANCHORED and exact-remote-verified: 1", anchored.stdout)
+
+    def test_a_second_worktree_writes_nothing_into_the_store_it_shares(self) -> None:
+        """The first checkout's store is read from a second worktree, never written.
+
+        Every fetch of the audit (the remote view of an absent tip, the head
+        prune's ``refs/remotes/origin/*`` and force-moved tags, ``--fetch``)
+        landed in the shared store from a second worktree, with ``FETCH_HEAD``
+        and maintenance, and without the lock ``submodule_sync.sh`` takes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            superproject, sibling, remote, pinned = self._fixture(tmp)
+            store = (superproject / ".git/modules/first-party/example").resolve()
+            second = Path(tmp) / "second"
+            _git("-C", str(superproject), "worktree", "add", "-q", "--detach", str(second), "HEAD")
+            _git(
+                "--git-dir", str(store), "worktree", "add", "-q", "--detach",
+                str(second / "first-party/example"), pinned,
+            )
+            # A remote tip the store lacks, so the audit must fetch to judge,
+            # and a tag the store holds that the remote moved.
+            _git("-C", str(sibling), "switch", "-qc", "later", "main")
+            (sibling / "value").write_text("later\n")
+            _git("-C", str(sibling), "commit", "-qam", "later")
+            later = _git("-C", str(sibling), "rev-parse", "HEAD").stdout.strip()
+            _git("-C", str(sibling), "push", "-q", "origin", "later")
+            _git("--git-dir", str(store), "tag", "moved", pinned)
+            _git("--git-dir", str(remote), "tag", "moved", later)
+
+            def state() -> tuple[str, list[str], bool]:
+                refs = _git("--git-dir", str(store), "for-each-ref").stdout
+                packs = sorted(p.name for p in (store / "objects").rglob("*") if p.is_file())
+                return refs, packs, (store / "FETCH_HEAD").exists()
+
+            before = state()
+            self.assertFalse(before[2])
+            fresh = self._run(second)
+            self.assertNotIn("not materialized", fresh.stdout)
+            self.assertIn("OK=1", fresh.stdout, fresh.stdout + fresh.stderr)
+            pruned = self._run(second, "--prepare-head-prune", "--retain-tags")
+            self.assertIn("SAFE_TAG", pruned.stdout, pruned.stdout + pruned.stderr)
+            fetched = self._run(second, "--fetch")
+            self.assertIn("not refreshed here", fetched.stdout)
+            self.assertEqual(state(), before)
+            self.assertFalse(_git("--git-dir", str(store), "cat-file", "-e", later, check=False).returncode == 0)
+            # The first checkout still refreshes its own store.
+            self._run(superproject, "--fetch")
+            self.assertNotEqual(state(), before)
+
     def test_a_missing_remote_is_an_error_not_a_pass(self) -> None:
         """Unfetchable is REPORTED. It is never the silent all-clear it was."""
         with tempfile.TemporaryDirectory() as tmp:

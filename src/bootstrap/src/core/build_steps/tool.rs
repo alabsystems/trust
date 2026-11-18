@@ -156,8 +156,8 @@ impl Step for ToolBuild {
         let path = self.path;
         let input = self.cargo_input(builder);
         let retained_frontend = self.artifact_kind == ToolArtifactKind::RetainedFrontendBinary;
-        let native_engineering = retained_frontend
-            || self.artifact_kind == ToolArtifactKind::NativeEngineeringBinary;
+        let native_engineering =
+            retained_frontend || self.artifact_kind == ToolArtifactKind::NativeEngineeringBinary;
         if native_engineering {
             assert_eq!(path, if retained_frontend { "targo-trust" } else { "src/tools/targo" });
             assert_eq!(self.build_compiler.stage, 0);
@@ -317,17 +317,15 @@ impl Step for ToolBuild {
             let tool_path = match self.artifact_kind {
                 ToolArtifactKind::Binary
                 | ToolArtifactKind::NativeEngineeringBinary
-                | ToolArtifactKind::RetainedFrontendBinary => {
-                    copy_link_tool_bin(
-                        builder,
-                        self.output_compiler,
-                        self.target,
-                        self.mode,
-                        self.build_compiler,
-                        tool,
-                        input,
-                    )
-                }
+                | ToolArtifactKind::RetainedFrontendBinary => copy_link_tool_bin(
+                    builder,
+                    self.output_compiler,
+                    self.target,
+                    self.mode,
+                    self.build_compiler,
+                    tool,
+                    input,
+                ),
                 ToolArtifactKind::Example => {
                     let source = builder
                         .cargo_out(self.build_compiler, input.cache_mode(self.mode), self.target)
@@ -376,7 +374,7 @@ impl ToolBuild {
     }
 }
 
-// Trust: this example is a BUILD-host DATA tool, not a compiler/proof producer.
+// Trust: this binary is a BUILD-host DATA tool, not a compiler/proof producer.
 // Snapshot std and CargoInput::Seed avoid any Assemble -> tool -> Assemble cycle.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct Vf5ResourceTool;
@@ -384,7 +382,7 @@ struct Vf5ResourceTool;
 // The host preparer links AY and trust-types with its default try-sugar API.
 // Keep their actual language requirements local to this recipe.
 const VF5_RESOURCE_ALLOW_FEATURES: &str =
-    "min_specialization,allocator_api,try_trait_v2,try_trait_v2_residual";
+    "min_specialization,allocator_ext,try_trait_v2,try_trait_v2_residual";
 
 fn vf5_resource_tool_recipe(builder: &Builder<'_>) -> ToolBuild {
     let compiler = builder.compiler(0, builder.host_target);
@@ -398,8 +396,8 @@ fn vf5_resource_tool_recipe(builder: &Builder<'_>) -> ToolBuild {
         source_type: SourceType::InTree,
         extra_features: Vec::new(),
         allow_features: VF5_RESOURCE_ALLOW_FEATURES,
-        cargo_args: vec!["--example".into(), "prepare_vf5_inputs".into()],
-        artifact_kind: ToolArtifactKind::Example,
+        cargo_args: vec!["--bin".into(), "prepare_vf5_inputs".into()],
+        artifact_kind: ToolArtifactKind::Binary,
     }
 }
 
@@ -487,6 +485,9 @@ fn prepare_tool_cargo_with_input(
 
     let path = PathBuf::from(path);
     let dir = builder.src.join(&path);
+    // Trust: check every actual standalone tool graph before any real Step;
+    // root metadata --no-deps cannot establish AY/Targo workspace readiness.
+    builder.record_selected_tool_sources(path.join("Cargo.toml"));
     cargo.arg("--manifest-path").arg(dir.join("Cargo.toml"));
 
     // Trust: an explicit sysroot also reaches Cargo's compiler-info probe. A
@@ -1158,8 +1159,15 @@ fn ay_bootstrap_cargo_args_for_manifest(manifest_text: &str) -> Vec<String> {
 // Trust: AY preserves allocation failure with Box::try_new. Its ahash dependency
 // detects this nightly seed in build.rs and requests min_specialization. Keep
 // these permissions recipe-local; AY does not need full specialization.
-const AY_ALLOW_FEATURES: &str = "min_specialization,allocator_api";
-const VERIFIER_BACKEND_ALLOW_FEATURES: &str = "min_specialization,specialization,allocator_api";
+// The pinned alloc library labels Box::try_new allocator_ext, implied by
+// allocator_api. The CLI also links veripb-formula -> smartstring, whose
+// native-channel probe still enables allocator_api. Keep that permission local
+// to this wider CLI graph; the shared proof-runtime census does not need it.
+const AY_ALLOW_FEATURES: &str = "min_specialization,allocator_api,allocator_ext";
+// Verifier CLIs retain their preexisting allocator_api permission: their wider
+// registry closures are not the shared proof-runtime graph audited below.
+const VERIFIER_BACKEND_ALLOW_FEATURES: &str =
+    "min_specialization,specialization,allocator_api,allocator_ext";
 
 fn ay_tool_build_recipe(
     build_compiler: Compiler,
@@ -1202,15 +1210,154 @@ pub(crate) fn ensure_sysroot_ay(
         return None;
     }
     let target = target_compiler.host;
-    let build_compiler =
-        get_tool_target_compiler(builder, ToolTargetBuildMode::Dist(target_compiler));
-    let ay =
-        builder.ensure(ay_tool_build_recipe(build_compiler, target_compiler, target, &builder.src));
     let bindir = sysroot.join("bin");
     t!(fs::create_dir_all(&bindir));
+    // Trust (DC-16a): a stage-2 `x.py build` whose change leaves the batteries alone
+    // takes them from its source toolchain, `ay` first (`Stage2VerifierTools`).
+    let (produced, sealed) = match taken_stage2_verifier_tools(builder, target_compiler) {
+        Some(taken) => {
+            let ay = taken.tool("ay").expect("a taken set starts with its ay");
+            (ay.path.clone(), Some(ay.sha256.clone()))
+        }
+        None => {
+            let build_compiler =
+                get_tool_target_compiler(builder, ToolTargetBuildMode::Dist(target_compiler));
+            let built = builder
+                .ensure(ay_tool_build_recipe(build_compiler, target_compiler, target, &builder.src))
+                .tool_path;
+            (built, None)
+        }
+    };
+    let tools_dir = builder.tools_dir(target_compiler, target_compiler.host);
+    let ay = if builder.config.dry_run() {
+        tools_dir.join(exe("ay", target_compiler.host))
+    } else {
+        let recorders = restored_sysroot_bins(builder)
+            .into_iter()
+            .filter(|(src_name, _)| AY_RECORDING_TOOLS.contains(src_name))
+            .map(|(src_name, _)| {
+                let bins = sysroot_bin_names_for_tool_source(src_name)
+                    .into_iter()
+                    .map(|name| exe(name, target_compiler.host))
+                    .collect();
+                (exe(src_name, target_compiler.host), bins)
+            })
+            .collect::<Vec<_>>();
+        settle_installed_ay(
+            &produced,
+            sealed.as_deref(),
+            &tools_dir,
+            &bindir,
+            &exe("ay", target_compiler.host),
+            &recorders,
+        )
+        .unwrap_or_else(|error| panic!("cannot install {}: {error}", produced.display()))
+    };
     let installed = bindir.join(exe("ay", target_compiler.host));
-    builder.copy_link(&ay.tool_path, &installed, FileType::Executable);
+    builder.copy_link(&ay, &installed, FileType::Executable);
     Some(installed)
+}
+
+/// Trust (DC-16a): the tools of a stage>0 sysroot whose build can record its `bin/ay`:
+/// every ToolTarget battery is told that sysroot (`name_tool_ay_record_host_sysroot`),
+/// and trust-cg-verify, linked into any of them, records the `ay` it finds there.
+const AY_RECORDING_TOOLS: [&str; 5] = ["targo", "targo-trust", "trustd", "ty", "clean"];
+
+/// Trust (DC-16a): the record, in a tools directory, of the `ay` that directory installs:
+/// its SHA-256. The record's modification time is when that `ay` arrived there.
+pub(crate) const INSTALLED_AY_RECORD: &str = "ay.installed.sha256";
+
+/// Trust (DC-16a): installs the `ay` at `produced` as `<tools_dir>/<ay_name>`, the file
+/// the sysroot's `bin/ay` is linked from, and returns that path.
+///
+/// What records a sysroot's `ay` (trust-cg-verify's build script, in the compiler and in
+/// each tool of [`AY_RECORDING_TOOLS`]) re-records it only when Cargo finds the file's
+/// modification time newer than its last run (`rerun-if-changed`). A file installed
+/// with its own time (a hard link, or a copy that keeps its times, as `copy_link`
+/// makes) can carry a time older than that run: a taken `ay` keeps the pack's time, and a
+/// built one Cargo did not relink keeps its old link time. Then the compiler kept
+/// recording the `ay` it found before while the sysroot held another. So the installed
+/// `ay` is always this directory's own copy, never a link into a pack or Cargo's output,
+/// and its time is the time its bytes arrived: when they differ from the record, now,
+/// and otherwise the record's, so that switching back and forth never sets it back to a
+/// time before a run that recorded other bytes.
+///
+/// When the bytes change, a tool restored from this directory that recorded the `ay` it
+/// replaces is removed, from `tools_dir` and from `bindir`, so that no sysroot restores
+/// a tool beside an `ay` it does not admit: `recorders` names each tool's file here and
+/// its file names in `bindir`. A tool records an `ay` by its SHA-256, in hex. Without a
+/// record, the `ay` before is unknown, and each tool that does not record this one is
+/// removed. A command that does not build these tools then finds them missing, never
+/// mismatched; `x.py build` builds them again.
+///
+/// `sealed`, when given, is the SHA-256 `produced` must have (a taken `ay`'s seal).
+pub(crate) fn settle_installed_ay(
+    produced: &Path,
+    sealed: Option<&str>,
+    tools_dir: &Path,
+    bindir: &Path,
+    ay_name: &str,
+    recorders: &[(String, Vec<String>)],
+) -> io::Result<PathBuf> {
+    use sha2::Digest as _;
+    let bytes = fs::read(produced)?;
+    let sha256 = helpers::hex_encode(sha2::Sha256::digest(&bytes).as_slice());
+    if let Some(sealed) = sealed
+        && sealed != sha256
+    {
+        return Err(io::Error::other(format!(
+            "it is {sha256}, not the {sealed} bootstrap took (it changed while it was taken)"
+        )));
+    }
+    let record = tools_dir.join(INSTALLED_AY_RECORD);
+    let before = match fs::read_to_string(&record) {
+        Ok(text) => Some(text.trim().to_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if before.as_deref() != Some(sha256.as_str()) {
+        for (tool, bins) in recorders {
+            let path = tools_dir.join(tool);
+            let held = match fs::read(&path) {
+                Ok(held) => held,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let stale = match &before {
+                Some(before) => memchr::memmem::find(&held, before.as_bytes()).is_some(),
+                None => memchr::memmem::find(&held, sha256.as_bytes()).is_none(),
+            };
+            if stale {
+                for path in std::iter::once(path).chain(bins.iter().map(|bin| bindir.join(bin))) {
+                    match fs::remove_file(&path) {
+                        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                            return Err(error);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // The record moves last: a run cut short before it removes again.
+        let next = tools_dir.join(format!("{INSTALLED_AY_RECORD}.next"));
+        fs::write(&next, format!("{sha256}\n"))?;
+        fs::rename(&next, &record)?;
+    }
+    let arrived = fs::metadata(&record)?.modified()?;
+    let installed = tools_dir.join(ay_name);
+    let next = tools_dir.join(format!("{ay_name}.installing"));
+    match fs::remove_file(&next) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    fs::write(&next, &bytes)?;
+    fs::set_permissions(&next, fs::metadata(produced)?.permissions())?;
+    helpers::set_file_times(
+        &next,
+        fs::FileTimes::new().set_accessed(arrived).set_modified(arrived),
+    )?;
+    fs::rename(&next, &installed)?;
+    Ok(installed)
 }
 
 // Trust: Sysroot may build compiler prerequisites, never a frontend bound to itself.
@@ -1368,7 +1515,13 @@ fn ensure_verifier_tool_bins(
         // otherwise trips an E0119 blanket/specialized impl conflict) compile.
         // Trust: both TY and Clean also reach ay-sat's fallible allocations.
         let backend_allow_features = VERIFIER_BACKEND_ALLOW_FEATURES;
-        if l2_backend_enabled(tools, "ty")
+        // Trust (DC-16a): the same decision `ensure_sysroot_ay` took for this sysroot.
+        let taken_ty = taken_stage2_verifier_tools(builder, target_compiler)
+            .filter(|taken| taken.tool("ty").is_some());
+        if let Some(taken) = &taken_ty {
+            let ty = install_taken_verifier_tool(builder, taken, "ty", target_compiler);
+            install_bin(builder, &ty, "ty");
+        } else if l2_backend_enabled(tools, "ty")
             && verifier_backend_source_present(&builder.src, TY_SOURCE_MANIFEST)
         {
             let ty = builder.ensure(ToolBuild {
@@ -1843,13 +1996,17 @@ fn should_defer_intermediate_verifier_tool_bins(
     compiler: Compiler,
     ambient: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> bool {
-    !builder.config.local_rebuild
-        && intermediate_verifier_tool_scheduling_known(builder, compiler, ambient)
+    !builder.config.local_rebuild && verifier_tool_scheduling_known(builder, compiler, 1, ambient)
 }
 
-fn intermediate_verifier_tool_scheduling_known(
+// Trust: the configurations whose verifier-tool scheduling is audited: a native
+// `x.py build --stage 2` (top stage 2) in the announced bootstrap posture, asked of
+// its `stage` compiler. The intermediate rule asks it of stage 1, the stage-2 source
+// rule (`stage2_verifier_tools`, DC-16a) of stage 2. Anything else is unknown.
+fn verifier_tool_scheduling_known(
     builder: &Builder<'_>,
     compiler: Compiler,
+    stage: u32,
     ambient: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> bool {
     use crate::core::backend::CodegenBackendKind::{Llvm, TrustCg};
@@ -1857,7 +2014,7 @@ fn intermediate_verifier_tool_scheduling_known(
     let native = helpers::get_host_target();
     if builder.kind != Kind::Build
         || builder.top_stage != 2
-        || compiler.stage != 1
+        || compiler.stage != stage
         || compiler.host != native
         || config.host_target != native
         || config.hosts != [native]
@@ -1943,6 +2100,17 @@ fn intermediate_tool_ambient_override(key: &OsStr, value: &OsStr) -> bool {
         | "TRUST_VANILLA_ANNOUNCED"
         | "TRUST_BOOTSTRAP_OFFLINE_CLOSURE" => value != "1",
         "TRUST_BUILD_LOCK_TOKEN" | "TRUST_BUILD_LOCK_WAIT" | "TRUST_REPO" => false,
+        // Trust: Bootstrap hands each word of these to every Cargo it runs
+        // (`builder/cargo.rs`), where `--config` or `-Z` can add `[env]` entries,
+        // wrappers or flags that the configuration-file check never reads. Only the
+        // lockfile and network switches leave the audited posture as it is.
+        "CARGOFLAGS" | "CARGOFLAGS_BOOTSTRAP" | "CARGOFLAGS_NOT_BOOTSTRAP" => {
+            value.to_str().is_none_or(|flags| {
+                flags
+                    .split_whitespace()
+                    .any(|flag| !matches!(flag, "--offline" | "--locked" | "--frozen"))
+            })
+        }
         _ => {
             key.contains("RUSTFLAGS")
                 || key.contains("RUSTDOCFLAGS")
@@ -1966,7 +2134,14 @@ fn intermediate_tool_ambient_override(key: &OsStr, value: &OsStr) -> bool {
 // the recreator's empty-home/no-ancestor-config posture. At the source root,
 // accept only the current non-compiler jobs/net settings and a string target-dir.
 // Bootstrap overrides target-dir through CARGO_TARGET_DIR for every tool build;
-// it cannot change the selected compiler or verification policy. Unknown tables,
+// it cannot change the selected compiler or verification policy. An `[env]`
+// table can (a `TRUST_*` or `RUSTC*` variable reaches every rustc Cargo runs), so
+// it is accepted only when it names `RUST_MIN_STACK` alone, with a decimal value,
+// plain or as `{ value, force = false }`. That sizes the compiler's, codegen's and
+// spawned threads' stacks and selects no compiler, flag or verifier control; the
+// ambient check above already admits it, and without `force` an ambient value
+// still wins. (`CARGOFLAGS` can carry `[env]` too; the ambient check handles it.)
+// Unknown tables,
 // legacy config, malformed/unreadable files and dangling links keep the old graph.
 fn intermediate_tool_cargo_configuration_known(src: &Path, cargo_home: &Path) -> bool {
     let absent = |path: &Path| matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound);
@@ -2001,9 +2176,555 @@ fn intermediate_tool_cargo_configuration_known(src: &Path, cargo_home: &Path) ->
                     _ => false,
                 })
             }),
+            "env" => value.as_table().is_some_and(|env| {
+                let decimal = |value: &toml::Value| {
+                    value.as_str().is_some_and(|text| {
+                        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                };
+                env.len() == 1
+                    && env.iter().all(|(key, value)| {
+                        key == "RUST_MIN_STACK"
+                            && (decimal(value)
+                                || value.as_table().is_some_and(|entry| {
+                                    entry.get("value").is_some_and(decimal)
+                                        && entry.iter().all(|(key, value)| match key.as_str() {
+                                            "value" => true,
+                                            "force" => value.as_bool() == Some(false),
+                                            _ => false,
+                                        })
+                                }))
+                    })
+            }),
             _ => false,
         })
     })
+}
+
+/// Trust (DC-16a): what a native `x.py build --stage 2` does with the verifier
+/// batteries the toolchain it is built from already carries.
+///
+/// A stage-2 tool is compiled by the stage-1 compiler, which changes with every
+/// compiler change, so cargo rebuilt every battery on every such change although a
+/// battery's own sources had not moved: 1 h 34 min of a seeded stage 2 (Trust
+/// docs/STATUS.md, Costs). Here a battery whose inputs are proven equal is installed
+/// from the source toolchain instead ([`Stage2VerifierTools::Taken`]):
+///
+/// * The source toolchain is the installed atpkg `trust` pack, the one
+///   `scripts/recreate_bootstrap.py`'s `atpkg_trust_sysroot` selects
+///   ([`installed_trust_pack`]). The seed `src/stage0` pins carries no battery.
+/// * Its record is the pack's `PROVENANCE` seal ([`SourceToolchainRecord`]): a
+///   `BUILD-STAMPED-CLEAN` build of `reported_commit`, and the SHA-256 of each
+///   `bin/` file as that build sealed it. A file that differs from its seal (a pack
+///   whose batteries were replaced in place after the cut) was not built from that
+///   commit, and nothing is taken.
+/// * The inputs of `ay` and `ty` are their `first-party/` pins with the worktree's
+///   departures under them ([`trust_source_identity::inputs_unchanged_since`]), and
+///   every source Cargo can read for them stays inside the pin
+///   ([`trust_source_identity::component_sources_closed`]).
+/// * A battery whose build records this build's compiler is always built:
+///   `targo` (bound to the completed compiler's image by `paired_compiler::bind`),
+///   `targo-trust` (its oracle compiler is `CFG_VER_HASH`, `tool_identity.rs`),
+///   `trustd` (`targo trust self-verify` requires its commit to be `trustc`'s) and
+///   `clean` (clean-elab's `oracle_compiler` admits only the `trustc` of
+///   `CFG_VER_HASH`). Each of them carries its commit as a bare string; a taken
+///   battery may not ([`records_its_compiler`]).
+/// * The set is taken whole or built whole. `ty` links trust-cg-verify, whose build
+///   script recorded the `ay` beside it (`name_tool_ay_record_host_sysroot`), so `ty`
+///   is taken only with the very `ay` its bytes record, and that `ay` is installed
+///   first, before the stage-2 compiler records it in turn. The installed `ay` arrives
+///   with a new time whenever its bytes change, so that what recorded the one before
+///   records it again, and a restored tool that recorded the one before is removed
+///   ([`settle_installed_ay`]).
+/// * A battery's answers depend on which of its own checks it compiles: the build must
+///   compile the batteries with debug assertions as the source toolchain's cut did
+///   ([`source_toolchain_tools_debug_assertions`]).
+///
+/// Everything else builds: `x.py dist`, `install` and every other command (a pack
+/// cut's double compile compares the tools the compilers it ships compiled), a
+/// configuration [`verifier_tool_scheduling_known`] does not recognise, a pack that
+/// cannot be read, a source commit this repository does not hold, an input that moved,
+/// and any doubt. What is accepted: a taken battery was compiled by another compiler
+/// and recipe, so a miscompilation of a battery by this tree's compiler or recipe is
+/// found at dist and the pack cut, not in a dev stage 2 (docs/DECISION_QUEUE.md,
+/// DC-16a).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Stage2VerifierTools {
+    /// Every battery is built; why none is taken.
+    Built(String),
+    Taken(TakenVerifierTools),
+}
+
+/// The batteries a stage-2 build installs from its source toolchain, `ay` first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TakenVerifierTools {
+    pub(crate) source: PathBuf,
+    pub(crate) commit: String,
+    pub(crate) tools: Vec<TakenVerifierTool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TakenVerifierTool {
+    pub(crate) name: &'static str,
+    /// The file in the source toolchain.
+    pub(crate) path: PathBuf,
+    /// Its SHA-256, which is also what its seal records.
+    pub(crate) sha256: String,
+}
+
+impl TakenVerifierTools {
+    fn tool(&self, name: &str) -> Option<&TakenVerifierTool> {
+        self.tools.iter().find(|tool| tool.name == name)
+    }
+}
+
+/// The batteries a stage-2 build may take: the independent solver repositories
+/// whose builds do not record this build's compiler. `ay` comes first.
+const STAGE2_TAKEABLE_VERIFIER_TOOLS: [(&str, trust_source_identity::IndependentToolComponent); 2] = [
+    ("ay", trust_source_identity::IndependentToolComponent::Ay),
+    ("ty", trust_source_identity::IndependentToolComponent::Ty),
+];
+
+/// What the source toolchain's seal says ([`Stage2VerifierTools`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SourceToolchainRecord {
+    pub(crate) commit: String,
+    /// The sealed SHA-256 of each `bin/<name>` the record names.
+    pub(crate) bins: std::collections::BTreeMap<String, String>,
+}
+
+/// The seal a pack carries at its root (`scripts/promote-toolchain.sh`).
+pub(crate) const SOURCE_TOOLCHAIN_RECORD: &str = "PROVENANCE";
+
+/// Reads a pack's [`SOURCE_TOOLCHAIN_RECORD`]: `key=value` lines, `#` comments. It must
+/// say `provenance_class=BUILD-STAMPED-CLEAN` (the build tree was clean at the commit
+/// when the build started and unchanged when it finished) and name one full
+/// `reported_commit`; any `sealtime_repo_tree` and `build_stamp:tree_state` say
+/// `clean`. Each `artifact_bin_<name>_sha256` is one sealed file. A key given twice,
+/// or a value of another shape, refuses the record.
+pub(crate) fn parse_source_toolchain_record(text: &str) -> Result<SourceToolchainRecord, String> {
+    let mut fields = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("{SOURCE_TOOLCHAIN_RECORD} line without `=`: {line:?}"));
+        };
+        if fields.insert(key, value).is_some() {
+            return Err(format!("{SOURCE_TOOLCHAIN_RECORD} names `{key}` twice"));
+        }
+    }
+    let hex = |value: &str, len: usize| {
+        value.len() == len && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if fields.get("provenance_class") != Some(&"BUILD-STAMPED-CLEAN") {
+        return Err(format!(
+            "the toolchain is not BUILD-STAMPED-CLEAN (provenance_class={:?})",
+            fields.get("provenance_class")
+        ));
+    }
+    for key in ["sealtime_repo_tree", "build_stamp:tree_state"] {
+        if fields.get(key).is_some_and(|value| *value != "clean") {
+            return Err(format!("{SOURCE_TOOLCHAIN_RECORD} says {key}={}", fields[key]));
+        }
+    }
+    let commit = match fields.get("reported_commit") {
+        Some(&commit) if hex(commit, 40) || hex(commit, 64) => commit.to_owned(),
+        other => return Err(format!("no full reported_commit: {other:?}")),
+    };
+    let mut bins = std::collections::BTreeMap::new();
+    for (key, value) in &fields {
+        if let Some(name) =
+            key.strip_prefix("artifact_bin_").and_then(|k| k.strip_suffix("_sha256"))
+        {
+            if !hex(*value, 64) {
+                return Err(format!("{key} is no SHA-256: {value:?}"));
+            }
+            bins.insert(name.to_owned(), (*value).to_owned());
+        }
+    }
+    Ok(SourceToolchainRecord { commit, bins })
+}
+
+/// The installed atpkg `trust` pack: `store/trust/current` under atpkg's per-user prefix
+/// (`home` is `$HOME`) is a symlink to a numbered pack directly in `store/trust`, whose
+/// `toolchain` is no symlink. atpkg keeps a pack's files in `<N>.noindex`, out of
+/// Spotlight, and links `<N>` to it, so the directory `current` resolves to is `<N>` or
+/// `<N>.noindex`. (`scripts/recreate_bootstrap.py`'s `_capture_atpkg_pack` reads the
+/// same link but admits only `<N>`.) Never `PATH` or `ATPKG_BIN`.
+pub(crate) fn installed_trust_pack(home: &Path) -> Result<PathBuf, String> {
+    let prefix = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/aterm/pkg")
+    } else if cfg!(target_os = "linux") {
+        home.join(".local/share/aterm/pkg")
+    } else {
+        return Err("atpkg installs no trust pack on this platform".into());
+    };
+    let store = prefix.join("store/trust");
+    let current = store.join("current");
+    let link = fs::symlink_metadata(&current)
+        .map_err(|error| format!("no installed trust pack at {}: {error}", current.display()))?;
+    if !link.file_type().is_symlink() {
+        return Err(format!("{} does not name the active pack", current.display()));
+    }
+    let pack =
+        fs::canonicalize(&current).map_err(|error| format!("{}: {error}", current.display()))?;
+    let store =
+        fs::canonicalize(&store).map_err(|error| format!("{}: {error}", store.display()))?;
+    let numbered = pack.file_name().and_then(OsStr::to_str).is_some_and(|name| {
+        let name = name.strip_suffix(".noindex").unwrap_or(name);
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) && !name.starts_with('0')
+    });
+    if pack.parent() != Some(store.as_path()) || !numbered {
+        return Err(format!("{} is not a numbered pack in {}", pack.display(), store.display()));
+    }
+    if fs::symlink_metadata(pack.join("toolchain")).is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(format!("{} is a wired sysroot, not a sealed pack", pack.display()));
+    }
+    Ok(pack)
+}
+
+/// The build record a pack carries at its root beside its seal (`tool-provenance.json`).
+pub(crate) const SOURCE_TOOLCHAIN_BUILD_RECORD: &str = "tool-provenance.json";
+
+/// Whether the source toolchain at `source` compiled its batteries with debug assertions:
+/// the one profile setting that decides which of a battery's own checks run, and so what
+/// it answers. (Overflow checks are always on: Trust's configuration refuses
+/// `rust.overflow-checks = false`. The rest of a battery's profile changes its code, not
+/// its answers, as another compiler does.)
+///
+/// The pack's build record names the configuration its cut parsed
+/// (`bootstrap_lineage.mint_configuration.configuration_closure`); its one profile,
+/// a file under `src/bootstrap/defaults/`, must be the bytes of this checkout's at `src`,
+/// and its `rust.debug-assertions-tools`, else `rust.debug-assertions`, else
+/// `rust.debug`, decides, as `Config` derives `tools_debug_assertions`. The cut's own
+/// `bootstrap.toml`, which the record names only by digest, is the recreator's template,
+/// which sets none of them. A record that names no profile, or another one's bytes,
+/// decides nothing.
+pub(crate) fn source_toolchain_tools_debug_assertions(
+    source: &Path,
+    src: &Path,
+) -> Result<bool, String> {
+    use sha2::Digest as _;
+    let path = source.join(SOURCE_TOOLCHAIN_BUILD_RECORD);
+    let record: serde_json::Value = fs::read(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("cannot parse {}: {error}", path.display()))
+        })?;
+    let files = record
+        .pointer("/bootstrap_lineage/mint_configuration/configuration_closure/files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{} names no configuration its cut parsed", path.display()))?;
+    let mut profiles = files.iter().filter_map(|file| {
+        let relative = file.get("relative_path")?.as_str()?;
+        relative.starts_with("src/bootstrap/defaults/").then_some((relative, file.get("sha256")))
+    });
+    let (Some((relative, sealed)), None) = (profiles.next(), profiles.next()) else {
+        return Err(format!("{} names no single configuration profile", path.display()));
+    };
+    let sealed = sealed.and_then(serde_json::Value::as_str).unwrap_or_default();
+    let bytes = fs::read(src.join(relative))
+        .map_err(|error| format!("the source toolchain's profile {relative}: {error}"))?;
+    if helpers::hex_encode(sha2::Sha256::digest(&bytes).as_slice()) != sealed {
+        return Err(format!("the source toolchain was cut on other bytes of {relative}"));
+    }
+    let profile = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.parse::<toml::Value>().ok())
+        .ok_or_else(|| format!("cannot parse {relative}"))?;
+    let rust = |key: &str| profile.get("rust").and_then(|rust| rust.get(key)?.as_bool());
+    Ok(rust("debug-assertions-tools")
+        .or_else(|| rust("debug-assertions"))
+        .unwrap_or(rust("debug") == Some(true)))
+}
+
+/// Whether a battery's bytes carry `commit`, the commit of the build that compiled it,
+/// as a record of that build: the full commit as a bare string (`CFG_VER_HASH`), or
+/// its 9-digit form in a version (`(<short> ` of `CFG_VERSION`, `+g<short>` of
+/// `CFG_TRUST_VERSION`). A path into the standard library's remapped sources,
+/// `/rustc/<commit>/`, names where std was built, not what the battery binds.
+pub(crate) fn records_its_compiler(bytes: &[u8], commit: &str) -> bool {
+    let commit = commit.as_bytes();
+    let short = &commit[..commit.len().min(9)];
+    memchr::memmem::find_iter(bytes, commit).any(|at| !bytes[..at].ends_with(b"/rustc/"))
+        || [[&b"("[..], short, &b" "[..]].concat(), [&b"+g"[..], short].concat()]
+            .iter()
+            .any(|marker| memchr::memmem::find(bytes, marker).is_some())
+}
+
+/// The batteries a stage-2 build would build in place of taking them: `wanted` are the
+/// takeable ones, `ay` first, and `debug_assertions` is whether it compiles them with
+/// debug assertions (`Config::tools_debug_assertions`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WantedVerifierTools<'a> {
+    pub(crate) tools: &'a [(&'static str, trust_source_identity::IndependentToolComponent)],
+    pub(crate) debug_assertions: bool,
+}
+
+/// The decision of [`Stage2VerifierTools`] for the checkout at `src` (HEAD `head`, its
+/// `.gitmodules` paths `submodules`) and the source toolchain at `source`, for the
+/// batteries `wanted`.
+pub(crate) fn decide_stage2_verifier_tools(
+    exec_ctx: &ExecutionContext,
+    src: &Path,
+    head: &crate::utils::channel::Info,
+    submodules: &[String],
+    source: &Path,
+    host: TargetSelection,
+    wanted: WantedVerifierTools<'_>,
+) -> Stage2VerifierTools {
+    match take_stage2_verifier_tools(exec_ctx, src, head, submodules, source, host, wanted) {
+        Ok(taken) => Stage2VerifierTools::Taken(taken),
+        Err(why) => Stage2VerifierTools::Built(why),
+    }
+}
+
+fn take_stage2_verifier_tools(
+    exec_ctx: &ExecutionContext,
+    src: &Path,
+    head: &crate::utils::channel::Info,
+    submodules: &[String],
+    source: &Path,
+    host: TargetSelection,
+    wanted: WantedVerifierTools<'_>,
+) -> Result<TakenVerifierTools, String> {
+    let WantedVerifierTools { tools: wanted, debug_assertions } = wanted;
+    if wanted.first().map(|(name, _)| *name) != Some("ay") {
+        return Err("nothing is taken without the ay every battery records".into());
+    }
+    let record_path = source.join(SOURCE_TOOLCHAIN_RECORD);
+    let record = fs::read_to_string(&record_path)
+        .map_err(|error| format!("cannot read {}: {error}", record_path.display()))
+        .and_then(|text| parse_source_toolchain_record(&text))?;
+    let cut = source_toolchain_tools_debug_assertions(source, src)?;
+    if cut != debug_assertions {
+        let on = |on: bool| if on { "on" } else { "off" };
+        return Err(format!(
+            "this build compiles the batteries with debug assertions {}, the source toolchain's \
+             cut compiled them with debug assertions {}",
+            on(debug_assertions),
+            on(cut)
+        ));
+    }
+    let mut roots = Vec::new();
+    for (name, component) in wanted {
+        if !submodules.iter().any(|path| path == component.root()) {
+            return Err(format!("{} is not a submodule of this checkout", component.root()));
+        }
+        if !record.bins.contains_key(*name) {
+            return Err(format!("the source toolchain's seal records no bin/{name}"));
+        }
+        roots.push(component.root());
+    }
+    trust_source_identity::inputs_unchanged_since(exec_ctx, src, &record.commit, head, &roots)?;
+    for root in &roots {
+        trust_source_identity::component_sources_closed(exec_ctx, src, root)?;
+    }
+    use sha2::Digest as _;
+    let mut tools = Vec::new();
+    let mut ay_sha256 = String::new();
+    for (name, _) in wanted {
+        let path = source.join("bin").join(exe(name, host));
+        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let sha256 = helpers::hex_encode(sha2::Sha256::digest(&bytes).as_slice());
+        if record.bins[*name] != sha256 {
+            return Err(format!(
+                "{} is not the file its seal records ({sha256}, sealed {})",
+                path.display(),
+                record.bins[*name]
+            ));
+        }
+        if records_its_compiler(&bytes, &record.commit) {
+            return Err(format!("{} records its compiler {}", path.display(), record.commit));
+        }
+        if *name == "ay" {
+            ay_sha256 = sha256.clone();
+        } else if memchr::memmem::find(&bytes, ay_sha256.as_bytes()).is_none() {
+            return Err(format!("{} does not record the ay {ay_sha256} beside it", path.display()));
+        }
+        tools.push(TakenVerifierTool { name, path, sha256 });
+    }
+    Ok(TakenVerifierTools { source: source.to_owned(), commit: record.commit, tools })
+}
+
+/// Whether a stage-2 build may take any battery: a native `x.py build --stage 2` in a
+/// configuration [`verifier_tool_scheduling_known`] recognises. An error says why not.
+fn stage2_verifier_tools_eligible(
+    builder: &Builder<'_>,
+    compiler: Compiler,
+    ambient: Vec<(OsString, OsString)>,
+) -> Result<(), String> {
+    if builder.kind != Kind::Build {
+        return Err(format!(
+            "`x.py {}` compiles every battery with its compiler",
+            builder.kind.as_str()
+        ));
+    }
+    if compiler.stage != 2 || builder.top_stage != 2 {
+        return Err("only a stage-2 sysroot of `x.py build --stage 2` takes batteries".into());
+    }
+    if !verifier_tool_scheduling_known(builder, compiler, 2, ambient) {
+        return Err("the configuration is not one whose tool scheduling is audited".into());
+    }
+    Ok(())
+}
+
+/// The takeable batteries this build would build for its stage-2 sysroot, `ay` first.
+fn stage2_wanted_verifier_tools(
+    builder: &Builder<'_>,
+) -> Vec<(&'static str, trust_source_identity::IndependentToolComponent)> {
+    let tools = builder.config.tools.as_ref();
+    let ay_present = verifier_backend_source_present(&builder.src, AY_SOURCE_MANIFEST);
+    let ty = ay_present
+        && default_source_solver_enabled(builder.config.extended, tools, ay_present)
+        && l2_backend_enabled(tools, "ty")
+        && verifier_backend_source_present(&builder.src, TY_SOURCE_MANIFEST);
+    STAGE2_TAKEABLE_VERIFIER_TOOLS
+        .into_iter()
+        .filter(|(name, _)| match *name {
+            "ay" => ay_present,
+            "ty" => ty,
+            _ => false,
+        })
+        .collect()
+}
+
+fn stage2_verifier_tools(
+    builder: &Builder<'_>,
+    compiler: Compiler,
+    ambient: Vec<(OsString, OsString)>,
+) -> Stage2VerifierTools {
+    let home = ambient.iter().find(|(key, _)| key == "HOME").map(|(_, value)| PathBuf::from(value));
+    if let Err(why) = stage2_verifier_tools_eligible(builder, compiler, ambient) {
+        return Stage2VerifierTools::Built(why);
+    }
+    let source = match home.as_deref().map(installed_trust_pack) {
+        Some(Ok(source)) => source,
+        Some(Err(why)) => return Stage2VerifierTools::Built(why),
+        None => return Stage2VerifierTools::Built("HOME is not set".into()),
+    };
+    let Some(head) = builder.rust_info().info() else {
+        return Stage2VerifierTools::Built("git names no HEAD for this checkout".into());
+    };
+    decide_stage2_verifier_tools(
+        builder.config.exec_ctx(),
+        &builder.src,
+        head,
+        &build_helper::util::parse_gitmodules(&builder.src),
+        &source,
+        compiler.host,
+        WantedVerifierTools {
+            tools: &stage2_wanted_verifier_tools(builder),
+            debug_assertions: builder.config.tools_debug_assertions,
+        },
+    )
+}
+
+// Trust: one decision per stage-2 compiler, shared by `ensure_sysroot_ay` (before the
+// compiler that records the `ay` is compiled) and the post-assembly batteries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Stage2VerifierToolSource {
+    compiler: Compiler,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a unit test hands [`Stage2VerifierToolSource`]; a test that hands nothing
+    /// takes nothing, whatever this machine has installed.
+    static STAGE2_VERIFIER_TOOLS_FOR_TEST: std::cell::RefCell<Option<Stage2VerifierTools>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl Step for Stage2VerifierToolSource {
+    type Output = Stage2VerifierTools;
+
+    fn run(self, builder: &Builder<'_>) -> Stage2VerifierTools {
+        #[cfg(test)]
+        let decision =
+            STAGE2_VERIFIER_TOOLS_FOR_TEST.with_borrow(Clone::clone).unwrap_or_else(|| {
+                Stage2VerifierTools::Built("a unit test hands no source toolchain".into())
+            });
+        #[cfg(not(test))]
+        let decision = stage2_verifier_tools(builder, self.compiler, env::vars_os().collect());
+        match &decision {
+            Stage2VerifierTools::Taken(taken) => builder.info(&format!(
+                "Taking stage{} verifier tools {} from {} (their inputs are unchanged since {})",
+                self.compiler.stage,
+                taken.tools.iter().map(|tool| tool.name).collect::<Vec<_>>().join(", "),
+                taken.source.display(),
+                taken.commit,
+            )),
+            Stage2VerifierTools::Built(why) => builder.config.do_if_verbose(|| {
+                println!("Building stage{} verifier tools: {why}", self.compiler.stage)
+            }),
+        }
+        decision
+    }
+}
+
+/// The batteries the stage-2 sysroot of `compiler` takes from its source toolchain, if
+/// any ([`Stage2VerifierTools`]). Only `x.py build` asks.
+fn taken_stage2_verifier_tools(
+    builder: &Builder<'_>,
+    compiler: Compiler,
+) -> Option<TakenVerifierTools> {
+    if builder.kind != Kind::Build || compiler.stage != 2 {
+        return None;
+    }
+    match builder.ensure(Stage2VerifierToolSource { compiler }) {
+        Stage2VerifierTools::Taken(taken) => Some(taken),
+        Stage2VerifierTools::Built(_) => None,
+    }
+}
+
+/// Installs the taken battery `name` (not `ay`, which [`ensure_sysroot_ay`] installs)
+/// where its build would have put it, the tools directory of `compiler`, so that sysroot
+/// restoration copies the same bytes, and returns that path.
+fn install_taken_verifier_tool(
+    builder: &Builder<'_>,
+    taken: &TakenVerifierTools,
+    name: &str,
+    compiler: Compiler,
+) -> PathBuf {
+    let tool = taken.tool(name).unwrap_or_else(|| panic!("no taken verifier tool {name}"));
+    let installed = builder.tools_dir(compiler, compiler.host).join(exe(name, compiler.host));
+    if !builder.config.dry_run() {
+        copy_taken_verifier_tool(&tool.path, &tool.sha256, &installed).unwrap_or_else(|error| {
+            panic!("cannot take {} from {}: {error}", tool.path.display(), taken.source.display())
+        });
+    }
+    installed
+}
+
+/// Trust (DC-16a): copies a taken battery from its source toolchain to `installed`. It is
+/// a copy of its own, never a link into the pack, and it must be the file the decision
+/// read: `sealed` is its SHA-256.
+pub(crate) fn copy_taken_verifier_tool(
+    source: &Path,
+    sealed: &str,
+    installed: &Path,
+) -> io::Result<()> {
+    use sha2::Digest as _;
+    let bytes = fs::read(source)?;
+    let sha256 = helpers::hex_encode(sha2::Sha256::digest(&bytes).as_slice());
+    if sha256 != sealed {
+        return Err(io::Error::other(format!(
+            "it is {sha256}, not the {sealed} bootstrap took (it changed while it was taken)"
+        )));
+    }
+    let next = installed.with_extension("installing");
+    match fs::remove_file(&next) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    fs::write(&next, &bytes)?;
+    fs::set_permissions(&next, fs::metadata(source)?.permissions())?;
+    fs::rename(&next, installed)
 }
 
 // Trust: share the actual Rustdoc step's registered source aliases with the
@@ -2894,9 +3615,10 @@ pub(super) fn targo_trust_in_process_features() -> Vec<String> {
 // `try_trait_v2_residual` joined in the 1.99 migration: the newer `Try` trait
 // requires `type Residual: Residual<Self::Output>`, so `Discharge` now also
 // implements `std::ops::Residual`.
-// Trust: `allocator_api` is required by ay-sat's fallible Box::try_new through
+// Trust: `allocator_ext` is required by ay-sat's fallible Box::try_new through
 // the proof-runtime closure shared by the native job service and verifier
-// tools. Generic tool defaults keep their own restrictions.
+// tools. It replaces the previous broader allocator_api permission for the
+// same API; generic tool defaults keep their own restrictions.
 // This list is a LIABILITY, not a convenience: every entry is an unstable
 // feature the compiler's own build graph is then permitted to depend on.
 // `variant_count` was briefly added here for `crates/trust-machine-sem` (which
@@ -2937,7 +3659,7 @@ pub(super) fn targo_trust_in_process_features() -> Vec<String> {
 // to remove that edge rather than to re-add the allowance.
 // The frontend's native member client needs the same child-only descriptor API
 // as Targo. This shared runtime recipe also governs trustd and their self-tests.
-pub(super) const CARGO_TRUST_ALLOW_FEATURES: &str = "min_specialization,specialization,try_trait_v2,try_trait_v2_residual,allocator_api,trust_process_inherit_fds";
+pub(super) const CARGO_TRUST_ALLOW_FEATURES: &str = "min_specialization,specialization,try_trait_v2,try_trait_v2_residual,allocator_ext,trust_process_inherit_fds";
 
 fn trustd_cargo_args() -> Vec<String> {
     locked_cargo_args(&["--bin", "trustd"])

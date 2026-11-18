@@ -4176,6 +4176,24 @@ written to standard error output)"),
         { TRUST_AUTHORITY: VerificationSelector },
         "represent opaque Option lanes by their discriminant during Trust-IR lowering \
          (default: yes)"),
+    // Trust (DC-18a): the check a store needs before it shares a unit across checkouts.
+    // It refuses and never rewrites, so a compile it passes writes exactly the bytes the
+    // same compile writes without it: TRACKED_NO_CRATE_HASH keeps the crate hash out of
+    // it, while incremental reuse is still invalidated, so metadata an earlier session
+    // encoded without the check is never copied into a session that has it.
+    // EvidenceControl: its whole effect is an observable refusal.
+    trust_path_free: bool = (false, parse_bool, [TRACKED_NO_CRATE_HASH]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "refuse to write crate metadata that would carry an absolute host path no \
+         --remap-path-prefix rule rewrote off this host: a path in an environment value an \
+         `env!`, an `option_env!` or a tracked read took, a source-file name or the working \
+         directory it was resolved against, a native library's name, or any value written \
+         into the metadata under this session's working directory, remap sources, sysroot, \
+         output, temporary or incremental directory, or home directory. The compile ends \
+         with one error whose note is a `trust-path-free-v1` JSON record naming the path and \
+         where it came from, and leaves no rlib or rmeta (`-Csave-temps` included). Nothing \
+         is rewritten; a unit that needs its real path is compiled without this option \
+         (default: no)"),
     // Trust (platform protocols: design 2026-10-01 Part 3 §3.2, plan L1a = design PR 8).
     // The five controls of the platform-protocol pass. THIS TRUSTC DOES NOT RUN THAT PASS
     // YET (plan L1d wires it): every value below is parsed, validated and tracked, and

@@ -90,6 +90,69 @@ fn original_domain_timeout_keeps_the_actual_resource_owner_unchanged() {
 }
 
 #[test]
+fn prelaunch_manifest_wait_retains_claim_and_releases_transaction_before_launch() {
+    use std::sync::mpsc;
+    let (root, claim) = fixture();
+    let prepared = claim.prepare_command(Command::new("never-launched")).unwrap();
+    let pool = Pool::open_existing(root.path()).unwrap().unwrap();
+    let other = Pool::open_existing(root.path()).unwrap().unwrap();
+    let held =
+        original_transaction_before(&pool, Instant::now() + Duration::from_secs(5), || {}).unwrap();
+    let (busy_tx, busy_rx) = mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+    let prepared = std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let mut first = Some(busy_tx);
+            let room = prepared
+                .claim
+                .observe_in_pool_before(&other, Instant::now() + Duration::from_secs(10), || {
+                    if let Some(first) = first.take() {
+                        first.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(matches!(room, LegacyFixedRoom::Fits { .. }));
+            // This independent description must acquire the manifest now:
+            // observation did not carry a transaction into the launch phase.
+            assert!(other.try_legacy_fixed_transaction().unwrap().is_some());
+            prepared
+        });
+        busy_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!crate::admission::resources::tests::released(&root.path().join("legacy/slot-0")));
+        drop(held);
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap()
+    });
+    prepared.claim.check_current().unwrap();
+}
+
+#[test]
+fn prelaunch_manifest_timeout_and_cancellation_do_not_start_or_release_the_claim() {
+    let (root, claim) = fixture();
+    let prepared = claim.prepare_command(Command::new("never-launched")).unwrap();
+    let pool = Pool::open_existing(root.path()).unwrap().unwrap();
+    let other = Pool::open_existing(root.path()).unwrap().unwrap();
+    let _held =
+        original_transaction_before(&pool, Instant::now() + Duration::from_secs(5), || {}).unwrap();
+    let timeout = prepared
+        .claim
+        .observe_in_pool_before(&other, Instant::now() + Duration::from_millis(10), || Ok(()))
+        .unwrap_err();
+    assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+    let cancelled = prepared
+        .claim
+        .observe_in_pool_before(&other, Instant::now() + Duration::from_secs(5), || {
+            Err(io::ErrorKind::Interrupted.into())
+        })
+        .unwrap_err();
+    assert_eq!(cancelled.kind(), io::ErrorKind::Interrupted);
+    prepared.claim.check_current().unwrap();
+    assert!(!crate::admission::resources::tests::released(&root.path().join("legacy/slot-0")));
+}
+
+#[test]
 fn early_fixed_snapshot_preserves_original_cursor_and_refuses_reused_packet() {
     use std::io::{Seek, SeekFrom};
     let (_root, claim) = fixture();

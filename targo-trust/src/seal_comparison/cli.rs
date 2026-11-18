@@ -25,9 +25,16 @@ DIR holds one directory per consumer:
 run.json (schema trust.seal-consumer-run.v1) has consumer, tree, command, seal,
 cpus, memory_gib, finished, exit, and optionally stopped_at_bound, obligations
 (a trust.obligations.v1 file or directory) and reds (the failing tests named).
+An obligations record that reports incomplete coverage or an unfinished
+measurement makes the runs incomparable.
+When obligations include libtest evidence, both seals must report the same
+test population from concluded harnesses. A newly failed case in that
+population produces NEW_RED. A package with no harnesses contributes zero
+measured cases. A run that supplies an obligations input still needs proof rows.
 
 A consumer whose runs have not both finished is PENDING. Run the command again
-when they have: a recorded verdict whose inputs are unchanged is kept.
+when they have. The verdict is recomputed from the saved runs, and an identical
+report is kept.
 
 Options:
   --state DIR      The comparison's state directory

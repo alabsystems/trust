@@ -320,6 +320,9 @@ impl Context<'_> {
             }
             Ty::Enum(id) => self.text.push(&format!("Enum({})[table=not-expanded]", id.index())),
             Ty::Func(id) => self.text.push(&format!("Func({})[table=not-expanded]", id.index())),
+            Ty::FnItem(id) => {
+                self.text.push(&format!("FnItem({})[function=not-expanded]", id.index()))
+            }
             Ty::Record(id) => {
                 self.text.push(&format!("Record({})[table=not-expanded]", id.index()))
             }
@@ -415,6 +418,31 @@ mod tests {
             "ptr",
         );
         assert!(output.contains("Tensor(rank=2,element=I32)"), "{output}");
+        assert!(output.contains("proof_authority=false"));
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn function_item_diagnostics_keep_nominal_ids_and_no_authority() {
+        let output = context(
+            vec![row(0, "Items", vec![Ty::FnItem(trust_ir::FuncId::new(7))])],
+            "struct.0",
+            "ptr",
+        );
+        assert!(output.contains("FnItem(7)[function=not-expanded]"), "{output}");
+        assert!(output.contains("proof_authority=false"));
+        assert!(output.contains("source_refinement=false"));
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn a_function_item_field_is_rendered_by_name_with_no_authority() {
+        let output = context(
+            vec![row(0, "Item", vec![Ty::FnItem(trust_ir::FuncId::new(7))])],
+            "struct.0",
+            "ptr",
+        );
+        assert!(output.contains("FnItem(7)[function=not-expanded]"), "{output}");
         assert!(output.contains("proof_authority=false"));
         assert!(output.len() <= MAX_OUTPUT_BYTES);
     }

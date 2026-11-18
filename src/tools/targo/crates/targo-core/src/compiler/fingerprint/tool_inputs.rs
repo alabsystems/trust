@@ -66,8 +66,23 @@ impl CachedInputs {
 
 impl Parent {
     fn capture(command: &ProcessBuilder, profile: Profile) -> CargoResult<Self> {
+        // An action sandbox is not another execution owner: `sandbox-exec`
+        // replaces itself with this same compiler, with the command's cwd and
+        // effective environment. It does narrow what the compiler may see, so
+        // its facts stand only where they hold unconfined too, and only for
+        // the policy they were taken under:
+        // * every fact is compared with Targo's own, unconfined observation
+        //   (`observe_current`); a candidate the policy denies but Targo can
+        //   reach differs there and yields no binding, so no receipt and no
+        //   reuse (`a_candidate_denied_to_the_compiler_but_reachable_unconfined_never_binds`);
+        // * the policy is part of the confined unit's fingerprint: its
+        //   `confined-command-v1` digest hashes the actual OS command,
+        //   generated sandbox policy included (`action_command::CommandInputs`),
+        //   so another policy is another fingerprint, never this receipt.
+        // Refusing the sandbox outright left every confined unit (each shared
+        // dependency unit) without facts, so no receipt and no reuse.
         anyhow::ensure!(
-            !command.has_process_executor() && !command.has_action_sandbox(),
+            !command.has_process_executor(),
             "tool-input parent uses an unsupported execution owner"
         );
         #[cfg(unix)]
@@ -77,6 +92,13 @@ impl Parent {
                 .ok_or_else(|| anyhow::anyhow!("tool-input parent has no explicit cwd"))?
                 .to_owned();
             anyhow::ensure!(cwd.is_absolute(), "tool-input parent cwd is not absolute");
+            // The child observes its physical cwd through current_dir(), not
+            // the spelling passed to chdir. Cargo homes commonly reach a
+            // registry through a symlink; retain the SAME directory identity
+            // rather than permanently rejecting its real compiler records.
+            // Resolve again for every parent capture so a retargeted alias
+            // cannot reuse the previous directory's tool-input context.
+            let cwd = fs::canonicalize(&cwd)?;
             let environment = command.get_effective_envs()?;
             Ok(Self {
                 cwd,
@@ -153,11 +175,17 @@ impl Plan {
         }
         let profile = match crate::compiler::validate_tool_input_profile(runner, unit) {
             Ok(profile) => profile,
-            Err(_) => return Ok(Self::Unavailable),
+            Err(error) => {
+                tracing::debug!(error = %format_args!("{error:#}"), "compiler tool-input profile is unavailable");
+                return Ok(Self::Unavailable);
+            }
         };
         let path = runner.files().fingerprint_file_path(unit, "dep-");
         let parent = crate::compiler::tool_input_parent_command(runner, unit)
             .and_then(|command| Parent::capture(&command, profile))
+            .inspect_err(|error| {
+                tracing::debug!(error = %format_args!("{error:#}"), path = %path.display(), ?profile, "compiler tool-input planning parent is unavailable");
+            })
             .ok();
         Ok(Self::Required {
             path,
@@ -183,7 +211,9 @@ impl Plan {
                     }
                     cached.as_mut().unwrap().binding(parent)
                 })();
-                result.map_or(
+                result.inspect_err(|error| {
+                    tracing::debug!(error = %format_args!("{error:#}"), path = %path.display(), profile = ?parent.profile, "cached compiler tool-input observation is unavailable");
+                }).map_or(
                     ToolInputExpectation::Unavailable,
                     ToolInputExpectation::Observed,
                 )
@@ -204,7 +234,11 @@ impl Plan {
             configured: configured.begin(command),
             parent: match self {
                 Self::Required { profile, .. } if requested => {
-                    Parent::capture(command, *profile).ok()
+                    Parent::capture(command, *profile)
+                        .inspect_err(|error| {
+                            tracing::debug!(error = %format_args!("{error:#}"), "compiler tool-input execution parent is unavailable");
+                        })
+                        .ok()
                 }
                 _ => None,
             },
@@ -239,7 +273,9 @@ fn current_binding(path: &std::path::Path, parent: &Parent) -> ToolInputExpectat
         let inputs = read_inputs(path)?;
         Ok(observe_current(&inputs, parent)?.binding())
     })();
-    observed.map_or(
+    observed.inspect_err(|error| {
+        tracing::debug!(error = %format_args!("{error:#}"), path = %path.display(), profile = ?parent.profile, "completed compiler tool-input observation is unavailable");
+    }).map_or(
         ToolInputExpectation::Unavailable,
         ToolInputExpectation::Observed,
     )
@@ -298,12 +334,106 @@ mod tests {
         }
     }
 
+    /// The compiler records each PATH candidate as its process may reach it;
+    /// under an action sandbox an earlier candidate the policy denies is
+    /// `denied` to it, while Targo, unconfined, reaches it. Simulated here by
+    /// the file's mode: recorded denied, then reachable. The facts then differ
+    /// from Targo's own observation and yield no binding (no receipt, no
+    /// reuse), never a binding of the compiler's narrower view.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_candidate_denied_to_the_compiler_but_reachable_unconfined_never_binds() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use trust_fs_observation::tool_lookup::Context;
+
+        super::super::build_script_inputs::settled(|world| {
+            let root = world.path().canonicalize().unwrap();
+            let native = |path: &std::path::Path, value: u8| {
+                let mut bytes = vec![0; 64];
+                if cfg!(target_os = "macos") {
+                    bytes[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+                } else {
+                    bytes[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1]);
+                }
+                bytes[63] = value;
+                fs::write(path, bytes).unwrap();
+            };
+            for name in ["confined", "granted"] {
+                fs::create_dir(root.join(name)).unwrap();
+            }
+            let denied = root.join("confined/tool");
+            native(&denied, 1);
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o600)).unwrap();
+            native(&root.join("granted/tool"), 2);
+            fs::set_permissions(root.join("granted/tool"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let child_path =
+                std::env::join_paths([root.join("confined"), root.join("granted")]).unwrap();
+            let context = Context::new(
+                std::ffi::OsStr::new("tool"),
+                &root,
+                Some(child_path.as_os_str()),
+                Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+                Profile::LocalUnixNativeV1,
+            )
+            .unwrap();
+            let inputs =
+                ToolInputs::from_records(vec![context.begin().unwrap().finish().unwrap()]).unwrap();
+            let unconfined = parent(&root);
+            // While both views agree, the facts bind.
+            assert!(observe_current(&inputs, &unconfined).is_ok());
+            // Reachable unconfined, recorded denied: no binding at all.
+            fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(observe_current(&inputs, &unconfined).is_err());
+        });
+    }
+
     fn write_terminal(path: &std::path::Path) {
         let encoded = EncodedDepInfo {
             tool_inputs: ToolInputsState::Observed(ToolInputs::from_records(Vec::new()).unwrap()),
             ..EncodedDepInfo::default()
         };
         fs::write(path, encoded.serialize().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_cwd_uses_the_childs_physical_directory_and_rechecks_aliases() {
+        use std::os::unix::fs::symlink;
+        use trust_fs_observation::tool_lookup::Context;
+
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let alias = root.path().join("registry-alias");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        symlink(&first, &alias).unwrap();
+        let mut command = ProcessBuilder::new("unexecuted-command-data");
+        command.cwd(&alias).env("PATH", "/usr/bin:/bin");
+        let captured = Parent::capture(&command, Profile::LocalUnixNativeV1).unwrap();
+        let physical = fs::canonicalize(&first).unwrap();
+        assert_eq!(captured.cwd, physical);
+        let context = Context::new(
+            std::ffi::OsStr::new("missing-tool"),
+            &physical,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            Profile::LocalUnixNativeV1,
+        )
+        .unwrap();
+        assert!(context.matches_parent(&captured.cwd, captured.path.as_deref(), captured.profile,));
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        let retargeted = Parent::capture(&command, Profile::LocalUnixNativeV1).unwrap();
+        assert_eq!(retargeted.cwd, fs::canonicalize(&second).unwrap());
+        assert!(!context.matches_parent(
+            &retargeted.cwd,
+            retargeted.path.as_deref(),
+            retargeted.profile,
+        ));
+        fs::remove_file(&alias).unwrap();
+        assert!(Parent::capture(&command, Profile::LocalUnixNativeV1).is_err());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

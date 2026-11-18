@@ -10,7 +10,6 @@ mod build_commit_info;
 
 fn main() {
     trust_std();
-    paired_compiler_input();
     commit_info();
     compress_man();
     windows_manifest();
@@ -39,29 +38,6 @@ fn trust_std() {
         .any(|line| line.starts_with(b"trust:"))
     {
         println!("cargo::rustc-cfg=trust_std");
-    }
-}
-
-fn paired_compiler_input() {
-    const KEY: &str = "TRUST_TARGO_PAIRED_COMPILER_PROFILE";
-    println!("cargo:rerun-if-env-changed={KEY}");
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "private canonical producer build input"
-    )]
-    if let Some(value) = std::env::var_os(KEY) {
-        let value = value
-            .into_string()
-            .expect("paired compiler producer input must be Unicode");
-        assert!(
-            value.len() <= 64 * 1024 && !value.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0')),
-            "invalid paired compiler producer input"
-        );
-        // The canonical producer supplies this input to the frontend compiler
-        // directly. `option_env!` records its actual value in the compiler's
-        // environment dependencies. Replaying it through build-script output
-        // would cross the authenticated executor's authority boundary: build
-        // scripts may not install or replace a compiler pairing profile.
     }
 }
 

@@ -499,7 +499,14 @@ class CpuBridgeTests(unittest.TestCase):
              mock.patch.object(self.gate.subprocess, "Popen", side_effect=AssertionError("probed unsupported command")):
             for args in cases:
                 with self.subTest(args=args):
-                    self.assertEqual(self.gate.main(args), 2)
+                    # Targo's own parser judges a `targo` invocation (7c40278d3b), so
+                    # these reach its query, and with no selected Targo here they are
+                    # refused by CpuBridgeUnavailable, which the entry exits 2 for.
+                    try:
+                        status = self.gate.main(args)
+                    except self.gate.CpuBridgeUnavailable:
+                        status = 2
+                    self.assertEqual(status, 2)
         # Even the right command shape must prove actual capability.
         with mock.patch.dict(os.environ, environment, clear=True), \
              mock.patch.object(self.gate, "worker_capability", return_value=False), \
@@ -874,18 +881,17 @@ class CpuBridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.gate.job_provenance({"TARGO_CALLER_JOBS": "0"})
 
-    def test_unsupported_verbs_and_lanes_never_probe_or_enter_worker_mode(self):
-        with mock.patch.object(self.gate.subprocess, "Popen", side_effect=AssertionError("unexpected probe")):
-            for args in [("trust", "build"), ("--unverified", "run"),
-                         ("--unverified", "bench"), ("--unverified", "install"),
-                         ("--unverified", "doc"), ("tippy",), ("--unverified", "alias")]:
-                self.assertFalse(self.gate.worker_capability(["targo", *args]))
-
-    def test_native_test_eligibility_uses_exact_invocation_query(self):
+    def test_native_operation_eligibility_uses_exact_invocation_query(self):
         program = self.root / "targo"
         capture = self.root / "query.json"
         for args, supported in [
             (["--unverified", "test", "--lib", "-p", "crate with spaces"], True),
+            (["--config", "build.build-dir='cache with spaces'", "--unverified", "check", "--all-targets"], True),
+            (["--unverified", "--config", "net.offline=true", "build"], True),
+            (["--unverified", "test", "--lib", "--", "--skip", "--resource-worker-v2"], True),
+            (["trust", "build"], False),
+            (["--version"], False),
+            (["--unverified", "alias"], False),
             (["--unverified", "test"], False),
             (["--unverified", "test", "--doc"], False),
         ]:
@@ -906,6 +912,115 @@ class CpuBridgeTests(unittest.TestCase):
             write_python_program(program, f'print({json.dumps(value)!r})\n')
             with self.assertRaises(self.gate.CpuBridgeUnavailable):
                 self.gate.worker_capability([str(program), "--unverified", "test", "--lib"])
+
+    def test_native_shim_front_queries_and_launches_the_same_selected_invocation(self):
+        front = [str(self.root / "atpkg"), "__build_admit", "--shim", "targo", "-",
+                 str(self.root / "selected SDK" / "bin" / "targo")]
+        answer = json.dumps(dict(version=3, cpu_workers=True, supports_invocation=True)).encode()
+        for verb in ("build", "check", "test"):
+            args = ["--unverified", verb, "--locked", "--lib", "-p", "crate with spaces"]
+            for flagged in (False, True):
+                command = [*front, *(["--resource-worker-v2"] if flagged else []), *args]
+                with self.subTest(verb=verb, flagged=flagged), \
+                     mock.patch.object(self.gate.shutil, "which", return_value=front[0]), \
+                     mock.patch.object(self.gate, "bounded_native_query", return_value=(0, answer, b"")) as query:
+                    self.assertTrue(self.gate.worker_capability(command))
+                    query.assert_called_once_with(
+                        [*front, "--resource-capabilities", "--", *args], observation=None)
+                    self.assertEqual(self.gate.worker_command(command),
+                                     [*front, "--resource-worker-v2", *args])
+        # An actual unsupported response cannot conceal this front as fixed work.
+        for cpu, invocation in ((False, False), (True, False)):
+            answer = json.dumps(dict(version=3, cpu_workers=cpu, supports_invocation=invocation)).encode()
+            with mock.patch.object(self.gate.shutil, "which", return_value=front[0]), \
+                 mock.patch.object(self.gate, "bounded_native_query", return_value=(0, answer, b"")):
+                with self.assertRaisesRegex(self.gate.CpuBridgeUnavailable, "does not support"):
+                    self.gate.worker_capability([*front, "--unverified", "test", "--lib"])
+
+    def test_malformed_native_shim_fronts_refuse_before_any_query_or_fixed_launch(self):
+        program, sdk = str(self.root / "atpkg"), str(self.root / "sdk" / "targo")
+        lead = [program, "__build_admit", "--shim", "targo", "-"]
+        malformed = [
+            [program, "__build_admit"],
+            [program, "--private-state-root", *lead[1:], sdk, "--unverified", "test"],
+            [program, "__build_admit", "--shim", "targo-tippy", "-", sdk, "--unverified", "test"],
+            [program, "__build_admit", "--shim", "targo", "config", sdk, "--unverified", "test"],
+            [program, "__build_admit", "--shim", "targo", "env", sdk, "--unverified", "test"],
+            [*lead, "relative/targo", "--unverified", "test"],
+            [*lead, str(self.root / "sdk" / "other"), "--unverified", "test"],
+        ]
+        with mock.patch.object(self.gate.subprocess, "Popen", side_effect=AssertionError("unexpected child")):
+            for command in malformed:
+                with self.subTest(command=command):
+                    with self.assertRaises(self.gate.CpuBridgeUnavailable):
+                        self.gate.worker_capability(command)
+                    for options in ([], ["--exclusive"]):
+                        with self.assertRaises(self.gate.CpuBridgeUnavailable):
+                            self.gate.main([*options, "--", *command])
+        self.assertIsNone(self.gate.worker_command(["env", *lead, sdk, "--unverified", "test"]))
+        # An ordinary command's data is not the hidden verb's dispatch position.
+        self.assertIsNone(self.gate.worker_command(
+            [program, "run", "other-tool", "--", "__build_admit", "--unverified", "test"]))
+
+    def test_native_shim_front_child_retains_original_epoch_after_gate_sigkill(self):
+        front, program = self.root / "atpkg", self.root / "targo"
+        marker, capture = self.root / "front-worker", self.root / "front-query"
+        write_python_program(front, '''import os, sys
+if sys.argv[1:5] != ["__build_admit", "--shim", "targo", "-"]:
+    raise SystemExit(91)
+os.execv(sys.argv[5], sys.argv[5:])
+''')
+        write_python_program(program, f'''import json, os, pathlib, sys
+if sys.argv[1:3] == ["--resource-capabilities", "--"]:
+    pathlib.Path({str(capture)!r}).write_text(json.dumps(sys.argv[1:]))
+    print('{{"version":3,"cpu_workers":true,"supports_invocation":true}}')
+    raise SystemExit(0)
+if sys.argv[1] != "--resource-worker-v2": raise SystemExit(92)
+fds = [int(value) for value in os.environ["BUILD_SLOT_FENCE_FDS"].split(",")]
+for fd in fds: os.fstat(fd)
+pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(
+    protocol=os.environ["BUILD_SLOT_CPU_PROTOCOL"], jobs=os.environ["CARGO_BUILD_JOBS"],
+    fences=len(fds), args=sys.argv[1:])))
+sys.stdin.buffer.read(1)
+''')
+        args = ["--config", "net.offline=true", "--unverified", "test", "--lib",
+                "-p", "ordinary-consumer", "--", "--skip", "--resource-worker-v2"]
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("BUILD_SLOT", "BUILD_SLOTS", "ATERM_", "TARGO_"))
+               and key != "CARGO_BUILD_JOBS"}
+        env.update(BUILD_SLOT_DIR=str(self.external), FIXTURE_USER_HOME=str(self.root / "home"))
+        child = subprocess.Popen([sys.executable, "-I", "-B", "-c", WRAPPER, str(SCRIPT),
+            "--cpus", "1", "--", str(front), "__build_admit", "--shim", "targo", "-",
+            str(program), *args], env=env, cwd=self.root, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            end = time.monotonic() + 5
+            while not marker.exists():
+                self.assertLess(time.monotonic(), end, "private native front did not start")
+                time.sleep(.01)
+            self.assertEqual(json.loads(capture.read_text()), ["--resource-capabilities", "--", *args])
+            actual = json.loads(marker.read_text())
+            self.assertEqual((actual["protocol"], actual["jobs"]), ("2", "1"))
+            self.assertGreater(actual["fences"], 0)
+            self.assertEqual(actual["args"], ["--resource-worker-v2", *args])
+            child.kill()
+            child.wait(timeout=5)
+            self.assertIsNone(self.gate.try_lease(str(self.external / "slot-0")))
+            child.stdin.close()
+            end = time.monotonic() + 5
+            while True:
+                released = self.gate.try_lease(str(self.external / "slot-0"))
+                if released is not None:
+                    os.close(released)
+                    break
+                self.assertLess(time.monotonic(), end, "native front lost or retained its epoch incorrectly")
+                time.sleep(.01)
+        finally:
+            if child.stdin and not child.stdin.closed: child.stdin.close()
+            if child.poll() is None: child.kill()
+            child.wait()
+            for stream in (child.stdout, child.stderr):
+                if stream: stream.close()
 
     def test_native_roots_coexist_while_legacy_exclusive_protocol_waits(self):
         program = self.root / "targo"

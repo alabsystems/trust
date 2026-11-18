@@ -12,6 +12,7 @@ import json
 import lzma
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -374,6 +375,11 @@ class SeedFetchTransportTests(unittest.TestCase):
         self.ledger = self.root / "bootstrap/trust-stage0/seed-ledger.toml"
         self.ledger.parent.mkdir(parents=True)
         self.ledger.write_text('[release]\nrepo = "owner/trust"\ntag = "exact-seed"\n')
+        # An empty atpkg store: never the person's own.
+        store = patch.object(recreate_bootstrap, "atpkg_store_prefix",
+                             return_value=self.root / "no-store")
+        store.start()
+        self.addCleanup(store.stop)
 
     def command(self, *client):
         return [*client, "release", "download", "owner/trust", "exact-seed",
@@ -429,6 +435,128 @@ class SeedFetchTransportTests(unittest.TestCase):
                 patch.object(recreate_bootstrap, "validate_seed") as validate:
             self.assertFalse(recreate_bootstrap.resolve_seed(self.root, allow_fetch=True))
         validate.assert_not_called()
+
+
+@unittest.skipUnless(sys.platform == "darwin", "atpkg hands a tree out only as APFS clones")
+class SeedStoreTests(unittest.TestCase):
+    """DC-16c: atpkg's `trust-stage0` tree is tried before agh, and the pins decide."""
+
+    date = "2026-07-13"
+    host = "aarch64-apple-darwin"
+    manifest = "5" * 64
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / "trust"
+        (self.root / "src").mkdir(parents=True)
+        self.archives = {"trustc-seed.tar.xz": b"trustc seed", "targo-seed.tar.xz": b"targo seed"}
+        pins = "".join(f"dist/{self.date}/{name}={hashlib.sha256(body).hexdigest()}\n"
+                       for name, body in sorted(self.archives.items()))
+        (self.root / "src/stage0").write_text(
+            f"compiler_channel_manifest_hash={self.manifest}\ncompiler_date={self.date}\n{pins}")
+        ledger = self.root / "bootstrap/trust-stage0/seed-ledger.toml"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text('[release]\nrepo = "owner/trust"\ntag = "exact-seed"\n')
+        self.prefix = Path(temporary.name) / "pkg"
+        store = patch.object(recreate_bootstrap, "atpkg_store_prefix", return_value=self.prefix)
+        store.start()
+        self.addCleanup(store.stop)
+        self.dist = self.root / "bootstrap/trust-stage0/dist" / self.date
+
+    def lay_tree(self, manifest=None, archives=None):
+        """A complete tree as atpkg lays one: the archives, then `<key>.ready`."""
+        inputs = ("trust-stage0-tree-key/v1\ncompiler_channel_manifest_hash "
+                  f"{manifest or self.manifest}\n")
+        key = hashlib.sha256(inputs.encode()).hexdigest()
+        tree = self.prefix / "trees.noindex/trust-stage0" / self.host / key
+        tree.mkdir(parents=True)
+        for name, body in (archives or self.archives).items():
+            (tree / name).write_bytes(body)
+        tree.with_name(key + ".ready").write_text("ok\nplatform=aarch64-macos\n")
+        return tree
+
+    def fetch(self):
+        with patch.object(recreate_bootstrap, "which", return_value="/tools/agh"), \
+                patch.object(recreate_bootstrap.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0)) as run:
+            fetched = recreate_bootstrap.fetch_seed_payloads(self.root, self.date, host=self.host)
+        return fetched, run
+
+    def test_the_store_tree_of_the_pinned_manifest_is_taken_before_agh(self):
+        tree = self.lay_tree()
+        fetched, run = self.fetch()
+        self.assertTrue(fetched)
+        run.assert_not_called()
+        for name, body in self.archives.items():
+            taken, stored = self.dist / name, tree / name
+            self.assertEqual(taken.read_bytes(), body)
+            # A clone, never a link: its own inode, and the store's file stays unlinked.
+            self.assertFalse(taken.is_symlink())
+            self.assertNotEqual(os.stat(taken).st_ino, os.stat(stored).st_ino)
+            self.assertEqual(os.stat(stored).st_nlink, 1)
+        self.assertTrue(tree.with_name(tree.name + ".used").is_file())
+        self.assertEqual(sorted(p.name for p in self.dist.iterdir()), sorted(self.archives))
+
+    def test_an_archive_that_fails_its_pin_is_left_for_agh(self):
+        self.lay_tree(archives={**self.archives, "targo-seed.tar.xz": b"not the pinned bytes"})
+        fetched, run = self.fetch()
+        self.assertTrue(fetched)
+        self.assertEqual((self.dist / "trustc-seed.tar.xz").read_bytes(), b"trustc seed")
+        self.assertFalse((self.dist / "targo-seed.tar.xz").exists())
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--asset"):command.index("--dir")],
+                         ["--asset", "targo-seed.tar.xz"])
+
+    def test_a_tree_of_another_manifest_or_unmarked_is_not_read(self):
+        self.lay_tree(manifest="6" * 64)
+        mine = self.lay_tree()
+        mine.with_name(mine.name + ".ready").unlink()
+        fetched, run = self.fetch()
+        self.assertTrue(fetched)
+        self.assertFalse(self.dist.exists() and any(self.dist.iterdir()))
+        command = run.call_args.args[0]
+        self.assertEqual(command.count("--asset"), 2)
+
+    def test_a_validated_seed_records_the_key_inputs_a_builder_packs_it_under(self):
+        self.lay_tree()
+        with patch.object(recreate_bootstrap, "validate_seed", return_value=True):
+            self.assertTrue(recreate_bootstrap.resolve_seed(self.root, allow_fetch=True,
+                                                            host=self.host))
+        inputs = (self.dist / ".trust-stage0-tree-key").read_text()
+        self.assertEqual(inputs, recreate_bootstrap.stage0_tree_key_inputs(self.root))
+        self.assertIn(f"compiler_channel_manifest_hash {self.manifest}", inputs)
+
+    def test_the_recorded_key_inputs_leave_the_checkout_clean(self):
+        repo = Path(__file__).resolve().parents[2]
+        recorded = f"bootstrap/trust-stage0/dist/{self.date}/.trust-stage0-tree-key"
+        checked = subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", recorded],
+                                 check=False)
+        self.assertEqual(checked.returncode, 0, f"{recorded} is not ignored")
+
+    def test_the_stage1_seed_switch_at_false_leaves_the_store_unread(self):
+        self.lay_tree()
+        with patch.object(recreate_bootstrap, "which", return_value="/tools/agh"), \
+                patch.object(recreate_bootstrap.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0)) as run:
+            fetched = recreate_bootstrap.fetch_seed_payloads(self.root, self.date, host=self.host,
+                                                             use_store=False)
+        self.assertTrue(fetched)
+        self.assertFalse(self.dist.exists() and any(self.dist.iterdir()))
+        command = run.call_args.args[0]
+        self.assertEqual(command.count("--asset"), 2)
+        enabled = recreate_bootstrap.stage1_seed_enabled
+        self.assertTrue(enabled(None))
+        self.assertTrue(enabled(b"[rust]\nchannel = \"dev\"\n"))
+        self.assertTrue(enabled(b"[rust]\ntrust-stage1-seed = true\n"))
+        self.assertFalse(enabled(b"[rust]\ntrust-stage1-seed = false\n"))
+        self.assertFalse(enabled(b"rust.trust-stage1-seed = false\n"))
+
+    def test_resolve_seed_passes_the_switch_to_the_fetch(self):
+        with patch.object(recreate_bootstrap, "fetch_seed_payloads", return_value=False) as fetch:
+            self.assertFalse(recreate_bootstrap.resolve_seed(self.root, allow_fetch=True,
+                                                             host=self.host, use_store=False))
+        self.assertIs(fetch.call_args.kwargs["use_store"], False)
 
 
 class FreshSeedMaterializationTests(unittest.TestCase):
@@ -650,7 +778,7 @@ class FreshSeedMaterializationTests(unittest.TestCase):
                 root, ["--check", "--stage", "2", "--require-seed", "--fresh-seed"]
             )
             self.assertEqual(status, 0, printed)
-            resolve_seed.assert_called_once_with(root, allow_fetch=False, host=self.host)
+            resolve_seed.assert_called_once_with(root, allow_fetch=False, host=self.host, use_store=True)
             self.assertIn(
                 f"\n--fresh-seed: the build sets build/{self.host}/stage0 aside and x.py hydrates "
                 "it again from the pinned archives validated above; a check sets nothing aside.\n",
@@ -1010,6 +1138,179 @@ class FreshSeedMaterializationTests(unittest.TestCase):
             "config declares 'seed'",
             stdout.getvalue(),
         )
+
+
+@unittest.skipUnless(os.name == "posix", "actual POSIX direct-child lifecycle control")
+class SubmoduleProgressBoundTests(unittest.TestCase):
+    """An acquisition ends for lack of progress, never on a total (RL-100).
+
+    The child is a real process under the real process-tree custody. It writes into
+    its stage's object directory one step at a time, and the bound's clock is the
+    test's: each reading of it is a minute later, and each measurement first lets the
+    child take its next step, so ten minutes pass in as many steps.
+    """
+
+    STEP_SECONDS = 60
+
+    CHILD = r"""
+import os, sys, time
+objects, steps = sys.argv[1], [int(word) for word in sys.argv[2:]]
+for number, count in enumerate(steps):
+    while not os.path.exists(os.path.join(objects, "..", f"step-{number}")):
+        time.sleep(0.005)
+    if count:
+        with open(os.path.join(objects, "pack", f"tmp_pack_{number}"), "wb") as stream:
+            stream.write(b"\0" * count)
+    os.replace(os.path.join(objects, "..", f"step-{number}"), os.path.join(objects, "..", f"done-{number}"))
+if os.environ.get("FIXTURE_NEVER_ENDS"):
+    print("fixture transport: waiting on a peer that sends nothing more", flush=True)
+    time.sleep(3600)
+"""
+
+    def acquire(self, directory, steps, *, never_ends=False):
+        """Run the fixture child under the progress bound; return (bound, minutes the clock ran)."""
+        stage = Path(directory) / "first-party/.trust-submodule-fixture/source"
+        objects = stage / ".git/objects"
+        (objects / "pack").mkdir(parents=True)
+        state = {"now": 0.0, "step": 0, "begun": False}
+
+        def clock():
+            state["now"] += self.STEP_SECONDS
+            return state["now"]
+
+        def measure(paths):
+            if not state["begun"]:
+                # The bound's first reading, before the child exists.
+                state["begun"] = True
+                return recreate_bootstrap._submodule_progress_bytes(paths)
+            # Let the child take its next step, then read what it left.
+            number = state["step"]
+            if number < len(steps):
+                (stage / ".git" / f"step-{number}").write_text("")
+                deadline = time.monotonic() + 30
+                while not (stage / ".git" / f"done-{number}").exists():
+                    self.assertLess(time.monotonic(), deadline, "the fixture child did not take its step")
+                    time.sleep(0.005)
+                state["step"] += 1
+            return recreate_bootstrap._submodule_progress_bytes(paths)
+
+        bound = recreate_bootstrap._SubmoduleProgress(
+            "first-party/fixture", (objects,), clock=clock, measure=measure)
+        environment = recreate_bootstrap._provenance_git_environment()
+        if never_ends:
+            environment["FIXTURE_NEVER_ENDS"] = "1"
+        with patch.object(sys, "stderr", io.StringIO()):
+            result = recreate_bootstrap._run_submodule_update_process(
+                [sys.executable, "-I", "-c", self.CHILD, str(objects), *map(str, steps)],
+                environment=environment, timeout_seconds=None, credential_gh=None, progress=bound)
+        return bound, state, result
+
+    def test_submodule_acquisition_that_keeps_receiving_outlives_the_former_600_seconds(self):
+        self.assertFalse(hasattr(recreate_bootstrap, "SUBMODULE_UPDATE_TIMEOUT_SECONDS"))
+        with tempfile.TemporaryDirectory() as directory:
+            # Forty minutes of a megabyte a minute: four times the total that ended it before.
+            bound, state, result = self.acquire(directory, [1024 * 1024] * 40)
+        self.assertEqual(result.returncode, 0)
+        self.assertGreaterEqual(state["now"], 40 * self.STEP_SECONDS)
+        self.assertGreater(state["now"], 4 * 600)
+        self.assertEqual(state["step"], 40)
+        self.assertGreaterEqual(bound.received, 39 * 1024 * 1024)
+
+    def test_submodule_acquisition_that_stalls_ends_naming_the_submodule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            started = time.monotonic()
+            with self.assertRaises(recreate_bootstrap._SubmoduleStalled) as raised:
+                # Three megabytes in three minutes, one line, then nothing written or printed.
+                self.acquire(directory, [1024 * 1024] * 3, never_ends=True)
+            elapsed = time.monotonic() - started
+        refusal = str(raised.exception)
+        self.assertRegex(refusal, r"^first-party/fixture showed too little progress: 31457\d\d bytes observed "
+                                  r"under its watched paths and on its output, "
+                                  r"0\.0 bytes/s over its last 600 s against a floor of 16 bytes/s, "
+                                  r"and none observed for the last 600 s; bytes it holds elsewhere are not seen$")
+        # The refusal reports an observation. A transport that shows nothing until its transfer
+        # is complete would read the same, so it never says the child received nothing.
+        self.assertNotRegex(refusal, r"received|stood still")
+        # It is a timeout to every caller that handles one, and the child that slept an hour is gone.
+        self.assertIsInstance(raised.exception, subprocess.TimeoutExpired)
+        self.assertLess(elapsed, 60)
+        # Ended one window after its last byte, not a window after its start.
+        self.assertEqual(raised.exception.timeout, recreate_bootstrap.SUBMODULE_STALL_WINDOW_SECONDS)
+
+    def test_submodule_acquisition_below_its_floor_rate_ends_naming_its_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(recreate_bootstrap._SubmoduleStalled) as raised:
+                # A megabyte, then 300 bytes a minute, 5 bytes/s, for as long as it is let.
+                self.acquire(directory, [1024 * 1024] + [300] * 200, never_ends=True)
+        refusal = str(raised.exception)
+        self.assertRegex(refusal, r"^first-party/fixture showed too little progress: 10515\d\d bytes observed "
+                                  r"under its watched paths and on its output, "
+                                  r"5\.0 bytes/s over its last 600 s against a floor of 16 bytes/s, "
+                                  r"and none observed for the last 0 s; bytes it holds elsewhere are not seen$")
+
+    def test_an_acquisition_that_prints_and_writes_nothing_is_ended_and_one_that_prints_is_not(self):
+        clock = {"now": 0.0}
+        bound = recreate_bootstrap._SubmoduleProgress("local Git status", clock=lambda: clock["now"])
+        bound.begin()
+        for _ in range(30):
+            clock["now"] += 30
+            bound.printed(30 * 70)  # one progress line a second
+            bound.check(["git"])
+        self.assertEqual(bound.received, 30 * 30 * 70)
+        # Then silence. It ends when its last window's average is under the floor: for 70
+        # bytes/s that is 480 s after the last line; a megabyte a second has the whole window.
+        with self.assertRaisesRegex(recreate_bootstrap._SubmoduleStalled,
+                                    r"^local Git status showed too little progress: 63000 bytes observed "
+                                    r"under its watched paths and on its output, "
+                                    r"14\.0 bytes/s over its last 600 s against a floor of 16 bytes/s, "
+                                    r"and none observed for the last 480 s; bytes it holds elsewhere are not seen$"):
+            for _ in range(21):
+                clock["now"] += 30
+                bound.check(["git"])
+        self.assertEqual(clock["now"], 900 + 480)
+
+    def test_progress_counts_growth_under_its_paths_and_never_a_shrinking_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "objects/pack").mkdir(parents=True)
+            (root / "objects/pack/tmp_pack").write_bytes(b"x" * 5000)
+            (root / "objects/link").symlink_to(root)
+            clock = {"now": 0.0}
+            bound = recreate_bootstrap._SubmoduleProgress("fixture", (root / "objects", root / "absent"),
+                                                          clock=lambda: clock["now"])
+            self.assertEqual(recreate_bootstrap._submodule_progress_bytes(bound.paths), 5000)
+            bound.begin()
+            clock["now"] += 10
+            (root / "objects/pack/tmp_pack").write_bytes(b"x" * 9000)
+            bound.check(["agh"])
+            self.assertEqual(bound.received, 4000)
+            # The transfer renames its temporary pack and drops a duplicate: not a loss.
+            clock["now"] += 10
+            (root / "objects/pack/tmp_pack").write_bytes(b"x" * 100)
+            bound.check(["agh"])
+            self.assertEqual(bound.received, 4000)
+            clock["now"] += 10
+            (root / "objects/pack/pack-1.pack").write_bytes(b"x" * 700)
+            bound.check(["agh"])
+            self.assertEqual(bound.received, 4700)
+
+    def test_whole_tree_local_git_reads_have_the_stall_window_and_small_queries_thirty_seconds(self):
+        calls = []
+
+        def run(command, **options):
+            calls.append((command, options["timeout"]))
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+        with patch.object(recreate_bootstrap.subprocess, "run", side_effect=run):
+            recreate_bootstrap._local_submodule_git(["-C", "/stage", "status", "--porcelain=v1"], whole_tree=True)
+            recreate_bootstrap._local_submodule_git(["-C", "/stage", "rev-parse", "HEAD"])
+        self.assertEqual([timeout for _command, timeout in calls],
+                         [recreate_bootstrap.SUBMODULE_STALL_WINDOW_SECONDS, 30])
+        # The two reads of every path of a checkout, where the 30 s ended a tick on 2026-11-16.
+        source = Path(recreate_bootstrap.__file__).read_text()
+        for read in ('"status", "--porcelain=v1", "--untracked-files=all", "--ignored", "--ignore-submodules=all"],\n'
+                     '                                      whole_tree=True)',
+                     '"ls-files", "--stage", "-z"], whole_tree=True)'):
+            self.assertEqual(source.count(read), 1, read)
 
 
 @unittest.skipUnless(os.name == "posix", "actual POSIX direct-child lifecycle control")
@@ -1899,7 +2200,14 @@ class SubmoduleMaterializationTests(unittest.TestCase):
                 self.assertNotIn("fetch", command)
                 self.assertNotIn("update", command)
                 self.assertIsNone(kwargs["credential_gh"])
-                self.assertEqual(kwargs["timeout_seconds"], recreate_bootstrap.SUBMODULE_UPDATE_TIMEOUT_SECONDS)
+                # No total: the checkout ends only for lack of progress in the tree it writes.
+                self.assertIsNone(kwargs["timeout_seconds"])
+                bound = kwargs["progress"]
+                self.assertEqual((bound.window, bound.floor),
+                                 (recreate_bootstrap.SUBMODULE_STALL_WINDOW_SECONDS,
+                                  recreate_bootstrap.SUBMODULE_FLOOR_BYTES_PER_SECOND))
+                self.assertEqual(bound.paths, (Path(command[command.index("-C") + 1]),))
+                self.assertIn("local Git checkout in ", bound.label)
                 self.assertEqual(kwargs["environment"]["GIT_TERMINAL_PROMPT"], "0")
                 self.assertEqual(kwargs["environment"]["GIT_NO_LAZY_FETCH"], "1")
                 self.assertIn("protocol.https.allow=never", command)
@@ -1919,7 +2227,7 @@ class SubmoduleMaterializationTests(unittest.TestCase):
             self.git(checkout, "remote", "set-url", "origin", "https://user:secret@example.invalid/trust.git")
             with patch.object(recreate_bootstrap, "_submodule_url_is_allowed", return_value=True), patch.object(
                 recreate_bootstrap, "_agh_source_fetch", side_effect=subprocess.TimeoutExpired(["agh", "repo", "fetch"],600)
-            ), self.assertRaisesRegex(RuntimeError, "Agh submodule acquisition timed out after 600s"):
+            ), self.assertRaisesRegex(RuntimeError, "Agh submodule acquisition of first-party/clean timed out"):
                 recreate_bootstrap.ensure_submodules(checkout)
             self.assertEqual(self.git(checkout, "remote", "get-url", "origin").stdout.strip(), "https://example.invalid/trust.git")
             self.assertEqual([row[0] for row in self.git(checkout,"submodule","status").stdout.splitlines()], [" ","-"])
@@ -1982,7 +2290,8 @@ class SubmoduleMaterializationTests(unittest.TestCase):
             (source/"new").write_text("different commit")
             self.git(source,"add","new");self.git(source,"commit","-qm","later")
             wrong=self.git(source,"rev-parse","HEAD").stdout.strip()
-            def acquire(url,destination,oid,private_ref):
+            def acquire(url,destination,oid,private_ref,*,scratch_parent):
+                self.assertEqual(scratch_parent,destination.parent)
                 self.git(destination,"fetch","--quiet",url,wrong+":"+private_ref)
                 return {"commit":oid}
             with patch.object(recreate_bootstrap,"_submodule_url_is_allowed",return_value=True),patch.object(
@@ -2259,6 +2568,96 @@ class SubmoduleMaterializationTests(unittest.TestCase):
             update.assert_not_called()
             self.assertFalse(marker.exists())
 
+    def declare_clean_branch(self, checkout: Path, line: str) -> None:
+        """Write one more line into clean's indexed declaration, the last section of .gitmodules."""
+        modules = checkout / ".gitmodules"
+        declared = self.git(checkout, "show", "HEAD:.gitmodules").stdout
+        self.assertTrue(declared.rstrip().endswith("clean-source"))
+        modules.write_text(declared + line + "\n", encoding="utf-8")
+        self.git(checkout, "add", ".gitmodules")
+
+    def test_an_indexed_branch_declaration_is_admitted_and_the_child_stays_at_its_gitlink(self):
+        # aterm declares vendor/astream with `branch = main`; the first train tick to reach
+        # before_cut ended there on "unsupported indexed .gitmodules key" (2026-11-17).
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = self.partial_checkout(directory)
+            source = Path(directory) / "clean-source"
+            pin = self.git(checkout, "rev-parse", ":first-party/clean").stdout.strip()
+            branch = self.git(source, "symbolic-ref", "--short", "HEAD").stdout.strip()
+            # The declared branch moves past the gitlink: `submodule update --remote` would follow it.
+            (source / "later").write_text("past the pin\n", encoding="utf-8")
+            self.git(source, "add", "later")
+            self.git(source, "commit", "--quiet", "-m", "later")
+            self.assertNotEqual(self.git(source, "rev-parse", "HEAD").stdout.strip(), pin)
+            self.declare_clean_branch(checkout, "\tbranch = " + branch)
+            with patch.object(recreate_bootstrap, "_submodule_url_is_allowed", return_value=True):
+                self.assertEqual(
+                    {(row.path.as_posix(), row.oid) for row in recreate_bootstrap._indexed_submodules(checkout)},
+                    {("first-party/ay", self.git(checkout, "rev-parse", ":first-party/ay").stdout.strip()),
+                     ("first-party/clean", pin)})
+            acquired = self.ensure_with_test_file_transport(checkout)
+            self.assertEqual([row[1] for row in acquired], [pin])
+            child = checkout / "first-party/clean"
+            self.assertEqual(self.git(child, "rev-parse", "HEAD").stdout.strip(), pin)
+            self.assertFalse((child / "later").exists())
+            self.assertTrue(all(row[0] == " " for row in self.git(checkout, "submodule", "status").stdout.splitlines()))
+
+    PLAIN_BRANCHES = (".", "main", "release/1.2", "feature_x-1", "v0.15.0")
+    UNSAFE_BRANCHES = ("", "-main", "--upload-pack=x", "+main", "main..other", "main...other", "main~1", "main^",
+                       "main^{commit}", "main:other", "@{u}", "main@{1}", "*", "a b", ".hidden", "main.", "main.lock",
+                       "main/", "/main", "a//b", "a/.b", "a/-b", "..", "refs/heads/x y", "ma\tin", "m\u00e4in",
+                       "m" * 256)
+
+    def test_a_declared_branch_is_a_plain_name_or_the_superprojects_own(self):
+        for value in self.PLAIN_BRANCHES:
+            self.assertTrue(recreate_bootstrap._submodule_branch_is_plain(value), value)
+        for value in self.UNSAFE_BRANCHES:
+            self.assertFalse(recreate_bootstrap._submodule_branch_is_plain(value), value)
+
+    def test_an_indexed_branch_that_is_not_a_plain_name_is_refused_before_agh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = self.partial_checkout(directory)
+            for value in ("-main", "main..other", "main^{commit}", "main:other", "a b", ".hidden", "main.lock"):
+                with self.subTest(value=value):
+                    self.declare_clean_branch(checkout, "\tbranch = " + value)
+                    with patch.object(recreate_bootstrap, "_submodule_url_is_allowed", return_value=True), patch.object(
+                        recreate_bootstrap, "_agh_source_fetch"
+                    ) as fetch, self.assertRaisesRegex(RuntimeError, r"unsafe indexed submodule branch") as raised:
+                        recreate_bootstrap.ensure_submodules(checkout)
+                    fetch.assert_not_called()
+                    self.assertNotIn(value, str(raised.exception))
+            self.assertEqual(list((checkout / "first-party/clean").iterdir()), [])
+
+    def test_every_other_indexed_declaration_key_is_still_refused_before_agh(self):
+        # Each changes what a command this owner does run reports or fetches.
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = self.partial_checkout(directory)
+            for line in ("\tignore = all", "\tshallow = true", "\tfetchRecurseSubmodules = true", "\tactive = false",
+                         "\tbranches = main"):
+                with self.subTest(line=line):
+                    self.declare_clean_branch(checkout, line)
+                    with patch.object(recreate_bootstrap, "_submodule_url_is_allowed", return_value=True), patch.object(
+                        recreate_bootstrap, "_agh_source_fetch"
+                    ) as fetch, self.assertRaisesRegex(RuntimeError, r"unsupported indexed \.gitmodules key"):
+                        recreate_bootstrap.ensure_submodules(checkout)
+                    fetch.assert_not_called()
+            # Two branch records for one child are a duplicate, as two URLs are.
+            self.declare_clean_branch(checkout, "\tbranch = main\n\tbranch = other")
+            with patch.object(recreate_bootstrap, "_submodule_url_is_allowed", return_value=True), patch.object(
+                recreate_bootstrap, "_agh_source_fetch"
+            ) as fetch, self.assertRaisesRegex(RuntimeError, r"duplicate indexed \.gitmodules branch record"):
+                recreate_bootstrap.ensure_submodules(checkout)
+            fetch.assert_not_called()
+
+    def test_no_owner_of_a_materialized_child_follows_a_declared_branch(self):
+        """`branch` is admitted because Git reads it only for `submodule update --remote`, which none passes."""
+        scripts = SCRIPT.parent
+        for name in ("recreate_bootstrap.py", "daily_toolchain_stage.py", "daily_dependency_git.py"):
+            words = {node.value for node in ast.walk(ast.parse((scripts / name).read_text(encoding="utf-8")))
+                     if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+            self.assertFalse({"--remote", "--remote-submodules"} & words, name)
+        self.assertNotIn("--remote", (scripts / "submodule_sync.sh").read_text(encoding="utf-8"))
+
     def test_hostile_local_update_command_is_rejected_before_initialization(self):
         with tempfile.TemporaryDirectory() as directory:
             checkout = self.partial_checkout(directory)
@@ -2380,6 +2779,75 @@ class SubmoduleMaterializationTests(unittest.TestCase):
                 with patch.object(recreate_bootstrap, "repo_root", return_value=repository):
                     with self.assertRaisesRegex(RuntimeError, r"hidden execution"):
                         recreate_bootstrap._run_git_read(repository, ["rev-parse", "--verify", "HEAD"])
+
+    def test_the_installed_ssh_keepalive_is_admitted_with_the_hooks_path_on_a_trust_root_only(self):
+        # scripts/install-git-hooks.sh writes both into the clone it installs the push hook in.
+        # A gate that kept the hooks path and refused the keepalive refused every such clone:
+        # the train's landing worktree at its first read (2026-11-17), and this recreator in a
+        # developer's hook-installed checkout.
+        keepalive = recreate_bootstrap.INSTALLED_SSH_KEEPALIVE_COMMAND
+        declared = re.search(r'^TRUST_SSH_KEEPALIVE_COMMAND="([^"]*)"$',
+                             (SCRIPT.parent / "hooks/_ssh_keepalive.sh").read_text(encoding="utf-8"), re.MULTILINE)
+        self.assertIsNotNone(declared)
+        self.assertEqual(declared.group(1), keepalive)
+        # No command of this owner can run it: ssh is denied by name on every one.
+        self.assertIn("protocol.ssh.allow=never", recreate_bootstrap.CONTROLLED_GIT_CONFIG_OVERRIDES)
+        self.assertIn("protocol.ssh.allow=never", recreate_bootstrap._controlled_git_command([]))
+        read = ["rev-parse", "--verify", "HEAD"]
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            self.create_repository(repository, "installed-keepalive")
+            linked = Path(directory) / "linked"
+            self.git(repository, "worktree", "add", "--quiet", "--detach", str(linked))
+            self.git(repository, "config", "core.hooksPath", "scripts/hooks")
+            self.git(repository, "config", "core.sshCommand", keepalive)
+            config = (repository / ".git/config").read_bytes()
+            # Any other repository still refuses both: a child, a sibling, a snapshot.
+            for checkout in (repository, linked):
+                with self.subTest(refused=checkout), self.assertRaisesRegex(
+                        RuntimeError, r"local:core\.hookspath, local:core\.sshcommand"):
+                    recreate_bootstrap._run_git_read(checkout, read)
+            # The recreator's own root keeps what its installer wrote.
+            with patch.object(recreate_bootstrap, "repo_root", return_value=repository):
+                recreate_bootstrap._run_git_read(repository, read)
+            # So does a checkout a caller admits (the train's landing worktree), and only it.
+            with recreate_bootstrap.admitted_trust_checkout(linked):
+                recreate_bootstrap._run_git_read(linked, read)
+                with self.assertRaisesRegex(RuntimeError, r"local:core\.sshcommand"):
+                    recreate_bootstrap._run_git_read(repository, read)
+            with self.assertRaisesRegex(RuntimeError, r"local:core\.sshcommand"):
+                recreate_bootstrap._run_git_read(linked, read)
+            self.assertEqual((repository / ".git/config").read_bytes(), config)
+
+    def test_any_other_ssh_command_is_refused_on_a_trust_root(self):
+        keepalive = recreate_bootstrap.INSTALLED_SSH_KEEPALIVE_COMMAND
+        settings = (
+            (("local", "/usr/bin/false"),),
+            (("local", "ssh"),),
+            (("local", keepalive + " -o ProxyCommand=/usr/bin/false"),),
+            (("local", keepalive + " -i /tmp/key"),),
+            (("local", "/opt/other/" + keepalive),),
+            (("local", keepalive.replace("=30", "=31")),),
+            (("local", "ssh -o ServerAliveCountMax=10 -o ServerAliveInterval=30"),),
+            (("local", keepalive + "; /usr/bin/false"),),
+            # One admitted value does not carry a second.
+            (("local", keepalive), ("local", "/usr/bin/false")),
+            # The installer writes the clone's own config, never a worktree scope.
+            (("worktree", keepalive),),
+        )
+        for values in settings:
+            with self.subTest(values=values), tempfile.TemporaryDirectory() as directory:
+                repository = Path(directory) / "repository"
+                self.create_repository(repository, "other-ssh-command")
+                self.git(repository, "config", "extensions.worktreeConfig", "true")
+                for scope, value in values:
+                    self.git(repository, "config", f"--{scope}", "--add", "core.sshCommand", value)
+                with patch.object(recreate_bootstrap, "repo_root", return_value=repository), self.assertRaisesRegex(
+                        RuntimeError, r"hidden execution.*core\.sshcommand"):
+                    recreate_bootstrap._run_git_read(repository, ["rev-parse", "--verify", "HEAD"])
+                with recreate_bootstrap.admitted_trust_checkout(repository), self.assertRaisesRegex(
+                        RuntimeError, r"hidden execution.*core\.sshcommand"):
+                    recreate_bootstrap._run_git_read(repository, ["rev-parse", "--verify", "HEAD"])
 
     def test_source_root_worktree_exception_refuses_unknown_enabled_and_duplicate_values(self):
         settings = (
@@ -11866,10 +12334,13 @@ class NativeToolPrerequisiteTests(unittest.TestCase):
             self.assertIn(sentence, text)
         # Every scratch owner must be named in the check's help contract.
         validation = SCRIPT.with_name("check_seed_freshness.py").read_text(encoding="utf-8")
-        for source, users in ((SCRIPT.read_text(encoding="utf-8"), 3), (validation, 1)):
-            # Each source's own mentions: the recreator's two are the schema
-            # probe and the submodule materialization, which a check never
-            # reaches (main() returns before ensure_submodules()).
+        for source, users in ((SCRIPT.read_text(encoding="utf-8"), 4), (validation, 1)):
+            # Each source's own mentions: the recreator's four are the seed
+            # runtime inspection and the schema probe, which the help names,
+            # and the submodule materialization's container and the transfer
+            # directory _agh_transfer_paths gives Agh, which a check never
+            # reaches (main() returns before ensure_submodules(), and
+            # fetch-source-pin is a command of its own).
             self.assertEqual(
                 len(re.findall(r"\btempfile\.(?:TemporaryDirectory|mkdtemp|mkstemp|NamedTemporaryFile)\(", source)),
                 users,
@@ -12081,7 +12552,8 @@ class AtpkgStage0AuthorityTests(unittest.TestCase):
         ) as seed, patch.object(recreate_bootstrap, "find_python_ge_311", return_value=sys.executable):
             selected = self.select("--fresh-seed", "--require-seed", "--no-fetch")
             config = recreate_bootstrap.write_config(self.root, "test-host", False, selection=selected).path
-        seed.assert_called_once_with(self.root, allow_fetch=False, host=recreate_bootstrap.host_triple())
+        seed.assert_called_once_with(self.root, allow_fetch=False, host=recreate_bootstrap.host_triple(),
+                                     use_store=True)
         self.assertEqual(selected.mode, "seed")
         self.assertIn("(seed stage0 mode)", config.read_text())
         self.assertNotIn(str(self.pack), config.read_text())
@@ -12136,6 +12608,14 @@ class AtpkgStage0AuthorityTests(unittest.TestCase):
         self.assertEqual(selected.mode, "seed")
         self.assertEqual(config.read_bytes(), original)
 
+    def test_selection_reads_the_stage1_seed_switch_of_the_existing_config(self):
+        # DC-16c: `rust.trust-stage1-seed = false` keeps atpkg's store out of the seed too.
+        config = self.config("seed")
+        config.write_text(config.read_text() + "[rust]\ntrust-stage1-seed = false\n")
+        with patch.object(recreate_bootstrap, "resolve_seed", return_value=True) as seed:
+            self.assertEqual(self.select("--require-seed").mode, "seed")
+        self.assertIs(seed.call_args.kwargs["use_store"], False)
+
     def test_selection_existing_seed_unavailable_never_silently_falls_back(self):
         self.config("seed")
         with patch.object(recreate_bootstrap, "resolve_seed", return_value=False):
@@ -12154,7 +12634,8 @@ class AtpkgStage0AuthorityTests(unittest.TestCase):
         self.verify_result.stdout = "not an exact tree match\n"
         with patch.object(recreate_bootstrap, "resolve_seed", return_value=True) as seed:
             self.assertEqual(self.select("--require-seed").mode, "seed")
-        seed.assert_called_once_with(self.root, allow_fetch=True, host=recreate_bootstrap.host_triple())
+        seed.assert_called_once_with(self.root, allow_fetch=True, host=recreate_bootstrap.host_triple(),
+                                     use_store=True)
         with patch.object(recreate_bootstrap, "resolve_seed", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "refusing genesis fallback"):
                 self.select("--require-seed")
@@ -13211,7 +13692,81 @@ class AtpkgStage0Tests(unittest.TestCase):
                 )
 
 
+class LLVMZstdInputConfigTests(unittest.TestCase):
+    HOST = "test-host"
+
+    def write(self, root, force=False, **kwargs):
+        with patch.object(recreate_bootstrap.platform, "system", return_value="Unknown"), \
+                patch.object(recreate_bootstrap, "find_python_ge_311", return_value=sys.executable), \
+                patch.object(sys, "stdout", io.StringIO()):
+            return recreate_bootstrap.write_config(root, self.HOST, force, seed_mode=True, **kwargs)
+
+    def test_explicit_metadata_directory_round_trips_spaces_and_quotes(self):
+        import tomllib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / 'native "zstd" metadata'
+            metadata.mkdir()
+            (metadata / "libzstd.pc").write_text("Name: zstd\n")
+            written = self.write(root, llvm_zstd_pkg_config_dir=str(metadata))
+            config = tomllib.loads(written.path.read_text())
+            self.assertEqual(config["target"][self.HOST]["llvm-zstd-pkg-config-dir"], str(metadata))
+            self.assertNotIn("PKG_CONFIG_PATH", written.path.read_text())
+
+    def test_missing_or_relative_metadata_refuses_before_config_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty = root / "empty"
+            empty.mkdir()
+            for invalid in ("relative", str(root / "absent"), str(empty)):
+                with self.subTest(path=invalid), self.assertRaisesRegex(RuntimeError, "containing libzstd.pc"):
+                    self.write(root, llvm_zstd_pkg_config_dir=invalid)
+                self.assertFalse((root / "bootstrap.toml").exists())
+
+    def test_existing_config_cannot_silently_ignore_a_new_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = self.write(root)
+            before = original.path.read_bytes()
+            metadata = root / "metadata"
+            metadata.mkdir()
+            (metadata / "libzstd.pc").write_text("Name: zstd\n")
+            with self.assertRaisesRegex(RuntimeError, "different LLVM zstd input"):
+                self.write(root, llvm_zstd_pkg_config_dir=str(metadata))
+            self.assertEqual(original.path.read_bytes(), before)
+            selected = self.write(root, force=True, llvm_zstd_pkg_config_dir=str(metadata))
+            reused = self.write(root, llvm_zstd_pkg_config_dir=str(metadata))
+            self.assertEqual(selected.sha256, reused.sha256)
+
+    def test_cli_preserves_explicit_native_dependency_input(self):
+        path = '/native zstd/metadata'
+        args = recreate_bootstrap.parse_args(["--llvm-zstd-pkg-config-dir", path])
+        self.assertEqual(args.llvm_zstd_pkg_config_dir, path)
+        with patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit):
+            recreate_bootstrap.parse_args(["--llvm-zstd-pkg-config-dir", ""])
+
+
 class DarwinNativeCompilerConfigTests(unittest.TestCase):
+    def external_llvm(self, root, *, clang_version="23.1.5", with_clang=True, clang_exit=0,
+                      lld_version="23.1.5", with_lld=True, lld_exit=0):
+        # Metadata-only executable fixtures for config selection, not LLVM or
+        # compiler qualification. The actual static LLVM link has its own run.
+        tools = root / "external llvm" / "bin"
+        tools.mkdir(parents=True)
+        config = tools / "llvm-config"
+        config.write_text("#!/bin/sh\nif [ \"$1\" = --bindir ]; then\n"
+                          f"  printf '%s\\n' '{tools}'\nelse\n  printf '23.1.5\\n'\nfi\n")
+        config.chmod(0o755)
+        if with_clang:
+            clang = tools / "clang"
+            clang.write_text(f"#!/bin/sh\nprintf 'clang version {clang_version}\\n'\nexit {clang_exit}\n")
+            clang.chmod(0o755)
+        if with_lld:
+            linker = tools / "ld64.lld"
+            linker.write_text(f"#!/bin/sh\nprintf 'LLD {lld_version}\\n'\nexit {lld_exit}\n")
+            linker.chmod(0o755)
+        return config, tools / "clang"
+
     def generated(self, root, host, llvm_config=None):
         with patch.object(recreate_bootstrap.platform, "system", return_value="Darwin"), \
                 patch.object(recreate_bootstrap, "find_python_ge_311", return_value=sys.executable), \
@@ -13242,17 +13797,96 @@ class DarwinNativeCompilerConfigTests(unittest.TestCase):
 
     def test_native_compiler_selection_keeps_the_explicit_external_llvm(self):
         with tempfile.TemporaryDirectory() as directory:
-            written = self.generated(Path(directory), "aarch64-apple-darwin", "/external llvm/bin/llvm-config")
+            root = Path(directory)
+            llvm, clang = self.external_llvm(root)
+            written = self.generated(root, "aarch64-apple-darwin", str(llvm))
             import tomllib
             config = tomllib.loads(written.path.read_text())
             target = config["target"]["aarch64-apple-darwin"]
             self.assertEqual(target.get("cc"), "/usr/bin/clang")
-            self.assertEqual(target["llvm-config"], "/external llvm/bin/llvm-config")
+            self.assertEqual(target.get("cxx"), "/usr/bin/clang++")
+            self.assertEqual(target["llvm-config"], str(llvm))
+            self.assertEqual(target["linker"], str(clang))
+            self.assertEqual(config["llvm"]["use-linker"], str(clang.with_name("ld64.lld")))
             cross = config["target"]["x86_64-apple-darwin"]
             self.assertEqual(cross["cc"], "/usr/bin/clang")
+            self.assertEqual(cross["linker"], str(clang))
             self.assertNotIn("llvm-config", cross)
             self.assertEqual(config["rust"]["codegen-backends"], ["llvm", "trust-cg"])
             self.assertEqual(config["build"]["target"], list(recreate_bootstrap.APPLE_TARGETS))
+            self.assertNotIn("rustflags", target)
+            self.assertNotIn("rustflags", cross)
+
+    def test_external_llvm_without_its_driver_refuses_before_writing_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            llvm, _ = self.external_llvm(root, with_clang=False)
+            with self.assertRaisesRegex(RuntimeError, "matching executable Clang driver"):
+                self.generated(root, "aarch64-apple-darwin", str(llvm))
+            self.assertFalse((root / "bootstrap.toml").exists())
+
+    def test_external_llvm_without_its_native_linker_refuses_before_writing_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            llvm, _ = self.external_llvm(root, with_lld=False)
+            with self.assertRaisesRegex(RuntimeError, "matching executable Mach-O linker"):
+                self.generated(root, "aarch64-apple-darwin", str(llvm))
+            self.assertFalse((root / "bootstrap.toml").exists())
+
+    def test_external_llvm_native_linker_version_mismatch_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            llvm, _ = self.external_llvm(root, lld_version="21.1.0")
+            with self.assertRaisesRegex(RuntimeError, "no system-linker fallback"):
+                self.generated(root, "aarch64-apple-darwin", str(llvm))
+            self.assertFalse((root / "bootstrap.toml").exists())
+
+    def test_failed_native_linker_probe_cannot_authorize_matching_version_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            llvm, _ = self.external_llvm(root, lld_exit=1)
+            with self.assertRaisesRegex(RuntimeError, "matching executable Mach-O linker"):
+                self.generated(root, "aarch64-apple-darwin", str(llvm))
+            self.assertFalse((root / "bootstrap.toml").exists())
+
+    def test_external_llvm_driver_version_mismatch_does_not_fall_back_to_apple(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            llvm, _ = self.external_llvm(root, clang_version="22.1.0")
+            with self.assertRaisesRegex(RuntimeError, "no system-linker fallback"):
+                self.generated(root, "aarch64-apple-darwin", str(llvm))
+            self.assertFalse((root / "bootstrap.toml").exists())
+
+    def test_failed_driver_probe_cannot_authorize_the_matching_version_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            llvm, _ = self.external_llvm(root, clang_exit=1)
+            with self.assertRaisesRegex(RuntimeError, "matching executable Clang driver"):
+                self.generated(root, "aarch64-apple-darwin", str(llvm))
+            self.assertFalse((root / "bootstrap.toml").exists())
+
+    def test_external_llvm_launcher_uses_reported_bindir_not_its_own_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            llvm, clang = self.external_llvm(root)
+            launcher = root / "llvm-config-launcher"
+            launcher.write_text(llvm.read_text())
+            launcher.chmod(0o755)
+            written = self.generated(root, "aarch64-apple-darwin", str(launcher))
+            import tomllib
+            target = tomllib.loads(written.path.read_text())["target"]["aarch64-apple-darwin"]
+            self.assertEqual(target["linker"], str(clang))
+
+    def test_external_llvm_relative_or_multiple_bindirs_refuse_before_writing(self):
+        for output in ("relative/bin", "/first\\n/second"):
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                llvm, _ = self.external_llvm(root)
+                llvm.write_text("#!/bin/sh\nif [ \"$1\" = --bindir ]; then\n"
+                                f"  printf '{output}\\n'\nelse\n  printf '23.1.5\\n'\nfi\n")
+                with self.assertRaisesRegex(RuntimeError, "one absolute bindir"):
+                    self.generated(root, "aarch64-apple-darwin", str(llvm))
+                self.assertFalse((root / "bootstrap.toml").exists())
 
     def test_non_apple_target_does_not_gain_apple_tool_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -13269,7 +13903,9 @@ class DarwinNativeCompilerConfigTests(unittest.TestCase):
             content = ('# (seed stage0 mode)\n[build]\n'
                        '[target.aarch64-apple-darwin]\ncc = "/selected/clang"\n')
             config.write_text(content)
-            written = self.generated(root, "aarch64-apple-darwin")
+            with patch.object(recreate_bootstrap, "_native_tool_record",
+                              side_effect=AssertionError("existing config must not rediscover LLVM")):
+                written = self.generated(root, "aarch64-apple-darwin", "/unavailable/llvm-config")
             self.assertEqual(config.read_text(), content)
             self.assertEqual(written.sha256, hashlib.sha256(content.encode()).hexdigest())
 
@@ -15182,12 +15818,141 @@ class AghSourceTransportTests(unittest.TestCase):
                  argv[6] + ":" + argv[8])
 
     def fetch(self, source=None, *, url="https://github.com/fixture/source.git", private_ref=None,
-              execute=None, checkout_cache=None):
+              execute=None, checkout_cache=None, **options):
         with patch.object(recreate_bootstrap, "which", return_value=str(self.agh)):
             return recreate_bootstrap._agh_source_fetch(
                 url, self.destination, source or self.second, private_ref or self.ref,
-                execute=execute or self.acquire, checkout_cache=checkout_cache,
+                execute=execute or self.acquire, checkout_cache=checkout_cache, **options,
             )
+
+    def scratch_agh(self, steps: int, *, then_sleep: bool = False) -> Path:
+        """An Agh stand-in that writes its transfer under TMPDIR, as agh 0.206.0 does, and moves
+        the commit into the destination only afterwards. With no TMPDIR it writes elsewhere,
+        where agh 0.206.0 wrote when the recreator gave it none: the system temporary folder."""
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir(exist_ok=True)
+        body = self.root / "scratch-agh.py"
+        body.write_text(
+            "import os, subprocess, sys, time\n"
+            f"scratch = os.environ.get('TMPDIR') or {str(elsewhere)!r}\n"
+            "work = os.path.join(scratch, '.ubd', 'agh-git-fixture.noindex', 'scratch.git')\n"
+            "os.makedirs(work, exist_ok=True)\n"
+            "with open(os.path.join(work, 'tmp_pack'), 'wb') as pack:\n"
+            f"    for _ in range({steps}):\n"
+            "        pack.write(b'x' * 4096)\n"
+            "        pack.flush()\n"
+            "        time.sleep(0.1)\n"
+            + ("time.sleep(600)\n" if then_sleep else "")
+            + f"subprocess.run([{shutil.which('git')!r}, '-c', 'protocol.file.allow=always', '-C', sys.argv[4],\n"
+            f"                'fetch', '--quiet', '--no-tags', {str(self.server)!r}, sys.argv[6] + ':' + sys.argv[8]],\n"
+            "               check=True)\n")
+        agh = self.root / "scratch-agh"
+        agh.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -I {shlex.quote(str(body))} \"$@\"\n")
+        agh.chmod(0o700)
+        return agh
+
+    def scratch_fetch(self, agh: Path, parent: Path) -> tuple[list, object]:
+        """_agh_source_fetch through the real process owner, under a one-second stall window."""
+        bounds = []
+        real = recreate_bootstrap._SubmoduleProgress
+
+        def bound(label, paths):
+            bounds.append(real(label, paths, window=1.0))
+            return bounds[-1]
+        with patch.object(recreate_bootstrap, "which", return_value=str(agh)), \
+                patch.object(recreate_bootstrap, "_SubmoduleProgress", bound), \
+                patch.object(sys, "stderr", io.StringIO()):
+            try:
+                return bounds, recreate_bootstrap._agh_source_fetch(
+                    "https://github.com/fixture/source.git", self.destination, self.second, self.ref,
+                    scratch_parent=parent)
+            except BaseException as error:
+                return bounds, error
+
+    def test_agh_writing_only_in_its_scratch_is_watched_there_and_its_scratch_removed(self):
+        # agh 0.206.0 does a checkout closure's whole download in its own scratch under TMPDIR
+        # and moves it into the destination when it is complete. Watching the destination alone,
+        # the bound ended alabsystems/clean's fetch three times on 2026-11-16 and 2026-11-17
+        # while it received 12.5 MB/s: "0.0 bytes/s over its last 600 s".
+        parent = self.root / "scratch-parent"
+        parent.mkdir()
+        bounds, record = self.scratch_fetch(self.scratch_agh(40), parent)  # four windows of steady writes
+        self.assertIsInstance(record, dict, record)
+        self.assertEqual(record["commit"], self.second)
+        [bound] = bounds
+        self.assertEqual(bound.paths[0], self.destination)
+        self.assertEqual(bound.paths[1].parent, parent.resolve())
+        self.assertGreaterEqual(bound.received, 30 * 4096)
+        # A transfer that completed leaves no scratch, and nothing is left elsewhere.
+        self.assertEqual(list(parent.iterdir()), [])
+        self.assertEqual(list((self.root / "elsewhere").iterdir()), [])
+        self.assertEqual(self.git(self.destination, "rev-parse", self.ref), self.second)
+
+    def test_an_agh_ended_for_too_little_progress_keeps_its_scratch_in_its_callers_folder(self):
+        parent = self.root / "scratch-parent"
+        parent.mkdir()
+        bounds, error = self.scratch_fetch(self.scratch_agh(1, then_sleep=True), parent)
+        self.assertIsInstance(error, recreate_bootstrap._SubmoduleStalled)
+        self.assertRegex(str(error), r"^Agh's fetch of fixture/source showed too little progress: 4096 bytes observed")
+        # What it wrote is kept, in the folder its caller reclaims, not the system temporary
+        # directory, where ended Aghs had left 556 scratch directories, 30.7 GB, by 2026-11-17.
+        [scratch] = parent.iterdir()
+        self.assertEqual(bounds[0].paths, (self.destination, scratch.resolve()))
+        self.assertEqual((scratch / ".ubd/agh-git-fixture.noindex/scratch.git/tmp_pack").stat().st_size, 4096)
+        self.assertEqual(list((self.root / "elsewhere").iterdir()), [])
+        self.assertEqual(self.git(self.destination, "for-each-ref"), "")
+
+    def test_an_injected_executor_makes_its_own_transfer_directory(self):
+        with self.assertRaisesRegex(RuntimeError, "makes its own transfer directory"):
+            self.fetch(execute=lambda *_: self.fail("Agh started"), scratch_parent=self.root)
+    def test_private_transfer_growth_counts_and_unrelated_growth_still_stalls(self):
+        observed = []
+        def transport(argv, *, environment, progress, **kwargs):
+            scratch = Path(environment["TMPDIR"]).resolve()
+            observed.append(scratch)
+            self.assertEqual(progress.paths, (self.destination, scratch))
+            if os.name != "nt":
+                self.assertEqual(scratch.stat().st_mode & 0o777, 0o700)
+            now = [0.0]
+            progress._clock = lambda: now[0]
+            progress.begin()
+            # Only Agh's private pack grows. Its destination and output remain still.
+            (scratch / "incoming.pack").write_bytes(b"x" * 12000)
+            now[0] += progress.window
+            progress.check(argv)
+            self.assertEqual(progress.received, 12000)
+            # A sibling outside both owned paths cannot keep a stalled transfer alive.
+            (self.root / "unrelated.pack").write_bytes(b"y" * 12000)
+            now[0] += progress.window
+            with self.assertRaises(recreate_bootstrap._SubmoduleStalled):
+                progress.check(argv)
+            self.acquire(argv, environment)
+            return subprocess.CompletedProcess(argv, 0)
+        with patch.object(recreate_bootstrap, "which", return_value=str(self.agh)), \
+             patch.object(recreate_bootstrap, "_run_submodule_update_process", side_effect=transport):
+            record = recreate_bootstrap._agh_source_fetch(
+                "https://github.com/fixture/source.git", self.destination, self.second, self.ref)
+        self.assertEqual(record["commit"], self.second)
+        self.assertFalse(observed[0].exists())
+
+    def test_failed_transfer_keeps_its_private_files_and_counts_nested_destination_once(self):
+        observed = []
+        def interrupted(argv, *, environment, progress, **kwargs):
+            scratch = Path(environment["TMPDIR"])
+            observed.append(scratch)
+            self.assertEqual(progress.paths, (self.destination,))
+            (scratch / "incoming.pack").write_bytes(b"unfinished")
+            return subprocess.CompletedProcess(argv, -9)
+
+        with patch.object(tempfile, "tempdir", str(self.destination)), \
+             patch.object(recreate_bootstrap, "which", return_value=str(self.agh)), \
+             patch.object(recreate_bootstrap, "_run_submodule_update_process", side_effect=interrupted), \
+             patch("sys.stderr", new_callable=io.StringIO) as diagnostics:
+            with self.assertRaisesRegex(RuntimeError, "exit -9"):
+                recreate_bootstrap._agh_source_fetch(
+                    "https://github.com/fixture/source.git", self.destination, self.second, self.ref)
+        self.assertEqual((observed[0] / "incoming.pack").read_bytes(), b"unfinished")
+        self.assertIn(str(observed[0]), diagnostics.getvalue())
 
     def test_checkout_cache_keeps_exact_source_and_private_destination(self):
         record = self.fetch(checkout_cache=self.server)
@@ -15251,6 +16016,15 @@ class AghSourceTransportTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fixture Agh operation refused"):
             self.fetch(execute=refusal)
         self.assertEqual(self.git(self.destination, "for-each-ref"), "")
+
+    def test_failed_executor_refuses_even_when_the_exact_ref_exists(self):
+        def failed(argv, env):
+            self.acquire(argv, env)
+            return subprocess.CompletedProcess(argv, 19)
+
+        with self.assertRaisesRegex(RuntimeError, r"owner-routed Agh source fetch failed \(exit 19\)"):
+            self.fetch(execute=failed)
+        self.assertEqual(self.git(self.destination, "rev-parse", self.ref), self.second)
 
     def test_changed_client_refuses_before_any_selected_commit_is_used(self):
         def change(argv, env):
@@ -15323,8 +16097,43 @@ class AghSourceTransportTests(unittest.TestCase):
         for command, kwargs in calls:
             self.assertEqual(command[5:], ["--ref", self.second, "--into", private_ref,
                                            "--checkout-closure"])
-            self.assertEqual(kwargs["timeout_seconds"], 600)
+            # No total: the repair's fetch ends only for lack of progress in the checkout it fills.
+            self.assertIsNone(kwargs["timeout_seconds"])
+            private = Path(kwargs["environment"]["TMPDIR"]).resolve()
+            self.assertEqual(kwargs["progress"].paths, (Path(command[4]), private))
+            self.assertFalse(private.exists())
+            self.assertEqual((kwargs["progress"].window, kwargs["progress"].floor),
+                             (recreate_bootstrap.SUBMODULE_STALL_WINDOW_SECONDS,
+                              recreate_bootstrap.SUBMODULE_FLOOR_BYTES_PER_SECOND))
             self.assertIsNone(kwargs["credential_gh"])
+
+    def test_native_exact_pin_fetch_asks_agh_for_no_filtered_closure(self):
+        # A store other checkouts read must not receive the blob-filtered
+        # selected-checkout closure (scripts/submodule_sync.sh, shared store).
+        private_ref = "refs/agh/trust-source-pins/" + self.second
+        calls = []
+
+        def provider(command, **kwargs):
+            calls.append(command)
+            self.git(self.destination, "fetch", "--quiet", "--no-tags", str(self.server),
+                     self.second + ":" + private_ref)
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(recreate_bootstrap, "which", return_value=str(self.agh)), \
+                patch.object(recreate_bootstrap, "_run_submodule_update_process", side_effect=provider):
+            self.assertEqual(recreate_bootstrap.fetch_source_pin_main([
+                "--url", "https://github.com/fixture/source.git", "--directory", str(self.destination),
+                "--pin", self.second, "--native-exact",
+            ]), 0)
+        self.assertEqual([command[5:] for command in calls],
+                         [["--ref", self.second, "--into", private_ref]])
+        with patch.object(recreate_bootstrap, "which", return_value=str(self.agh)):
+            with self.assertRaisesRegex(RuntimeError, "native exact fetch takes no checkout closure"):
+                recreate_bootstrap._agh_source_fetch(
+                    "https://github.com/fixture/source.git", self.destination, self.second,
+                    self.ref, execute=self.acquire, checkout_closure=True, native_exact=True,
+                )
+        self.assertEqual(self.calls, [])
 
     def test_pin_repair_preserves_a_conflicting_existing_private_ref(self):
         self.fetch()

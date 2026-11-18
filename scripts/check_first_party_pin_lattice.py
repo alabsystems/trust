@@ -92,7 +92,10 @@ followed by the command that fixes it, then `PIN LATTICE OK` (exit 0) or
 The move procedure that makes the lattice green again is written down in
 docs/first-party-pin-ledger.md, "Pin lattice". Roadmap increment WS8.2;
 closes the pin half of F-118. Required since the train-T0 realignment landed
-on 2026-09-28; the live manifest records `required=true`, `last_green=2026-09-30`.
+on 2026-09-28; the live manifest records `required=true`, `last_green=2026-09-30`
+for the `fast` diagnostic profile. Commit 39b35cb9f749b021d8ebf3eb07035cdd23ddd205
+removed this row from ordinary `push`; unresolved findings remain diagnostics,
+not a passing full lattice or checker claim.
 
 Python 3.11+ is required (tomllib); under an older `python3` the script
 re-executes itself with the newest python3.1x on PATH, and fails closed if

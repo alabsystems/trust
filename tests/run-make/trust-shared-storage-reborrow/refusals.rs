@@ -58,3 +58,14 @@ pub fn empty_array_with_disjoint_mutation(count: i32) -> usize {
     bump(&mut other);
     read_empty(&value)
 }
+
+fn touch_raw_pointer(_: &mut *const u32) {}
+
+pub fn raw_parameter_with_mutable_borrow(mut value: *const u32) -> bool {
+    touch_raw_pointer(&mut value);
+    std::ptr::eq(&value, &value)
+}
+
+pub fn raw_parameter_address_escape(value: *const u32) -> *const *const u32 {
+    &value as *const *const u32
+}

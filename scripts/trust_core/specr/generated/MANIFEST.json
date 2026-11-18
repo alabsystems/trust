@@ -24,22 +24,22 @@
   }
  },
  "translator": {
-  "PreludeVectors.lean": "9c78ba45db875f3b697d78b304909cf78dd148200621e16b48cdd511813673fa",
+  "PreludeVectors.lean": "812206f91c5159013dce3a51eb1ce19250a84e106c1cd9c13191159a9a7da04a",
   "SliceVectors.lean": "e8f9dc49d09654f43b4b754ea2012dd77f9fc1b9946549ca8ff38e558479b1aa",
-  "SpecrPrelude.lean": "fd4c2c087ad5ea40c6b64431cac066812d3e5def64ed0f80cbf1083fe698ed39",
+  "SpecrPrelude.lean": "c66f7b7197384e328dc7192fc48b62b5ae5c3a3ee04e09298e2f0c4dd20e1cfd",
   "conformance/mrjson.py": "fba8799230c07462807b9642af9b3f3bc31cb5195639c881f1a4a575f4831e61",
   "conformance/records2clean.py": "25ece352a89e34ad8e00e95637c99a00c2fe3737a3bcd5048d8e91c8aad25719",
   "conformance/select_slice.py": "4a5c1e8372a83d79dae2ae505bed1edc3393500983afa453f01a72f8fcf78511",
   "conformance/summarize.py": "f809936ceba627c7426fc057121eb408c1b6f803a407ebe4ae82f3599e6a2fd8",
-  "regen.py": "0653e5b196bae486d50f0f7498a9a670f318d32a9d4e543186af779c34932fb8",
+  "regen.py": "cedffd42646766288ad54ee0dee7cf00b15f279b82e42a3b7e9e0fc95f1f30e5",
   "slice.json": "7db4ab1c284d65e70ba1f4e87a8eb70eea9ace87adacc8772d5c85cb61184be5",
   "specr2clean/calls.py": "7b3213b0e87d870369082468064daed34c1eff97a1f4b9aa68b37258045aeb42",
   "specr2clean/common.py": "fc53d80c989aa6c2b97f9eaabb9b040d405ef5abe1babee4043aa61ae74be7d0",
   "specr2clean/emit_fns.py": "8b4847316240ba71de22035b69d6c79a923ed85c02d387f404ad2b0b629da81a",
   "specr2clean/emit_types.py": "6a49d1fec4edfffb7e4cc82969636303c7766f635d168d4c71a8657c31542fe8",
-  "specr2clean/items.py": "c50dc56c295f4c754b8625a1fea4f5cfd971c004617401964fcff6dfbae4d139",
+  "specr2clean/items.py": "4283d4cbecad1f9d7cadb06102b5e530bf4c5bf69380fbf2addee2cff67401a7",
   "specr2clean/lower.py": "381e385e090da2f058a13151d374f8496f5ec315e6d981761f308e761271b583",
   "specr2clean/specr2clean.py": "0005c470c9155735f933122fb9808b2e38436425fa65b3ae52662fb2822d2f8d",
-  "specr2clean/tyres.py": "1535b54034caa9c89f652e17ef64cf65f2ee17f0296e4dcff8bb625765eaa9e9"
+  "specr2clean/tyres.py": "c76740943708d4c7b7ce2c917fb3adf0dd1b7df025ae582a0688b72769ac411f"
  }
 }

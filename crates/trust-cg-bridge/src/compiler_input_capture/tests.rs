@@ -480,19 +480,27 @@ fn actual_archive_member_replays_original_in_fresh_child_without_proof_productio
     });
 }
 
+#[path = "migration_tests.rs"]
+mod migration_tests;
+
 #[test]
 fn frozen_old_modules_without_current_layout_table_remain_noncanonical() {
     let cases: &[(&[u8], &str)] = &[
-        (include_bytes!("../../tests/fixtures/signed_o0_original/compiler-input.json"),
-         "8b0fea9f81e69a36adab955bcb2bb3ad158aaaf1ebe63c20439da1944199f104"),
-        (include_bytes!("../compiler_frame_inputs/actual-b8-caller-input.json"),
-         "fccc4c260617ebf86cc83a8bf32e56a17957aeb48949ea17050a997f116a2dae"),
+        (
+            include_bytes!("../../tests/fixtures/signed_o0_original/compiler-input.json"),
+            "8b0fea9f81e69a36adab955bcb2bb3ad158aaaf1ebe63c20439da1944199f104",
+        ),
+        (
+            include_bytes!("../compiler_frame_inputs/actual-b8-caller-input.json"),
+            "fccc4c260617ebf86cc83a8bf32e56a17957aeb48949ea17050a997f116a2dae",
+        ),
     ];
     for (bytes, digest) in cases {
         assert_eq!(crate::object_replay::artifact_digest(bytes), *digest);
         let error = CompilerInputCapture::from_bytes(bytes)
             .and_then(|capture| capture.decode_inputs())
-            .err().expect("historical transport must refuse before producing current inputs");
+            .err()
+            .expect("historical transport must refuse before producing current inputs");
         assert_eq!(error, "compiler capture Module transport is noncanonical");
     }
 }

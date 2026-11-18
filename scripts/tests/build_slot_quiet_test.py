@@ -39,6 +39,7 @@ gate.NCPU = gate.MEASURED_NCPU or 4
 gate.available_gib = lambda: read("memory")
 gate.load1 = lambda: read("load")
 gate.build_processes = lambda: read("builds")
+gate.ledger_discovery = lambda env: None  # never the operator's real aterm ledger
 gate.QUIET_SECONDS = 0.12
 sleep = time.sleep
 gate.time.sleep = lambda seconds: sleep(min(seconds, 0.02))
@@ -612,6 +613,7 @@ class BuildSlotTest(unittest.TestCase):
                     mock.patch.object(gate, "available_gib", return_value=16), \
                     mock.patch.object(gate, "load1", return_value=100), \
                     mock.patch.object(gate, "build_processes", return_value=[]), \
+                    mock.patch.object(gate, "ledger_discovery", return_value=None), \
                     mock.patch.object(gate.os, "open", side_effect=track_open), \
                     mock.patch.object(gate.os, "close", side_effect=track_close), \
                     mock.patch.object(gate.time, "monotonic", side_effect=[0, .1, .2, .3, .999999, 1.000001]), \

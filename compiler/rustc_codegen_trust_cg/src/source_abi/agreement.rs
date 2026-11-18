@@ -71,6 +71,7 @@ pub(super) struct Lane {
 
 #[derive(Clone, Debug)]
 pub(super) enum Transport {
+    Ignore,
     Direct(Lane),
     Pair([Lane; 2]),
 }
@@ -146,7 +147,18 @@ pub(super) fn closure_transport(
         size = size.div_ceil(field) * field + field;
     }
     size = size.div_ceil(align) * align;
-    if observed.captures.is_empty() || size != observed.size || align != observed.align {
+    // Trust: Ignore is valid only for the exact empty, align-one source frame.
+    // A nonempty environment never inherits this physical omission.
+    if observed.captures.is_empty() {
+        return if size == observed.size && align == observed.align
+            && matches!(transport, Transport::Ignore)
+        {
+            Ok(0)
+        } else {
+            Err("empty source environment does not have its exact ignored ABI".into())
+        };
+    }
+    if size != observed.size || align != observed.align {
         return Err("source environment totals disagree with the native aggregate carrier".into());
     }
     let plain = |lane: &Lane| lane.extension == Extension::None && !lane.inreg;

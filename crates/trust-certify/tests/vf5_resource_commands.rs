@@ -3,7 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
 //! Actual host executable controls. Build this source's prepare_vf5_inputs
-//! example, bind TRUST_VF5_RESOURCE_TOOL to Cargo's emitted executable, then
+//! binary, bind TRUST_VF5_RESOURCE_TOOL to Cargo's emitted executable, then
 //! select this required-feature target. Missing executable input fails.
 //! Arbitrary fixture bytes test DATA transport, never theorem admission.
 
@@ -19,13 +19,13 @@ use sha2::{Digest, Sha256};
 fn tool() -> PathBuf {
     let path = PathBuf::from(std::env::var_os("TRUST_VF5_RESOURCE_TOOL")
         .expect("selected actual VF5 command controls require TRUST_VF5_RESOURCE_TOOL"));
-    let metadata = std::fs::symlink_metadata(&path).expect("actual VF5 example input must exist");
-    assert!(metadata.is_file() && !metadata.file_type().is_symlink(), "actual example must be a regular file");
+    let metadata = std::fs::symlink_metadata(&path).expect("actual VF5 binary input must exist");
+    assert!(metadata.is_file() && !metadata.file_type().is_symlink(), "actual binary must be a regular file");
     path
 }
 
 fn run(args: &[&OsStr]) -> Output {
-    Command::new(tool()).args(args).output().expect("execute the actual declared VF5 resource example")
+    Command::new(tool()).args(args).output().expect("execute the actual declared VF5 resource binary")
 }
 fn success(output: Output) -> Value {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

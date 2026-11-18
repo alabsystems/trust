@@ -803,7 +803,7 @@ mod direct_definition_map;
 pub mod finalization_probe;
 mod tuple_layout;
 mod closure_layout;
-mod closure_adapter;
+pub mod closure_adapter;
 mod uniform_array_spelling;
 mod shared_borrow;
 mod float_storage;
@@ -903,6 +903,7 @@ mod raw_entry_field;
 mod raw_pointer_coercion;
 mod ordered_slice_match;
 mod core_wrapping_add;
+mod core_ptr_eq;
 
 /// Data-only identification of the versioned core lowering model; not source/proof authority.
 pub fn core_u64_wrapping_add_model_v1<'tcx>(
@@ -911,6 +912,17 @@ pub fn core_u64_wrapping_add_model_v1<'tcx>(
     args: rustc_middle::ty::GenericArgs<'tcx>,
 ) -> Option<&'static str> {
     core_wrapping_add::recognize(tcx, def, args).map(|_| core_wrapping_add::MODEL)
+}
+
+/// The input of the exact-source thin-pointer comparison model. This is
+/// descriptive source data, with the same identity, source and target checks as
+/// lowering; it grants no body admission, inventory answer or proof authority.
+pub fn core_thin_ptr_eq_input_v1<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def: rustc_span::def_id::DefId,
+    args: rustc_middle::ty::GenericArgs<'tcx>,
+) -> Option<rustc_middle::ty::Ty<'tcx>> {
+    core_ptr_eq::recognize(tcx, def, args).map(|comparison| comparison.input())
 }
 
 mod join_provenance;
@@ -4397,6 +4409,19 @@ pub enum SiteTy {
     Ref(Box<SiteTy>, ty::Mutability),
 }
 
+/// Canonical source-observed closure type data, shared with native handoff
+/// authentication. The value itself grants no source, storage or ABI authority.
+pub fn source_closure_type_origin<'tcx>(
+    tcx: TyCtxt<'tcx>, source: RustcTy<'tcx>,
+) -> Option<trust_ir::ty::TypeOrigin> {
+    let ty::Closure(def, args) = source.kind() else { return None };
+    if source.has_non_region_param() || source.has_non_region_infer() { return None; }
+    let encoded = encode_site_args(tcx, *args)?;
+    Some(crate::lineage::ConcreteCalleeKey::from_site_args(
+        tcx, *def, crate::lineage::ConcreteInstanceKind::Item, &encoded,
+    ).type_origin())
+}
+
 /// Trust (wave-C): encode a site's `GenericArgs` (the raw `node_args`) to the lifetime-free form.
 /// `None` if ANY arg is a lifetime/const, or any type arg is outside `SiteTy` (fail closed).
 pub(crate) fn encode_site_args<'tcx>(
@@ -6034,6 +6059,53 @@ enum PointeeMeta {
     Unknown,
 }
 
+/// One source metadata determination shared by the converter and its concrete
+/// template host. Unknown (including fuel exhaustion) is never thin evidence.
+fn source_pointee_meta_and_tail<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointee: RustcTy<'tcx>,
+) -> (PointeeMeta, Option<RustcTy<'tcx>>) {
+    let te = ty::TypingEnv::fully_monomorphized();
+    let mut ty = cycle_safe_normalize(tcx, te, pointee);
+    for _ in 0..ADT_VISIT_FUEL {
+        match ty.kind() {
+            ty::Str | ty::Slice(_) => return (PointeeMeta::Len, None),
+            ty::Dynamic(..) => return (PointeeMeta::Vtable, None),
+            // An `extern type` is `!Sized`, but pointers to it carry NO metadata and are
+            // thin (rustc_middle ty/sty.rs:1796 — "Extern types have metadata = ()").
+            ty::Foreign(..) => return (PointeeMeta::Thin, None),
+            // Not determinable: the tail's metadata comes from the instantiation.
+            ty::Param(_)
+            | ty::Alias(..)
+            | ty::Bound(..)
+            | ty::Placeholder(_)
+            | ty::Infer(_) => {
+                return (PointeeMeta::Unknown, Some(ty));
+            }
+            // Only a STRUCT has a tail (rustc breaks out of the walk on enums/unions —
+            // both are sized, and neither can carry an unsized field).
+            ty::Adt(def, args) if def.is_struct() => match def.non_enum_variant().tail_opt() {
+                // Trust: `skip_normalization()` then `cycle_safe_normalize` — rust 1.99's
+                // `FieldDef::ty` returns `Unnormalized<Ty>`; the same two-step
+                // `struct_field_tys`/`fat_shape` use.
+                Some(f) => {
+                    ty = cycle_safe_normalize(tcx, te, f.ty(tcx, *args).skip_normalization());
+                }
+                None => return (PointeeMeta::Thin, None),
+            },
+            ty::Tuple(elems) => match elems.iter().last() {
+                Some(last) => ty = cycle_safe_normalize(tcx, te, last),
+                None => return (PointeeMeta::Thin, None),
+            },
+            ty::Pat(inner, _) => ty = cycle_safe_normalize(tcx, te, *inner),
+            // Everything else is a sized leaf (scalars, arrays, refs, raw pointers,
+            // fn-ptrs, closures, coroutines, enums, unions, `!`, …).
+            _ => return (PointeeMeta::Thin, None),
+        }
+    }
+    (PointeeMeta::Unknown, None)
+}
+
 /// Trust (T5): `map_ty`'s spelling for a pointer whose pointee CONTAINS a DST in tail position
 /// (as opposed to *being* one — `&[T]`/`&str`/`&dyn` and `*const [T]`/`*const str`/`*const dyn`
 /// have their own first-class arms). `None` means FAIL CLOSED; the caller records the tag.
@@ -7364,7 +7436,7 @@ enum CalleeKind {
     /// env is the wave-5 fresh unit-slot Ptr (zero captures → no upvar projection can exist).
     ClosureCall { callee: FuncId, capturing: bool },
     /// A real by-value environment, evaluated once before the argument tuple.
-    ClosureOnceCall { callee: FuncId },
+    ClosureOnceCall { callee: FuncId, borrowed_zero: bool },
 }
 
 /// Trust: one enclosing-loop frame for `Break`/`Continue` resolution.
@@ -7886,11 +7958,26 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     where
         T: rustc_middle::ty::TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
+        match self.try_monomorphize(value) {
+            Some(out) => out,
+            None => {
+                self.mono_residual = true;
+                value
+            }
+        }
+    }
+
+    /// The same query and postcondition without changing producer state.
+    /// Admission predicates refuse `None`; lowering records the residual above.
+    fn try_monomorphize<T>(&self, value: T) -> Option<T>
+    where
+        T: rustc_middle::ty::TypeFoldable<TyCtxt<'tcx>> + Copy,
+    {
         let Some(args) = self.mono_args else {
-            return value;
+            return Some(value);
         };
         if !value.has_non_region_param() {
-            return value;
+            return Some(value);
         }
         let tcx = self.tcx;
         match tcx.try_instantiate_and_normalize_erasing_regions(
@@ -7903,11 +7990,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // THE POSTCONDITION, mirrored from `instance_flip`: a fully-monomorphized
             // instantiation carries no non-region parameter. If it still does, the args did not
             // cover this value and nothing downstream may be trusted to notice.
-            Ok(out) if !out.has_non_region_param() => out,
-            Ok(_) | Err(_) => {
-                self.mono_residual = true;
-                value
-            }
+            Ok(out) if !out.has_non_region_param() => Some(out),
+            Ok(_) | Err(_) => None,
         }
     }
 
@@ -8788,7 +8872,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             ty::Closure(_, cargs) => {
                 let clo = cargs.as_closure();
                 let upvar_tys = clo.upvar_tys();
-                if upvar_tys.is_empty() {
+                if upvar_tys.is_empty() && self.zero_capture_closure_admissible(ty) {
+                    match self.closure_first_class_ty(ty, clo) {
+                        Some(mapped) => mapped,
+                        None => {
+                            self.unsupported.push((format!("{ty:?}"), "Ty(typed empty closure)"));
+                            Ty::Unit
+                        }
+                    }
+                } else if upvar_tys.is_empty() {
                     // Trust (wave-CV): a NON-CAPTURING closure type is a dataless ZST — the
                     // SAME `Ty::Unit` the oracle spells (`Ty::Closure { upvars: [] }` ->
                     // `Unit`, trust-ir-bridge) and `closure_env_param_ty` already signs for
@@ -8796,7 +8888,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // unit lane; the value it holds is the `PhantomData` seed the `Closure`
                     // arm mints. Used to be lumped with the non-thin refusal below.
                     Ty::Unit
-                } else if !upvar_tys.iter().all(|t| self.upvar_is_thin(t)) {
+                } else if !upvar_tys.iter().all(|t| {
+                    self.upvar_is_thin(t)
+                        || (matches!(clo.kind(), ty::ClosureKind::FnOnce)
+                            && self.fn_once_capture_admissible(t, 16))
+                }) {
                     self.unsupported.push((format!("{ty:?}"), "Ty"));
                     Ty::Unit
                 } else if matches!(clo.kind(), ty::ClosureKind::FnOnce) {
@@ -8975,6 +9071,49 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         }
     }
 
+    /// A nested, concrete FnOnce environment is an actual capture value, not a
+    /// pointer or a Unit stand-in. Keep this separate from the thin predicate:
+    /// Fn/FnMut memory environments and arbitrary aggregates do not gain storage
+    /// permission. The bounded walk refuses unresolved, dropping and recursive
+    /// shapes before querying layouts or lowering operands.
+    /// An owned capture-free Fn/FnOnce value retains its typed nominal environment.
+    /// A Fn body takes a borrow and requires the real ClosureOnce shim when
+    /// consumed; an inferred FnOnce body receives its environment by value.
+    fn zero_capture_closure_admissible(&self, source: RustcTy<'tcx>) -> bool {
+        let ty::Closure(def, args) = source.kind() else { return false };
+        self.template.is_none()
+            && def.is_local() && !self.tcx.is_coroutine(*def)
+            && !args.has_non_region_param() && !args.has_non_region_infer()
+            && matches!(args.as_closure().kind_ty().to_opt_closure_kind(),
+                Some(ty::ClosureKind::Fn | ty::ClosureKind::FnOnce))
+            && args.as_closure().upvar_tys().is_empty()
+            && self.is_drop_free_zst(source)
+    }
+
+    fn fn_once_capture_admissible(&self, capture: RustcTy<'tcx>, fuel: usize) -> bool {
+        if self.upvar_is_thin(capture) {
+            return true;
+        }
+        if self.zero_capture_closure_admissible(capture) {
+            return true;
+        }
+        if fuel == 0 || capture.has_non_region_param() || capture.has_non_region_infer() {
+            return false;
+        }
+        let ty::Closure(def, args) = capture.kind() else { return false };
+        let closure = args.as_closure();
+        def.is_local()
+            && !self.tcx.is_coroutine(*def)
+            && matches!(closure.kind_ty().to_opt_closure_kind(), Some(ty::ClosureKind::FnOnce))
+            && !closure.upvar_tys().is_empty()
+            && closure.upvar_tys().iter().all(|field| {
+                self.fn_once_capture_admissible(field, fuel - 1)
+            })
+            && !needs_drop_unrevealed(
+                self.tcx, capture, ty::TypingEnv::non_body_analysis(self.tcx, self.body_def),
+            )
+    }
+
     /// Trust (B6): the FORMAT's first-class type for a by-value-env (FnOnce-kind) capturing
     /// closure — `Ty::Closure(id)` over `ClosureTy { func: the closure's CALL signature,
     /// captures }`. The signature comes from `clo.sig()` (inputs = one tuple of the call
@@ -9022,8 +9161,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// (`trust_mir_extract::ty_convert` + `trust_ir_bridge::lower::map_type{,_ctx}`):
     ///   * `Fn`/`FnMut` env `&{closure}` / `&mut {closure}` — a THIN ref; the oracle converts
     ///     `TyKind::Ref → TrustTy::Ref → TrustIrTy::Ptr`. We sign `Ty::Ptr`.
-    ///   * `FnOnce` by-value NON-capturing env — the oracle converts `TyKind::Closure` (empty
-    ///     `upvar_tys`) `→ TrustTy::Closure { upvars: [] } → TrustIrTy::Unit`. We sign `Ty::Unit`.
+    ///   * A concrete admitted `FnOnce` by-value environment retains its typed nominal
+    ///     `Ty::Closure`, including the actual empty environment inferred by an explicit
+    ///     FnOnce request. Legacy unsupported empty values retain the Unit fallback.
     ///
     /// FAIL-CLOSED (precise tag + placeholder `Ty::Unit`, so the module stays well-formed while
     /// the ratchet reports the body as unsupported):
@@ -9243,7 +9383,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // `closure_env_ty` for `Fn`/`FnMut`: a thin `&{closure}` / `&mut {closure}`.
             ty::Ref(..) => Some(Ty::Ptr),
             // `closure_env_ty` for `FnOnce`: the closure type itself, by value.
-            ty::Closure(_, args) if args.as_closure().upvar_tys().is_empty() => Some(Ty::Unit),
+            // Trust: an explicitly inferred empty FnOnce still owns its nominal
+            // environment. Its zero physical width does not erase the source type.
+            ty::Closure(_, args) if args.as_closure().upvar_tys().is_empty()
+                && !self.zero_capture_closure_admissible(env.ty) => Some(Ty::Unit),
             // Trust (B6, v25 Fn/ByValue slice): a CAPTURING by-value env — sign the
             // closure's first-class `Ty::Closure` spelling (map_ty's kind-split; a
             // by-value env implies FnOnce kind, so the split always takes the
@@ -10756,7 +10899,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             if let ty::Closure(_, closure_args) = input.kind() {
                 let clo = closure_args.as_closure();
                 let upvars = clo.upvar_tys();
-                let closure_ty = if upvars.is_empty() {
+                let closure_ty = if upvars.is_empty() && self.zero_capture_closure_admissible(*input) {
+                    self.pending_closure_sources.get(input).copied().map(Ty::Closure)
+                } else if upvars.is_empty() {
                     Some(Ty::Unit)
                 } else if matches!(clo.kind(), ty::ClosureKind::FnOnce) {
                     None
@@ -11133,46 +11278,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         &self,
         pointee: RustcTy<'tcx>,
     ) -> (PointeeMeta, Option<RustcTy<'tcx>>) {
-        let tcx = self.tcx;
-        let te = ty::TypingEnv::fully_monomorphized();
-        let mut ty = cycle_safe_normalize(tcx, te, pointee);
-        for _ in 0..ADT_VISIT_FUEL {
-            match ty.kind() {
-                ty::Str | ty::Slice(_) => return (PointeeMeta::Len, None),
-                ty::Dynamic(..) => return (PointeeMeta::Vtable, None),
-                // An `extern type` is `!Sized`, but pointers to it carry NO metadata and are
-                // thin (rustc_middle ty/sty.rs:1796 — "Extern types have metadata = ()").
-                ty::Foreign(..) => return (PointeeMeta::Thin, None),
-                // Not determinable: the tail's metadata comes from the instantiation.
-                ty::Param(_)
-                | ty::Alias(..)
-                | ty::Bound(..)
-                | ty::Placeholder(_)
-                | ty::Infer(_) => {
-                    return (PointeeMeta::Unknown, Some(ty));
-                }
-                // Only a STRUCT has a tail (rustc breaks out of the walk on enums/unions —
-                // both are sized, and neither can carry an unsized field).
-                ty::Adt(def, args) if def.is_struct() => match def.non_enum_variant().tail_opt() {
-                    // Trust: `skip_normalization()` then `cycle_safe_normalize` — rust 1.99's
-                    // `FieldDef::ty` returns `Unnormalized<Ty>`; the same two-step
-                    // `struct_field_tys`/`fat_shape` use.
-                    Some(f) => {
-                        ty = cycle_safe_normalize(tcx, te, f.ty(tcx, *args).skip_normalization());
-                    }
-                    None => return (PointeeMeta::Thin, None),
-                },
-                ty::Tuple(elems) => match elems.iter().last() {
-                    Some(last) => ty = cycle_safe_normalize(tcx, te, last),
-                    None => return (PointeeMeta::Thin, None),
-                },
-                ty::Pat(inner, _) => ty = cycle_safe_normalize(tcx, te, *inner),
-                // Everything else is a sized leaf (scalars, arrays, refs, raw pointers,
-                // fn-ptrs, closures, coroutines, enums, unions, `!`, …).
-                _ => return (PointeeMeta::Thin, None),
-            }
-        }
-        (PointeeMeta::Unknown, None)
+        source_pointee_meta_and_tail(self.tcx, pointee)
     }
 
     /// Trust (step 2 increment 6, step 6.5.1; INC6.5-SENTINEL): the template sentinel of rustc's
@@ -11197,6 +11303,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     /// in the actual template producer. Arrays and nominals share this exact
     /// source key/dependency path; the opaque contract grants no layout rule.
     fn template_type_hole(&mut self, source: RustcTy<'tcx>) -> Ty {
+        self.template_type_hole_with_contract(source, trust_ir::template::TypeContract::Opaque)
+    }
+
+    fn template_type_hole_with_contract(
+        &mut self,
+        source: RustcTy<'tcx>,
+        contract: trust_ir::template::TypeContract,
+    ) -> Ty {
         let result = (|| {
             let lane = self.template.as_ref().ok_or("type hole outside template lane")?;
             if lane.owner != Some(crate::template_key::rustc::stable_def(self.tcx, self.body_def)) {
@@ -11206,6 +11320,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 crate::template_key::rustc::checked_type_key(self.tcx, source, self.body_def)
                     .map_err(|_| "type hole source identity")?);
             if let Some(hole) = lane.type_holes.iter().find(|hole| hole.key == key) {
+                if hole.contract != contract {
+                    return Err("type hole representation contract changed");
+                }
                 return Ok(hole.id);
             }
             let indices = crate::template_key::parameters(&key)
@@ -11227,7 +11344,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             let index = u32::try_from(lane.callee_holes.len() + lane.type_holes.len())
                 .map_err(|_| "template hole space exhausted")?;
             let id = trust_ir::HoleId::new(index);
-            lane.type_holes.push(template_lowering::TypeHole { id, key, dependencies });
+            lane.type_holes.push(template_lowering::TypeHole { id, key, contract, dependencies });
             Ok(id)
         })();
         match result {
@@ -11261,7 +11378,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ///   question inside `mir_built` is, [`is_sized_unrevealed`]): a THIN `Ty::Ptr`;
     /// * any other `Unknown` — an unsized-capable parameter (a trait's implicit `Self`
     ///   included), an alias, a bound, placeholder or inference type, or the walk out of fuel —
-    ///   the lane refusal `parameter-dependent pointer metadata` (6.5.2 makes it a hole).
+    ///   a source-owned thin-pointer type hole when the pointer depends on this
+    ///   definition's parameters. Its actual source host must determine thinness
+    ///   after substitution; wide or still unknown metadata cannot instantiate it.
+    ///   A ground unknown remains a named lane refusal.
     ///
     /// The level-R spelling (`Unknown` -> thin, `PointeeMeta`'s documented posture) is untouched.
     fn template_pointer_ty(&mut self, ty: RustcTy<'tcx>, pointee: RustcTy<'tcx>) -> Ty {
@@ -11281,7 +11401,15 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     }
                     _ => false,
                 };
-                if sized_param { Ty::Ptr } else { self.template_refused_ty(ty, UNKNOWN) }
+                if sized_param {
+                    Ty::Ptr
+                } else if ty.has_non_region_param() {
+                    self.template_type_hole_with_contract(
+                        ty, trust_ir::template::TypeContract::ThinPointer,
+                    )
+                } else {
+                    self.template_refused_ty(ty, UNKNOWN)
+                }
             }
         }
     }
@@ -11862,8 +11990,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ///         list is empty NO upvar projection can exist in the body, so a fresh unit-slot
     ///         pointer is indistinguishable (within the fragment) from a pointer to the real
     ///         (zero-sized) closure place — the call site builds exactly that;
-    ///       - kind `FnOnce` (by-value env) with no captures cannot be inferred (kind inference
-    ///         yields `Fn` for capture-free closures) — kept fail-closed as a tripwire.
+    ///       - kind `FnOnce` receives its actual typed environment by value. A direct
+    ///         `FnOnce::call_once` request can infer this kind even with no captures;
+    ///         it keeps the exact observed zero frame rather than a Unit seed.
     ///
     /// The returned body-local `FuncId` is ledgered by exact closure-body identity via
     /// `admit_callee`; its `DefIndex` remains one field of that identity record:
@@ -12055,8 +12184,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                         // and this resolved source call passes the actual environment
                         // value directly to its Rust body.
                         ty::ClosureKind::FnOnce => {
-                            if closure_args.as_closure().upvar_tys().is_empty()
-                                || !closure_args.as_closure().upvar_tys().iter().all(|t| self.upvar_is_thin(t))
+                            if !closure_args.as_closure().upvar_tys().iter()
+                                    .all(|t| self.fn_once_capture_admissible(t, 16))
                                 || self.template.is_some()
                             {
                                 return Err("Call(closure env unsupported)");
@@ -12069,13 +12198,37 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             }
                             Ok(CalleeKind::ClosureOnceCall {
                                 callee: self.admit_closure_callee(resolved, closure_args),
+                                borrowed_zero: false,
                             })
                         },
                     }
                 }
+                ty::InstanceKind::Shim(ty::ShimKind::ClosureOnce { call_once, closure, track_caller }) => {
+                    if call_once != def_id || closure != closure_def_id || track_caller
+                        || inst.args != gen_args
+                        || closure_args.as_closure().kind() != ty::ClosureKind::Fn
+                        || !self.zero_capture_closure_admissible(gen_args.type_at(0))
+                        || self.tcx.trait_of_assoc(def_id)
+                            .and_then(|tr| self.tcx.fn_trait_kind_from_def_id(tr))
+                            != Some(ty::ClosureKind::FnOnce)
+                    {
+                        return Err("Call(closure once shim unsupported)");
+                    }
+                    let Some(Ty::Closure(environment)) = self.map_ty_checked(gen_args.type_at(0)) else {
+                        return Err("Call(closure once shim environment)");
+                    };
+                    if !self.pending_closure_layouts.iter().any(|row| row.closure == environment
+                        && row.size == 0 && row.align == 1 && row.capture_offsets.is_empty()) {
+                        return Err("Call(closure once shim layout unavailable)");
+                    }
+                    Ok(CalleeKind::ClosureOnceCall {
+                        callee: self.admit_closure_callee(closure, closure_args),
+                        borrowed_zero: true,
+                    })
+                }
                 ty::InstanceKind::Virtual(..) => Err("Call(dyn dispatch)"),
                 ty::InstanceKind::Intrinsic(..) => Err("Call(intrinsic)"),
-                // ClosureOnceShim (`call_once` on a `Fn`/`FnMut` closure), FnPtrShim, … —
+                // Every other shim, including captured/FnMut ClosureOnce and FnPtr, —
                 // synthetic MIR we do not model.
                 _ => Err("Call(instance shim)"),
             },
@@ -12324,6 +12477,22 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     }
 
     fn closure_env_storage_admissible(&self, mapped: &Ty, rty: RustcTy<'tcx>) -> bool {
+        // A typed empty Fn environment also needs one real local home, including
+        // a direct FnMut request on that Fn value. This admits no captured FnMut
+        // or mutable FnOnce environment: the source kind is Fn, captures are
+        // empty, and the exact pended source type owns the observed zero frame.
+        if let Ty::Closure(id) = mapped {
+            if matches!(rty.kind(), ty::Closure(_, args)
+                if args.as_closure().kind_ty().to_opt_closure_kind() == Some(ty::ClosureKind::Fn))
+                && self.zero_capture_closure_admissible(rty)
+                && self.pending_closure_sources.get(&rty) == Some(id)
+                && self.pending_closure_tys.get(id.as_usize()).is_some_and(|ct| ct.captures.is_empty())
+            {
+                return self.pending_closure_layouts.iter().any(|frame| frame.closure == *id
+                    && frame.origin.is_some() && frame.size == 0 && frame.align == 1
+                    && frame.capture_offsets.is_empty());
+            }
+        }
         let Some(captures) = self.closure_env_capture_count(rty) else { return false };
         let Ty::Tuple(fields) = mapped else { return false };
         captures == fields.len()
@@ -13973,6 +14142,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         let ty::Closure(def_id, cargs) = expr_ty.kind() else {
             return None;
         };
+        // A supported typed value must never fall back to the legacy Unit
+        // receipt after a failed lowering attempt. Keep that attempt's refusal.
+        if self.zero_capture_closure_admissible(expr_ty) {
+            return None;
+        }
         // G3.
         if self.tcx.is_coroutine(*def_id) {
             return None;
@@ -15582,6 +15756,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             return;
         }
         let ty::Closure(_, args) = source.kind() else { return; };
+        if source.has_non_region_param() || source.has_non_region_infer() {
+            return;
+        }
+        let Some(origin) = source_closure_type_origin(self.tcx, source) else { return; };
         let rust_captures = args.as_closure().upvar_tys();
         let captures = self.pending_closure_tys[id.as_usize()].captures.clone();
         let typing = ty::TypingEnv::fully_monomorphized();
@@ -15598,8 +15776,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             }
         }
         let descriptor = trust_ir::ClosureLayoutDescriptor {
-            // Trust: retain the existing unkeyed producer claim; do not invent source identity.
-            origin: None,
+            origin: Some(origin),
             closure: id,
             size: layout.size.bytes(),
             align: layout.align.bytes(),
@@ -16005,16 +16182,22 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
     ) -> Option<ValueId> {
         let ty::Closure(def, closure_args) = *source.kind() else { return None; };
         let clo = closure_args.as_closure();
+        let borrowed_zero = clo.kind() == ty::ClosureKind::Fn
+            && self.zero_capture_closure_admissible(source);
         if self.template.is_some() || !def.is_local() || self.tcx.is_coroutine(def)
             || closure_args.has_non_region_param() || closure_args.has_non_region_infer()
-            || clo.upvar_tys().is_empty() || clo.upvar_tys().len() != operands.len()
-            || !clo.upvar_tys().iter().all(|t| self.upvar_is_thin(t))
+            || (!borrowed_zero && !matches!(clo.kind(), ty::ClosureKind::FnOnce))
+            || (!borrowed_zero && clo.upvar_tys().is_empty()
+                && !self.zero_capture_closure_admissible(source))
+            || clo.upvar_tys().len() != operands.len()
+            || !clo.upvar_tys().iter().all(|t| self.fn_once_capture_admissible(t, 16))
         {
             self.unsupported.push((format!("{span:?}"), "Closure(FnOnce captures)"));
             return None;
         }
         let Ty::Closure(closure) = self.map_ty_checked(source)? else { return None; };
-        if !self.pending_closure_layouts.iter().any(|row| row.closure == closure) {
+        if !self.pending_closure_layouts.iter().any(|row| row.closure == closure
+            && (!borrowed_zero || (row.size == 0 && row.align == 1 && row.capture_offsets.is_empty()))) {
             self.unsupported.push((format!("{span:?}"), "Closure(FnOnce layout unavailable)"));
             return None;
         }
@@ -16029,8 +16212,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             if slot >= ADAPTER_FUNC_ID_COUNT { return None; }
             let id = FuncId::new(ADAPTER_FUNC_ID_BASE + slot);
             let body = self.admit_closure_callee(def, closure_args);
-            let shape = crate::closure_adapter::Shape { closure, body };
-            let name = format!("{}::{{fn-once-adapter}}", rustc_middle::ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(def)));
+            let shape = crate::closure_adapter::Shape { closure, body, borrowed_zero };
+            // Trust: an empty Fn-to-FnOnce adapter is also the actual compiler
+            // shim's implementation. Name it from the real Instance at creation;
+            // native selection must still authenticate its source and full ABI.
+            let name = if borrowed_zero {
+                let instance = ty::Instance::fn_once_adapter_instance(self.tcx, def, closure_args);
+                self.tcx.symbol_name(instance).name.to_string()
+            } else {
+                format!("{}::{{fn-once-adapter}}", rustc_middle::ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(def)))
+            };
             let function = crate::closure_adapter::build(id, sig, name, shape, &ct, &apparent)?;
             self.pending_adapters.push(function);
             self.closure_adapter_keys.push((def, closure, slot as usize));
@@ -16042,7 +16233,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             captures.push(self.lower_expr(*operand)?);
         }
         let value = self.fresh();
-        let outlives_frame = captures.iter().all(|capture| self.reference_source_outlives_frame(*capture));
+        // A nested closure may itself own a borrow of this frame. Its value is
+        // not a borrow pointer; require the constructor's recursive provenance
+        // witness rather than treating that aggregate as an untracked scalar.
+        let outlives_frame = captures.iter().zip(&self.pending_closure_tys[closure.as_usize()].captures)
+            .all(|(capture, ty)| match ty {
+                Ty::Closure(_) => self.closure_values_outliving_frame.contains(capture),
+                _ => self.reference_source_outlives_frame(*capture),
+            });
         self.push_node(InstrNode::new(Inst::MakeClosure { ty: closure, func: adapter, captures }).with_result(value));
         if outlives_frame {
             self.closure_values_outliving_frame.push(value);
@@ -17977,6 +18175,17 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             // Only incoming parameters and the explicit payload-reference emitter use
             // this recovery. General reference locals/destructuring stay refused.
             (Ty::Ptr, ty::Ref(_, _, rustc_hir::Mutability::Not)) => reference_binding,
+            // An incoming raw-pointer VALUE can have a shared address without
+            // acquiring reference/dereference rights for its pointee. Keep its
+            // SSA value and raw-parameter provenance; only the pointer object
+            // receives the immutable lifetime-long home. Mutable borrows still
+            // fail immutable_shared_binding above, and Freeze is checked below.
+            (Ty::Ptr, ty::RawPtr(..)) => reference_binding,
+            // This is the original immutable closure VALUE's shared home,
+            // never a mutable environment or a snapshot of its pointees.
+            (Ty::Closure(_), ty::Closure(..)) => {
+                self.fn_once_value_storage_admissible(mapped, rust_ty)
+            }
             (
                 Ty::FatPtr(
                     trust_ir::FatPtrKind::Slice(_)
@@ -18000,13 +18209,27 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             )
     }
 
+    /// Concrete drop-free FnOnce values may use their declared capture image.
+    /// The exact immutable emitted module must still bind its unique callable
+    /// target before any interpreter/native memory consumer can execute it.
+    fn fn_once_value_storage_admissible(&self, mapped: &Ty, source: RustcTy<'tcx>) -> bool {
+        let Ty::Closure(id) = mapped else { return false };
+        self.fn_once_capture_admissible(source, 16)
+            && self.pending_closure_sources.get(&source) == Some(id)
+            && self.pending_closure_layouts.iter().any(|row| {
+                row.closure == *id && row.origin.is_some()
+            })
+    }
+
     fn immutable_shared_binding(&self, var: LocalVarId) -> bool {
         !self.coroutine_frame_ptr
             && self.shared_local_without_aliasing_mutable_borrow(var)
-            && !self.thir.exprs.iter().any(|expr| match &expr.kind {
+            && !self.thir.exprs.iter_enumerated().any(|(id, expr)| match &expr.kind {
                 // Raw const addresses can be cast mutable without an explicit mutable
-                // borrow. A suspended activation also needs a different storage proof.
-                ExprKind::RawBorrow { .. } | ExprKind::Yield { .. } => true,
+                // borrow. Only an immediate authenticated pointer comparison consumes
+                // its exact shared-to-raw coercion without exporting the address.
+                ExprKind::RawBorrow { .. } => !self.shared_home_comparison_raw_borrow(var, id),
+                ExprKind::Yield { .. } => true,
                 ExprKind::Assign { lhs, .. } | ExprKind::AssignOp { lhs, .. } => {
                     self.place_rebound_base_local(*lhs) == Some(var)
                 }
@@ -18021,6 +18244,90 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 }
                 _ => false,
             })
+    }
+
+    /// A shared reference coerced directly into core's pointer comparison cannot
+    /// mutate or export its original local. Keep raw addresses in every other
+    /// context refused, including a binding/cast between the coercion and call.
+    fn shared_home_comparison_raw_borrow(&self, var: LocalVarId, raw: ExprId) -> bool {
+        let Some(source) = self.local_rust_tys
+            .get_or_init(|| DeclaredLocalRustTypes::collect(self.tcx, self.thir)).get(var)
+            else { return false };
+        let ty::Closure(_, closure_args) = source.kind() else { return false };
+        if closure_args.as_closure().kind_ty().to_opt_closure_kind() != Some(ty::ClosureKind::FnOnce) {
+            return false;
+        }
+        let Some(id) = self.pending_closure_sources.get(&source) else { return false };
+        if !self.fn_once_value_storage_admissible(&Ty::Closure(*id), source) {
+            return false;
+        }
+        let ExprKind::RawBorrow { mutability: rustc_hir::Mutability::Not, arg } =
+            self.thir.exprs[raw].kind else { return false };
+        let ExprKind::Deref { arg: reference } = self.thir.exprs[arg].kind else { return false };
+        let ExprKind::Borrow { borrow_kind: rustc_middle::mir::BorrowKind::Shared, arg: place } =
+            self.thir.exprs[reference].kind else { return false };
+        if self.shared_borrow_local_place(place) != Some(var)
+            || !matches!(self.thir.exprs[raw].ty.kind(), ty::RawPtr(pointee, rustc_hir::Mutability::Not)
+                if *pointee == source)
+            || !matches!(self.thir.exprs[reference].ty.kind(), ty::Ref(_, pointee, rustc_hir::Mutability::Not)
+                if *pointee == source)
+        {
+            return false;
+        }
+
+        // Use the exhaustive THIR visitor for immediate expression uses. Stopping
+        // at each child also finds uses through block/statement/arm containers;
+        // those parents fail the Scope-or-comparison allow-list below.
+        struct Uses<'a, 'tcx> {
+            thir: &'a Thir<'tcx>,
+            child: &'a Expr<'tcx>,
+            count: usize,
+        }
+        impl<'a, 'tcx> rustc_middle::thir::visit::Visitor<'a, 'tcx> for Uses<'a, 'tcx> {
+            fn thir(&self) -> &'a Thir<'tcx> { self.thir }
+            fn visit_expr(&mut self, expr: &'a Expr<'tcx>) {
+                self.count += usize::from(std::ptr::eq(self.child, expr));
+            }
+        }
+        let mut child = raw;
+        // Every transparent parent is a different arena row. This bound also
+        // refuses malformed cycles without assuming that arena IDs are ordered.
+        for _ in 0..self.thir.exprs.len() {
+            let mut parent = None;
+            for (id, expr) in self.thir.exprs.iter_enumerated() {
+                let mut uses = Uses { thir: self.thir, child: &self.thir.exprs[child], count: 0 };
+                rustc_middle::thir::visit::walk_expr(&mut uses, expr);
+                if uses.count != 0 {
+                    if uses.count != 1 || parent.replace(id).is_some() {
+                        return false;
+                    }
+                }
+            }
+            let Some(id) = parent else { return false };
+            match &self.thir.exprs[id].kind {
+                ExprKind::Scope { value, .. } if *value == child => child = id,
+                ExprKind::Call { ty: call_ty, fun, args, .. } => {
+                    let Some(call_ty_mono) = self.try_monomorphize(*call_ty)
+                        else { return false };
+                    let ty::FnDef(def, generic_args) = *call_ty_mono.kind()
+                        else { return false };
+                    // Trust: storage admission must authenticate the same exact
+                    // core body, signature and target as lowering/conservation.
+                    // A diagnostic label alone cannot authorize a raw address.
+                    let Some(comparison) = core_ptr_eq::recognize(
+                        self.tcx, def, generic_args.skip_binder(),
+                    )
+                        else { return false };
+                    return args.len() == 2 && args.contains(&child)
+                        && self.thir.exprs[*fun].ty == *call_ty
+                        && args.iter().all(|arg|
+                            self.try_monomorphize(self.thir.exprs[*arg].ty)
+                                == Some(comparison.input()));
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn alloc_shared_value(&mut self, var: LocalVarId, ty: Ty, value: ValueId) {
@@ -21579,6 +21886,36 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     })
             }
             (ty::Tuple(source), Ty::Unit) => source.is_empty(),
+            (ty::Closure(_, args), Ty::Closure(id)) => {
+                // The converter retains this exact Rust closure identity and
+                // its source-observed frame. Equal total sizes or capture
+                // signatures cannot substitute a different environment.
+                self.pending_closure_sources.get(&rust_ty) == Some(id)
+                    && module.closure_type(*id).is_some_and(|row| {
+                        let captures = args.as_closure().upvar_tys();
+                        let Ok(Some(frame)) = module.closure_layout_descriptor(*id) else {
+                            return false;
+                        };
+                        let Some(origin) = source_closure_type_origin(self.tcx, rust_ty) else {
+                            return false;
+                        };
+                        frame.origin.as_ref() == Some(&origin)
+                            && frame.size == source.size.bytes()
+                            && frame.align == source.align.bytes()
+                            && source.fields.count() == captures.len()
+                            && frame.capture_offsets.len() == captures.len()
+                            && row.captures.len() == captures.len()
+                            && captures.iter().zip(&row.captures).enumerate().all(
+                                |(index, (capture, mapped))| {
+                                    frame.capture_offsets[index]
+                                        == source.fields.offset(index).bytes()
+                                        && self.replacement_layout_component(
+                                            layouts, capture, mapped, visiting, checked,
+                                        )
+                                },
+                            )
+                    })
+            }
             (ty::Array(source, source_len), Ty::Array(element, mapped_len)) => {
                 source_len.try_to_target_usize(self.tcx) == Some(*mapped_len)
                     && module.types.get(element.as_usize()).is_some_and(|mapped| {
@@ -24415,7 +24752,8 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 //     by value all stay refused;
                 //   * a CAPTURING or coroutine literal does not match the recognizer and falls
                 //     through to `lower_expr`'s fail-closed closure arm below.
-                if self.non_capturing_closure_literal(init) {
+                if self.non_capturing_closure_literal(init)
+                    && !self.zero_capture_closure_admissible(self.thir.exprs[init].ty) {
                     return;
                 }
                 // Trust (wave-22): `let _ = |…| {…}` / `let _ = async {…}` — a closure/coroutine
@@ -26119,7 +26457,11 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 } else {
                     upvar_tys.iter().map(|t| self.map_ty(t)).collect()
                 };
-                if !coroutine_env && !elem_tys.iter().all(|t| is_scalar_ty(t) || matches!(t, Ty::Ptr))
+                if !coroutine_env && !elem_tys.iter().zip(upvar_tys.iter()).all(|(mapped, source)| {
+                    is_scalar_ty(mapped) || matches!(mapped, Ty::Ptr)
+                        || (by_value_env && matches!(mapped, Ty::Closure(_))
+                            && self.fn_once_capture_admissible(source, 16))
+                })
                 {
                     self.unsupported.push((format!("{expr_span:?}"), "UpvarRef(non-thin capture)"));
                     return None;
@@ -26621,7 +26963,9 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     // (the str-match lane's `PtrMetadata` machinery); not built until a
                     // population demands it — fail closed with a named tag instead of an
                     // ill-typed instruction.
-                    if !is_scalar_ty(&ty) && !matches!(ty, Ty::Ptr) {
+                    let thin_hole = self.template.as_ref().is_some_and(|lane|
+                        template_lowering::is_thin_pointer_hole(&ty, &lane.type_holes));
+                    if !is_scalar_ty(&ty) && !matches!(ty, Ty::Ptr) && !thin_hole {
                         self.unsupported
                             .push((format!("{expr_span:?}"), "Binary(non-scalar compare)"));
                         return None;
@@ -26702,6 +27046,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 {
                     return outcome;
                 }
+                // The exact source-owned core thin-pointer comparison is a value
+                // computation. Callee effects ran above; a failed argument never
+                // falls back to another call path or evaluates an argument twice.
+                if let Some(outcome) =
+                    self.try_lower_core_thin_ptr_eq(expr_span, expr_ty, *fun, args)
+                {
+                    return outcome;
+                }
                 // Trust: core's Boolean-to-integer From is a zero extension,
                 // not a bodyless external call. Keep callee effects above and
                 // evaluate the sole argument exactly once, in source order.
@@ -26743,10 +27095,16 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // `ExtractField(slice, 1)` yields the `I64` len, cast to the `usize`-mapped result type.
                 // This is FAITHFUL (the len is the real static length stored in the fat pointer by the
                 // `Unsize` coercion) and keeps the body interpretable (no cross-module `Call`).
+                let slice_mark = self.unsupported.len();
                 if let Some(v) =
                     self.try_lower_slice_len(expr_span, expr_ty, *fun, args, *from_hir_call)
                 {
                     return Some(v);
+                }
+                // A recognized slice operation owns its refusal. Do not retry
+                // its receiver through generic call lowering after that refusal.
+                if self.unsupported.len() != slice_mark {
+                    return None;
                 }
                 // Trust (wave-N): `core::mem::offset_of!(C, field)` — rustc lowers each field level to
                 // a synthetic `Call` to the `OffsetOf` lang-item intrinsic; fold it to a compile-time
@@ -26898,7 +27256,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     //     observable effects: fail closed;
                     //   * the tuple operand split per `lower_closure_call_untupled` (element
                     //     order = MIR's tuple-temp field evaluation order).
-                    CalleeKind::ClosureOnceCall { callee } => {
+                    CalleeKind::ClosureOnceCall { callee, borrowed_zero } => {
                         if arg_ids.len() != 2 {
                             self.unsupported.push((format!("{expr_span:?}"), "Call(rust-call ABI)"));
                             return None;
@@ -26909,12 +27267,25 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                             self.unsupported.push((format!("{expr_span:?}"), "Call(closure value env)"));
                             return None;
                         };
-                        let Ty::Closure(_) = self.map_ty_checked(self.thir.exprs[arg_ids[0]].ty)? else {
+                        let Ty::Closure(environment) = self.map_ty_checked(self.thir.exprs[arg_ids[0]].ty)? else {
                             self.unsupported.push((format!("{expr_span:?}"), "Call(closure value env)"));
                             return None;
                         };
                         let untupled = self.lower_closure_call_untupled(expr_span, arg_ids[1], true)?;
-                        let mut args = vec![env];
+                        let body_env = if borrowed_zero {
+                            // Borrow the actual moved typed environment as rustc's
+                            // ClosureOnce shim does. Never replace it with a Unit seed.
+                            let pointer = self.fresh();
+                            let ty = Ty::Closure(environment);
+                            self.push_node(InstrNode::new(Inst::Alloca {
+                                ty: ty.clone(), count: None, align: Some(1),
+                            }).with_result(pointer));
+                            self.push_node(InstrNode::new(Inst::Store {
+                                ty, ptr: pointer, value: env, volatile: false, align: Some(1),
+                            }));
+                            pointer
+                        } else { env };
+                        let mut args = vec![body_env];
                         args.extend(untupled);
                         let env_outlives_frame = self.closure_values_outliving_frame.contains(&env);
                         let result = self.emit_call_at(*fn_span, Inst::Call { callee, args }, expr_ty);
@@ -34127,6 +34498,10 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                 // case is RE-SORTED below rather than refused, and every other position keeps
                 // `Ty::Unit`, which is what `map_ty` spells for the closure's own type and what
                 // the surrounding lane is therefore declared to hold.
+                if self.zero_capture_closure_admissible(expr_ty)
+                    && self.opaque_return_tail_closure != Some(id) {
+                    return self.lower_fn_once_closure(expr_ty, &upvar_ids, expr_span);
+                }
                 if upvar_tys.is_empty()
                     && matches!(expr_ty.kind(), ty::Closure(def, _) if !self.tcx.is_coroutine(*def))
                     && (self.is_drop_free_zst(expr_ty) || !layout_query_is_reentrant_safe(expr_ty))
@@ -40757,6 +41132,15 @@ fn try_lower_mut_call_temp_slot(
                 return None;
             }
         };
+        // The Rust receiver type does not establish the lowered SSA spelling.
+        // Opaque enum payloads can be bound to a fact-free Unit carrier; using
+        // that value as a fat pointer would invalidate the entire crate module.
+        // Share the existing value-provenance owner with field projection so
+        // aliases cannot launder an opaque carrier into pointer metadata.
+        if self.carrier_spelling(slice_val).is_some() {
+            self.unsupported.push((format!("{span:?}"), "SliceLen(opaque receiver carrier)"));
+            return None;
+        }
         // Trust (B2-1): the receiver is now first-class `Ty::FatPtr(Slice)` — the len
         // is the metadata lane, read via the FORMAT's own projection (`PtrMetadata`,
         // canonical metadata type = the pointer-sized unsigned U64). A receiver whose
@@ -58899,6 +59283,7 @@ mod seed_final_value_tests {
                 Constant::Int(_)
                 | Constant::U128(_)
                 | Constant::Bytes { .. }
+                | Constant::TensorBlob { .. }
                 | Constant::Float(_)
                 | Constant::Bool(_)
                 | Constant::Vector(_)
@@ -58907,12 +59292,13 @@ mod seed_final_value_tests {
                 | Constant::Record(_)
                 | Constant::Closure { .. }
                 | Constant::FnDef(_)
+                // Nominal identity needs its source type/definition binding;
+                // this untyped placeholder predicate grants neither.
+                | Constant::FnItem(_)
                 | Constant::SymbolAddr { .. }
                 // An unwritten lane holds no value at all, so it is no lane's inhabitant.
                 | Constant::Uninit
-                // Trust: a trust-ir v70 tensor weight is a chosen input named by digest,
-                // never a lane's unique inhabitant.
-                | Constant::TensorBlob { .. } => false,
+                => false,
                 // Level R (trust-ir amendment S): a module constant has no extension.
                 Constant::Ext(e) => e.unreachable(),
             }
@@ -58921,6 +59307,9 @@ mod seed_final_value_tests {
             Constant::Int(0),
             Constant::U128(u128::from(u64::MAX) + 1),
             Constant::Bytes { data: vec![0], utf8: false },
+            Constant::TensorBlob {
+                digest: trust_ir::blob::BlobDigest::of(&[0]), dims: vec![1],
+            },
             Constant::Float(0.0),
             Constant::Bool(false),
             Constant::Aggregate(Vec::new()),
@@ -58930,6 +59319,7 @@ mod seed_final_value_tests {
             Constant::Set(Vec::new()),
             Constant::Record(Vec::new()),
             Constant::FnDef(trust_ir::FuncId::new(0)),
+            Constant::FnItem(trust_ir::FuncId::new(0)),
             Constant::SymbolAddr { symbol: "g".to_string(), addend: 0 },
             Constant::PhantomData,
             Constant::splat(Constant::PhantomData, 2),
@@ -58938,6 +59328,7 @@ mod seed_final_value_tests {
                 digest: trust_ir::blob::BlobDigest::of(&[0, 0, 0, 0]),
                 dims: vec![1],
             },
+            Constant::FnItem(trust_ir::FuncId::new(0)),
         ];
         for c in &probes {
             assert_eq!(
@@ -65151,7 +65542,12 @@ mod g1_mono_entry_point_tests {
     #[test]
     fn monomorphize_is_fail_closed_and_checks_its_postcondition() {
         let code = production_code();
-        let body = fn_span(&code, "monomorphize", "map_ty");
+        let wrapper = squash(fn_span(&code, "monomorphize", "try_monomorphize"));
+        let body = fn_span(&code, "try_monomorphize", "cycle_safe_layout_of");
+        assert!(
+            wrapper.contains("match self.try_monomorphize(value)"),
+            "lowering must use the same fallible normalization as admission",
+        );
         assert!(
             body.contains("try_instantiate_and_normalize_erasing_regions("),
             "the instantiation must use the `Result`-returning spelling",
@@ -65166,12 +65562,13 @@ mod g1_mono_entry_point_tests {
             "the instantiation must run at the fully-monomorphized typing env",
         );
         assert!(
-            body.contains("Ok(out) if !out.has_non_region_param() => out,"),
+            body.contains("Ok(out) if !out.has_non_region_param() => Some(out),"),
             "the OUTPUT must be re-checked for residual parameters — the mirror of the \
              `has_non_region_param` rejection `instance_flip` makes on the MIR side",
         );
         assert!(
-            body.contains("self.mono_residual = true;"),
+            body.contains("Ok(_) | Err(_) => None,")
+                && wrapper.contains("None => { self.mono_residual = true; value }"),
             "and a failed or incomplete instantiation must arm the tripwire, not fall through",
         );
     }

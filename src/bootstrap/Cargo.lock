@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "trust-build-cpu"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "libc",
  "serde",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "trust-sha2"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "typenum"

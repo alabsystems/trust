@@ -21,6 +21,24 @@ use crate::core::build_steps::llvm::{LLVM_INVALIDATION_PATHS, LlvmKind, get_llvm
 use crate::core::builder::Builder;
 
 #[test]
+fn library_test_selector_is_explicit_and_mutually_exclusive() {
+    use clap::Parser;
+
+    use crate::core::build_steps::test::TestTarget;
+
+    for command in ["test", "miri"] {
+        let parsed = Flags::try_parse_from(["x.py", command, "--lib"]).unwrap();
+        assert_eq!(parsed.cmd.test_target(), TestTarget::Lib);
+        assert!(!parsed.cmd.test_target().runs_doctests());
+        let default = Flags::try_parse_from(["x.py", command]).unwrap();
+        assert_eq!(default.cmd.test_target(), TestTarget::Default);
+        for conflicting in ["--tests", "--all-targets", "--doc", "--no-doc"] {
+            assert!(Flags::try_parse_from(["x.py", command, "--lib", conflicting]).is_err());
+        }
+    }
+}
+
+#[test]
 fn compiler_profile_keeps_paired_lld_with_selected_external_llvm() {
     let context = crate::utils::tests::TestCtx::new();
     let host = crate::utils::helpers::get_host_target();
@@ -263,26 +281,141 @@ fn clap_verify() {
 // Trust: native reuse binds actual parser inputs, including includes/profiles.
 #[test]
 fn native_config_retains_exact_loaded_include_and_profile_bytes() {
-    let context = TestCtx::new();
+    let context = TestCtx::new().retain();
     let included = context.dir().join("extra.toml");
-    fs::write(&included, "[rust]\ndeny-warnings = false\n").unwrap();
+    let nested = context.dir().join("nested.toml");
+    let leaf = context.dir().join("leaf.toml");
+    fs::write(&included, "include = ['nested.toml']\n[rust]\ndeny-warnings = false\n").unwrap();
+    fs::write(&nested, "include = ['leaf.toml']\n").unwrap();
+    fs::write(&leaf, "[rust]\ndeny-warnings = true\n").unwrap();
     let config = context
         .config("test")
         .arg("--trust-repo-check")
         .stage(1)
         .with_default_toml_config("include = ['extra.toml']\nprofile = 'compiler'\n")
         .create_config();
-    assert!(config.native_repo_config_inputs.len() >= 3);
+    assert!(config.native_repo_config_inputs.len() >= 5);
     for (path, digest) in &config.native_repo_config_inputs {
         assert_eq!(*digest, crate::utils::trust_repo_cache::file_digest(path).unwrap());
     }
     assert!(config.native_repo_config_inputs.iter().any(|(path, _)| path == &included));
+    for expected in [&nested, &leaf] {
+        let expected = expected.canonicalize().unwrap();
+        assert!(config.native_repo_config_inputs.iter().any(|(path, _)| path == &expected));
+    }
+    assert!(!config.deny_warnings, "the outer include keeps precedence over nested defaults");
     assert!(
         config
             .native_repo_config_inputs
             .iter()
             .any(|(path, _)| path.ends_with("bootstrap.compiler.toml"))
     );
+    context.close().expect("remove passed native config fixture");
+}
+
+#[test]
+fn seed_configuration_projects_the_actual_include_profile_and_empty_override() {
+    let context = TestCtx::new().retain();
+    let root = context.dir();
+    let defaults = root.join("src/bootstrap/defaults");
+    fs::create_dir_all(&defaults).unwrap();
+    fs::create_dir(root.join("nested")).unwrap();
+    let config = root.join("bootstrap.toml");
+    let files = [
+        (
+            config.clone(),
+            "include = ['outer.toml', 'later.toml']\nprofile = 'user'\n[build]\nrustc = ''\n",
+        ),
+        (
+            root.join("outer.toml"),
+            "include = ['nested/leaf.toml']\n[build]\ncargo = 'outer-cargo'\n",
+        ),
+        (root.join("later.toml"), "[build]\ncargo = 'later-cargo'\n"),
+        (root.join("nested/leaf.toml"), "[build]\ncargo = 'leaf-cargo'\n"),
+        (
+            defaults.join("bootstrap.dist.toml"),
+            "include = ['profile-extra.toml']\n[build]\nrustc = 'profile-rustc'\ncargo = 'profile-cargo'\n",
+        ),
+        (defaults.join("profile-extra.toml"), "[build]\nrustc = 'profile-extra-rustc'\n"),
+    ];
+    for (path, text) in &files {
+        fs::write(path, text).unwrap();
+    }
+    let selected = crate::engine::seed_configuration(root, Some(config.clone()), false).unwrap();
+    // D12 must reject Some even when the configured path is empty.
+    assert_eq!(selected.rustc_override(), Some(Path::new("")));
+    assert_eq!(selected.cargo_override(), Some(Path::new("later-cargo")));
+    assert_eq!(selected.inputs().len(), files.len());
+    for (index, (expected, contents)) in files.iter().enumerate() {
+        // The ordinary parser preserves top-level selected spellings and
+        // canonicalizes nested include paths before reading them. /var can
+        // alias /private/var on macOS; assert those exact reader semantics.
+        let expected = if matches!(index, 3 | 5) {
+            expected.canonicalize().unwrap()
+        } else {
+            expected.clone()
+        };
+        let digest = crate::utils::trust_repo_cache::bytes_digest(contents.as_bytes());
+        assert!(
+            selected.inputs().iter().any(|(path, value)| path == &expected && value == &digest)
+        );
+    }
+
+    fs::write(&config, "profile = 'user'\n").unwrap();
+    let profile = crate::engine::seed_configuration(root, Some(config.clone()), false).unwrap();
+    assert_eq!(profile.rustc_override(), Some(Path::new("profile-rustc")));
+    assert_eq!(profile.cargo_override(), Some(Path::new("profile-cargo")));
+
+    fs::write(&config, "").unwrap();
+    let tarball = crate::engine::seed_configuration(root, Some(config.clone()), true).unwrap();
+    assert_eq!(tarball.rustc_override(), profile.rustc_override());
+    assert_eq!(tarball.cargo_override(), profile.cargo_override());
+    let checkout = crate::engine::seed_configuration(root, Some(config), false).unwrap();
+    assert_eq!(checkout.rustc_override(), None);
+    assert_eq!(checkout.cargo_override(), None);
+    assert_eq!(checkout.inputs().len(), 1);
+    context.close().unwrap();
+}
+
+#[test]
+fn seed_configuration_returns_invalid_data_without_exiting_for_bad_toml_or_cycles() {
+    let context = TestCtx::new().retain();
+    let root = context.dir();
+    let config = root.join("bootstrap.toml");
+    for invalid in [
+        "[build]\nrustc = false\n",
+        "[build]\ncargo = false\n",
+        "[build]\nunknown-seed-selector = 'tool'\n",
+        "[build\n",
+    ] {
+        fs::write(&config, invalid).unwrap();
+        let error =
+            crate::engine::seed_configuration(root, Some(config.clone()), false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("bootstrap.toml"));
+    }
+    fs::write(&config, "include = ['cycle.toml']\n").unwrap();
+    fs::write(root.join("cycle.toml"), "include = ['bootstrap.toml']\n").unwrap();
+    let error = crate::engine::seed_configuration(root, Some(config), false).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("Cyclic inclusion detected"));
+    context.close().unwrap();
+}
+
+#[test]
+fn seed_configuration_preserves_missing_input_errors_without_falling_back() {
+    let context = TestCtx::new().retain();
+    let root = context.dir();
+    let config = root.join("bootstrap.toml");
+    for contents in [None, Some("include = ['missing.toml']\n"), Some("profile = 'missing'\n")] {
+        if let Some(contents) = contents {
+            fs::write(&config, contents).unwrap();
+        }
+        let error =
+            crate::engine::seed_configuration(root, Some(config.clone()), false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    }
+    context.close().unwrap();
 }
 
 #[test]
@@ -1480,7 +1613,8 @@ fn dry_download_plans_ignore_and_do_not_populate_real_download_cache() {
 fn vf5_resource_config_keeps_absence_and_source_relative_pair() {
     assert!(parse("").vf5_base.is_none());
     let digest = "12".repeat(32);
-    let config = parse(&format!("[build]\nvf5-base = 'mathematics/base'\nvf5-base-sha256 = '{digest}'\n"));
+    let config =
+        parse(&format!("[build]\nvf5-base = 'mathematics/base'\nvf5-base-sha256 = '{digest}'\n"));
     let input = config.vf5_base.as_ref().unwrap();
     assert_eq!(input.package, config.src.join("mathematics/base"));
     assert_eq!(input.manifest_sha256, digest);
@@ -1488,7 +1622,9 @@ fn vf5_resource_config_keeps_absence_and_source_relative_pair() {
 
 #[test]
 fn vf5_resource_config_refuses_each_missing_half() {
-    for value in ["vf5-base = 'base'".to_owned(), format!("vf5-base-sha256 = '{}'", "12".repeat(32))] {
+    for value in
+        ["vf5-base = 'base'".to_owned(), format!("vf5-base-sha256 = '{}'", "12".repeat(32))]
+    {
         assert!(std::panic::catch_unwind(|| parse(&format!("[build]\n{value}\n"))).is_err());
     }
 }
@@ -1496,11 +1632,50 @@ fn vf5_resource_config_refuses_each_missing_half() {
 #[test]
 fn vf5_resource_config_refuses_malformed_digest_and_empty_package() {
     for digest in [String::new(), "12".to_owned(), "A0".repeat(32), "g0".repeat(32)] {
-        assert!(std::panic::catch_unwind(|| parse(&format!(
-            "[build]\nvf5-base = 'base'\nvf5-base-sha256 = '{digest}'\n"
-        ))).is_err());
+        assert!(
+            std::panic::catch_unwind(|| parse(&format!(
+                "[build]\nvf5-base = 'base'\nvf5-base-sha256 = '{digest}'\n"
+            )))
+            .is_err()
+        );
     }
-    assert!(std::panic::catch_unwind(|| parse(&format!(
-        "[build]\nvf5-base = ''\nvf5-base-sha256 = '{}'\n", "12".repeat(32)
-    ))).is_err());
+    assert!(
+        std::panic::catch_unwind(|| parse(&format!(
+            "[build]\nvf5-base = ''\nvf5-base-sha256 = '{}'\n",
+            "12".repeat(32)
+        )))
+        .is_err()
+    );
+}
+
+#[test]
+fn linked_submodule_checkout_names_the_store_it_shares() {
+    // A second worktree's checkout made by `scripts/submodule_sync.sh
+    // --restore`: its `.git` file names <store>/worktrees/<id>, which has a
+    // commondir. bootstrap's `update_submodule` must leave such a checkout to
+    // the script.
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path();
+    let store = root.join("first/.git/modules/m");
+    let registration = store.join("worktrees/m");
+    fs::create_dir_all(&registration).unwrap();
+    fs::write(registration.join("commondir"), "../..\n").unwrap();
+    let linked = root.join("second/m");
+    fs::create_dir_all(&linked).unwrap();
+    fs::write(linked.join(".git"), "gitdir: ../../first/.git/modules/m/worktrees/m\n").unwrap();
+    let shared = super::linked_submodule_store(&linked).expect("a linked checkout shares a store");
+    assert_eq!(shared.canonicalize().unwrap(), store.canonicalize().unwrap());
+
+    // The first checkout's own: its `.git` file names the store itself.
+    let own = root.join("first/m");
+    fs::create_dir_all(&own).unwrap();
+    fs::write(own.join(".git"), "gitdir: ../.git/modules/m\n").unwrap();
+    assert_eq!(super::linked_submodule_store(&own), None);
+    // A clone of its own, and a directory nothing has checked out yet.
+    let cloned = root.join("cloned");
+    fs::create_dir_all(cloned.join(".git")).unwrap();
+    assert_eq!(super::linked_submodule_store(&cloned), None);
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    assert_eq!(super::linked_submodule_store(&empty), None);
 }

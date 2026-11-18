@@ -59,7 +59,7 @@ fn recorded_foreign_prefix_routes_but_requires_original_source_admission() {
         roots: &roots, has_statics: false, target_triple: "arm64-apple-macosx", pointer_size: 8 };
     assert!(routing::uses_native_source(&route));
     let items = [NativeWorkItem { func: FuncId::new(0), symbol: "caller".into(),
-        linkage: FunctionLinkage::External, never_inline: false, placement: None, inventory_residue: false }];
+        linkage: FunctionLinkage::External, never_inline: false, placement: None, inventory_residue: false, adapter_identity: None }];
     let mut input = NativeModuleInput { producer: &m, base: Some(&m), items: &items,
         conserved: &ids, source_ids: &ids, foreign_declarations: &BTreeSet::new(), has_statics: false,
         target: &ExpectedTarget { triple: "arm64-apple-macosx".into(), pointer_size: 8 } };

@@ -1,7 +1,6 @@
 // Copyright 2026 Andrew Yates | Apache-2.0
 use super::*;
-use crate::compiler_input_capture::CompilerInputCapture;
-const INPUT: &[u8] = include_bytes!("../../compiler_frame_inputs/actual-b8-caller-input.json");
+use crate::compiler_input_capture::historical_b8_data_for_tests;
 const CALLER: &str = "source_memory_caller";
 fn guarded<T>(f: impl FnOnce() -> T) -> T {
     crate::original_conjunction_certificate::without_production(|| {
@@ -17,7 +16,7 @@ fn check_actual() {
     let directory = std::path::PathBuf::from(
         std::env::var_os("TRUST_FRAME_CALLER_COHORT").expect("actual caller cohort required"),
     );
-    let data = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    let data = historical_b8_data_for_tests();
     actual_callee_alias_control(&data.input());
     let normal = crate::call_event::verify_compiled_module(&data.input()).unwrap();
     let grades = normal
@@ -78,7 +77,7 @@ fn check_actual() {
         assert!(guarded(|| fresh.replay_conditional_frame(&changed, &data.input())).is_err());
     }
     // Same source spelling and framed caller bytes, different real callee bytes.
-    let mut other = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    let mut other = historical_b8_data_for_tests();
     let callee = BoundFunction::bind(
         &other.object,
         &other.m_cg,

@@ -113,8 +113,16 @@ where
 /// instead of declining (a 2 MiB thread, a 16-deep left-nested `^` chain, in a
 /// debug build). The stack is switched, not the thread, so thread-locals (the
 /// test hooks among them) and panics behave as they did on the caller's stack.
-fn on_route_stack<T>(route: impl FnOnce() -> T) -> T {
+pub(crate) fn on_route_stack<T>(route: impl FnOnce() -> T) -> T {
     stacker::grow(RECHECK_STACK_BYTES, route)
+}
+
+/// Same-thread checks retain the caller's no-production custody while using
+/// the existing shared kernel permit and stack bound.
+#[cfg(feature = "fmrel")]
+pub(crate) fn on_kernel_stack<T>(check: impl FnOnce() -> T) -> T {
+    let _permit = RecheckThreadPermit::acquire();
+    on_route_stack(check)
 }
 
 /// The slow bit-blast certificate lane shares the same stack permits as the
@@ -217,6 +225,10 @@ pub(crate) mod kx {
     pub fn div(a: Expr, b: Expr) -> Expr {
         Expr::apps(Expr::const_str("Clean.BVC.BvF.Div"), [a, b])
     }
+    #[cfg(feature = "fmrel")]
+    pub fn sdiv(a: Expr, b: Expr) -> Expr {
+        Expr::apps(Expr::const_str("Clean.BVC.BvF.SDiv"), [a, b])
+    }
     pub fn shl(a: Expr, b: Expr) -> Expr {
         Expr::apps(Expr::const_str("Clean.BVC.BvF.Shl"), [a, b])
     }
@@ -268,6 +280,10 @@ pub(crate) mod kx {
     }
     pub fn div_cong(a: Expr, ap: Expr, b: Expr, bp: Expr, ha: Expr, hb: Expr) -> Expr {
         Expr::apps(Expr::const_str("Clean.BVC.bvf_div_cong"), [a, ap, b, bp, ha, hb])
+    }
+    #[cfg(feature = "fmrel")]
+    pub fn sdiv_cong(a: Expr, ap: Expr, b: Expr, bp: Expr, ha: Expr, hb: Expr) -> Expr {
+        Expr::apps(Expr::const_str("Clean.BVC.bvf_sdiv_cong"), [a, ap, b, bp, ha, hb])
     }
     pub fn shl_cong(a: Expr, ap: Expr, b: Expr, bp: Expr, ha: Expr, hb: Expr) -> Expr {
         Expr::apps(Expr::const_str("Clean.BVC.bvf_shl_cong"), [a, ap, b, bp, ha, hb])
@@ -369,6 +385,10 @@ pub(crate) mod kx {
     }
     pub fn bv_not(xs: Expr) -> Expr {
         Expr::app(Expr::const_str("Clean.BVC.bvNot"), xs)
+    }
+    #[cfg(feature = "fmrel")]
+    pub fn bv_neg(xs: Expr) -> Expr {
+        Expr::app(Expr::const_str("Clean.BVC.bvNeg"), xs)
     }
     pub fn add_rec_m(xs: Expr, ys: Expr, c: Expr) -> Expr {
         Expr::apps(Expr::const_str("Clean.BVI.addRecM"), [xs, ys, c])
@@ -545,6 +565,9 @@ pub(crate) struct ReflectCtx {
     /// `branching_steps`, so no goal reflection (`branching_goal`,
     /// `branch_reflect`'s `goal_only`) reaches them.
     div_steps: bool,
+    /// Untrusted proposal only; never selected by any legacy goal/grade route.
+    #[cfg(feature = "fmrel")]
+    source_goal_advice: bool,
 }
 
 impl ReflectCtx {
@@ -570,6 +593,8 @@ impl ReflectCtx {
             const_div: false,
             const_div_steps: false,
             div_steps: false,
+            #[cfg(feature = "fmrel")]
+            source_goal_advice: false,
         }
     }
 
@@ -727,6 +752,17 @@ fn reflect_node(f: &Formula, ctx: &mut ReflectCtx) -> Result<Reflected, String> 
         }
         Formula::BvUDiv(l, r, _w) if ctx.div_steps && ctx.branching_steps => {
             div_split::udiv(l, r, ctx)
+        }
+        // These terms are DATA for the canonical original-byte relation, never
+        // legacy goal authority. The fmrel consumer must check the complete
+        // relation and final ConjHoldsB proof in the fenced reference entry.
+        #[cfg(feature = "fmrel")]
+        Formula::BvSDiv(a, b, _) if ctx.source_goal_advice => {
+            div_split::source_advice::sdiv(a, b, ctx)
+        }
+        #[cfg(feature = "fmrel")]
+        Formula::BvNot(a, w) if ctx.source_goal_advice => {
+            div_split::source_advice::bvnot(a, *w, ctx)
         }
         // BRANCH-SPLIT-1: the bit-vector `Ite` and the faithful unsigned
         // division, active only under `ctx.branching` (`branch_reflect`).
@@ -2933,6 +2969,10 @@ mod branch_split;
 // and the dispatch that orders the two (the step-(5) branch routes).
 #[path = "verify_output_instantiate/div_split.rs"]
 mod div_split;
+#[cfg(feature = "fmrel")]
+pub(crate) use div_split::source_advice::bank::{
+    Advice as FormulaAdvice, propose as formula_advice,
+};
 
 #[path = "verify_output_instantiate/branch_dispatch.rs"]
 mod branch_dispatch;
@@ -3023,7 +3063,15 @@ pub fn record_branch_split_conjunctions<R>(
 pub(crate) fn try_original_conjunction_discharge(
     items: &[(Formula, Formula)],
 ) -> Option<crate::original_conjunction_certificate::CheckedOriginalConjunction> {
-    on_route_stack(|| memory_reflection::discharge_conjunction(items))
+    on_route_stack(|| {
+        if let Some(checked) = memory_reflection::discharge_conjunction(items) {
+            return Some(checked);
+        }
+        #[cfg(feature = "fmrel")]
+        return crate::original_conjunction_certificate::check_formula_produced(items).ok();
+        #[cfg(not(feature = "fmrel"))]
+        None
+    })
 }
 
 pub(crate) fn try_mem_store_load_discharge(

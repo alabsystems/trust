@@ -97,8 +97,10 @@ fn actual_withheld_one_use_and_poison_cannot_release_original_exclusion() {
             panic!("original transition was not retained")
         };
         assert!(std::sync::Arc::ptr_eq(&lease, held));
-        // Unit DATA only, never an opaque supported Host. Production attaches
-        // this binding only after the actual client support negotiation.
+        // Unit DATA only, never an opaque supported Host. This test attaches
+        // the binding directly. Outside tests only the unwired
+        // `prepare_input_retention` negotiation would, and that module and
+        // this field are compiled only with tests.
         *retention = Some(RetentionBinding { context: context(), binding: query().binding });
     }
     drop(lease);

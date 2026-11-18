@@ -13,6 +13,8 @@ use clap::{Arg, ArgAction};
 use trust_build_tree::admission::{
     Attempt, FixedCommandAdmission, FixedCpuRequest, RunningFixedGroup,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use trust_build_tree::admission::ExecutionStartPipe;
 
 #[path = "resource_fixed/adopt.rs"]
 mod adopt;
@@ -25,8 +27,8 @@ const MAX_WAIT_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 fn cli() -> clap::Command {
     clap::Command::new("targo --unverified resource fixed")
-        .about("Run an ordinary Targo job or native repo-lock-exec under fixed host admission")
-        .after_help(trust_build_tree::trust_repo_lock::management::exec::USAGE)
+        .about("Run an ordinary Targo job, held native tool or repo-lock-exec under fixed host admission")
+        .after_help(format!("{}\nSelected tool: targo --unverified resource fixed [sizing] -- fixed-tool -- ABSOLUTE_NATIVE_PROGRAM [args...]\nThe native system-only image is held and checked while stopped before GO. This is original fixed/GNU continuation, not SDK or hosted-runtime authority.", trust_build_tree::trust_repo_lock::management::exec::USAGE))
         .arg(
             Arg::new("cpus")
                 .long("cpus")
@@ -54,6 +56,26 @@ fn cli() -> clap::Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("execution-start-fd")
+                .long("execution-start-fd")
+                .hide(true)
+                .value_parser(clap::builder::OsStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("command")
+                .required(true)
+                .num_args(1..)
+                .last(true)
+                .value_parser(clap::builder::OsStringValueParser::new()),
+        )
+}
+
+// Trust: this continuation is reached only with the original fixed claim and
+// GNU transport. A fresh caller uses `resource fixed -- fixed-tool -- ...`.
+fn fixed_tool_cli() -> clap::Command {
+    clap::Command::new("fixed-tool")
+        .about("Continue original fixed admission for an absolute native system-only tool")
+        .arg(
             Arg::new("command")
                 .required(true)
                 .num_args(1..)
@@ -66,6 +88,7 @@ pub(super) fn help_command() -> clap::Command {
     clap::Command::new("resource")
         .about("Native resource admission")
         .subcommand(cli().name("fixed"))
+        .subcommand(fixed_tool_cli())
         .subcommand(super::resource_prune::help_command())
         .subcommand(
             clap::Command::new("status")
@@ -93,17 +116,38 @@ struct Options {
     exclusive: bool,
     timeout: Option<Duration>,
     command: Vec<OsString>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    execution_start: Option<ExecutionStartPipe>,
 }
 
-fn options(args: &[OsString]) -> Result<Options> {
-    let matches = cli().try_get_matches_from(
-        std::iter::once(OsString::from("resource fixed")).chain(args.iter().cloned()),
-    )?;
-    let command = matches
-        .get_many::<OsString>("command")
-        .expect("required command")
-        .cloned()
-        .collect::<Vec<_>>();
+// Trust: explicit operation intent, never executable-name inference or an
+// admission capability. The existing native owner captures the selected image.
+enum CommandIntent<'a> {
+    Targo,
+    Tool {
+        program: &'a OsStr,
+        args: &'a [OsString],
+    },
+}
+
+fn command_intent(command: &[OsString]) -> Result<CommandIntent<'_>> {
+    if command.first().is_some_and(|arg| arg == "fixed-tool") {
+        ensure!(
+            command.get(1).is_some_and(|arg| arg == "--"),
+            "fixed-tool requires its explicit -- program delimiter"
+        );
+        let program = command
+            .get(2)
+            .context("fixed-tool requires an absolute native program")?;
+        ensure!(
+            std::path::Path::new(program).is_absolute(),
+            "fixed-tool requires an absolute native program; PATH lookup is not image custody"
+        );
+        return Ok(CommandIntent::Tool {
+            program,
+            args: &command[3..],
+        });
+    }
     ensure!(
         command
             .first()
@@ -123,8 +167,31 @@ fn options(args: &[OsString]) -> Result<Options> {
                         | "repo-prune"
                 )
             }),
-        "native fixed admission requires an ordinary Targo compile/test command or exact repo-lock-exec after --"
+        "native fixed admission requires an ordinary Targo command, fixed-tool, or exact repo-lock-exec after --"
     );
+    Ok(CommandIntent::Targo)
+}
+
+fn options(args: &[OsString]) -> Result<Options> {
+    let matches = cli().try_get_matches_from(
+        std::iter::once(OsString::from("resource fixed")).chain(args.iter().cloned()),
+    )?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let execution_start = matches
+        .get_one::<OsString>("execution-start-fd")
+        .map(|value| ExecutionStartPipe::from_descriptor(value))
+        .transpose()?;
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    ensure!(
+        matches.get_one::<OsString>("execution-start-fd").is_none(),
+        "native loaded execution-start is unavailable on this platform; no command started"
+    );
+    let command = matches
+        .get_many::<OsString>("command")
+        .expect("required command")
+        .cloned()
+        .collect::<Vec<_>>();
+    let _ = command_intent(&command)?;
     let memory = matches
         .get_one::<NonZeroU64>("memory-mib")
         .expect("default memory")
@@ -154,6 +221,8 @@ fn options(args: &[OsString]) -> Result<Options> {
         exclusive: matches.get_flag("exclusive"),
         timeout,
         command,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        execution_start,
     })
 }
 
@@ -195,7 +264,10 @@ pub(super) enum NestedInput {
 pub(super) fn snapshot_nested(args: &[OsString]) -> std::io::Result<Option<NestedInput>> {
     if args.get(..3).is_none_or(|prefix| {
         prefix[..2] != ["--unverified", "resource"]
-            || (prefix[2] != "fixed" && prefix[2] != "repo-prune" && prefix[2] != "budget")
+            || !matches!(
+                prefix[2].to_str(),
+                Some("fixed" | "fixed-tool" | "repo-prune" | "budget")
+            )
     }) {
         return Ok(None);
     }
@@ -297,43 +369,78 @@ fn run_nested(options: Options, input: NestedInput) -> Result<i32> {
         .context("nested fixed admission requires its original GNU transport")?
         .clone();
     let worktree = worktree_lock()?;
-    let mut command = Command::new(std::env::current_exe()?);
-    command.arg("--unverified");
+    let output_directory = original.original_output_cwd()?;
+    let intent = command_intent(&options.command)?;
+    let mut command = match &intent {
+        CommandIntent::Targo => {
+            let mut command = Command::new(std::env::current_exe()?);
+            command.arg("--unverified");
+            command
+        }
+        CommandIntent::Tool { program, args } => {
+            let mut command = Command::new(program);
+            command.args(*args);
+            command
+        }
+    };
     // The selected self image has the closed native system-only load profile.
     // Do not carry Cargo's generated build-script loader search list, or any
     // other loader override, into this known frontend. This chooses no alternate
     // image or runtime; the actual stopped image is still checked before GO.
-    for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(b"DYLD_")
-            || name.as_encoded_bytes().starts_with(b"LD_")
-        {
-            command.env_remove(name);
+    // An explicitly selected tool keeps its requested environment semantics:
+    // the held native owner refuses loader overrides instead of deleting them.
+    if matches!(intent, CommandIntent::Targo) {
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"DYLD_")
+                || name.as_encoded_bytes().starts_with(b"LD_")
+            {
+                command.env_remove(name);
+            }
         }
+        if options
+            .command
+            .first()
+            .is_some_and(|arg| arg == "repo-prune")
+        {
+            command.arg("resource");
+        }
+        command.args(&options.command);
     }
-    if options
-        .command
-        .first()
-        .is_some_and(|arg| arg == "repo-prune")
-    {
-        command.arg("resource");
-    }
-    command.args(&options.command);
     // SAFETY: the original native entry captures this GNU transport exactly
     // once. The checked fixed originals and same worktree are retained, Host/
     // SDK/worker routes were refused, and this wrapper waits serially while
     // the outer owner continues to own group signalling/retirement. This
-    // command changes only argv/environment and retains original cwd/stdio.
+    // command retains console stdio. A V2 output continuation additionally
+    // pins its SAME actual current directory for native child-only fchdir;
+    // it cannot substitute a pathname or manufacture V1 membership.
     let prepared = unsafe {
-        original.prepare_nested_command(
-            command,
-            scheduler,
-            budget,
-            worktree.as_deref(),
-            options.exclusive,
-            Instant::now()
-                .checked_add(Duration::from_secs(30))
-                .context("nested input deadline overflow")?,
-        )?
+        if let Some(directory) = output_directory {
+            original.prepare_nested_output_command(
+                command,
+                scheduler,
+                budget,
+                directory,
+                options.exclusive,
+                Instant::now()
+                    .checked_add(Duration::from_secs(30))
+                    .context("nested output input deadline overflow")?,
+            )?
+        } else {
+            original.prepare_nested_command(
+                command,
+                scheduler,
+                budget,
+                worktree.as_deref(),
+                options.exclusive,
+                Instant::now()
+                    .checked_add(Duration::from_secs(30))
+                    .context("nested input deadline overflow")?,
+            )?
+        }
+    };
+    let prepared = match options.execution_start {
+        Some(pipe) => prepared.with_execution_start(pipe)?,
+        None => prepared,
     };
     let mut owner = prepared.spawn()?;
     // Same existing group: the outer owner retains all group signalling and
@@ -413,6 +520,30 @@ pub(super) fn dispatch(
         return None;
     }
     Some((|| {
+        if args.get(2).is_some_and(|arg| arg == "fixed-tool") {
+            if args.len() == 4 && matches!(args[3].to_str(), Some("--help" | "-h")) {
+                fixed_tool_cli().print_help()?;
+                let mut output = std::io::stdout().lock();
+                writeln!(output)?;
+                output.flush()?;
+                return Ok(0);
+            }
+            let matches = fixed_tool_cli().try_get_matches_from(
+                std::iter::once(OsString::from("fixed-tool")).chain(args[3..].iter().cloned()),
+            )?;
+            let command = matches
+                .get_many::<OsString>("command")
+                .context("missing selected native tool")?;
+            let options = options(
+                &std::iter::once(OsString::from("--"))
+                    .chain([OsString::from("fixed-tool"), OsString::from("--")])
+                    .chain(command.cloned())
+                    .collect::<Vec<_>>(),
+            )?;
+            return run_nested(options, nested.context(
+                "fixed-tool requires an authenticated original fixed claim; use resource fixed -- fixed-tool -- PROGRAM outside an existing admission",
+            )?);
+        }
         if args.get(2).is_some_and(|arg| arg == "budget") {
             return budget::dispatch(&args[3..], nested);
         }
@@ -454,6 +585,15 @@ pub(super) fn dispatch(
             return Ok(0);
         }
         let options = options(&args[3..])?;
+        if matches!(
+            command_intent(&options.command)?,
+            CommandIntent::Tool { .. }
+        ) {
+            ensure!(
+                cfg!(all(target_os = "macos", target_arch = "aarch64")),
+                "held selected-tool execution is unavailable on this platform; no admission or child started"
+            );
+        }
         if let Some(input) = nested {
             return run_nested(options, input);
         }
@@ -480,9 +620,14 @@ pub(super) fn dispatch(
             .command
             .first()
             .is_some_and(|arg| arg == "repo-lock-exec");
+        let selected_tool = matches!(
+            command_intent(&options.command)?,
+            CommandIntent::Tool { .. }
+        );
         let mut command = Command::new(std::env::current_exe()?);
         command.arg("--unverified");
         if repo_exec
+            || selected_tool
             || options
                 .command
                 .first()
@@ -496,6 +641,21 @@ pub(super) fn dispatch(
         // the probe. A failed/unknown probe therefore cannot release a claim
         // whose command scope might still be live.
         let mut command = attribution::command(&context, command, deadline)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let native_image = if options.execution_start.is_some() {
+            Some(trust_resource_provenance::program::HeldSystemCommand::open(
+                std::path::Path::new(command.get_program()),
+                deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(30))
+                    .min(Instant::now() + Duration::from_secs(30)),
+            ).context("capture original native execution-start orchestrator")?)
+        } else {
+            None
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let observed_launch = native_image.is_some();
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let observed_launch = false;
         let mut admission = FixedCommandAdmission::for_current_user(
             worktree_lock()?,
             options.slots,
@@ -509,7 +669,10 @@ pub(super) fn dispatch(
                 deadline.is_none_or(|until| Instant::now() < until),
                 "native fixed admission timed out; no command started"
             );
-            match admission.attempt()? {
+            match admission
+                .attempt()
+                .context("native fixed admission attempt")?
+            {
                 Attempt::Admitted(claim) => {
                     ensure!(
                         deadline.is_none_or(|until| Instant::now() < until),
@@ -531,6 +694,13 @@ pub(super) fn dispatch(
                 }
             }
         };
+        let claim = if observed_launch {
+            claim
+                .with_original_output_member()
+                .context("issue original fixed Root output member")?
+        } else {
+            claim
+        };
         // Only a standalone owned fixed root without an inherited scheduler
         // creates its one original GNU server. Consume its real implicit credit
         // exactly as ordinary Cargo does; inner exec never creates a pool.
@@ -538,15 +708,22 @@ pub(super) fn dispatch(
             .command
             .first()
             .is_some_and(|arg| arg == "repo-prune");
-        let original_exec_server =
-            if (repo_exec || repo_prune) && context.jobserver_from_env()?.is_none() {
-                let mut original = cargo_util::Jobserver::new(claim.budget().get() as usize)?;
-                original.client().acquire_raw()?;
-                original.enable_descendant_handoff()?;
-                Some(original)
-            } else {
-                None
-            };
+        let original_exec_server = if (repo_exec || repo_prune || selected_tool || observed_launch)
+            && context.jobserver_from_env()?.is_none()
+        {
+            let mut original = cargo_util::Jobserver::new(claim.budget().get() as usize)
+                .context("create original admitted fixed GNU transport")?;
+            original
+                .client()
+                .acquire_raw()
+                .context("retain original fixed implicit GNU credit")?;
+            original
+                .enable_descendant_handoff()
+                .context("retain original fixed GNU courier")?;
+            Some(original)
+        } else {
+            None
+        };
         if let Some(original) = original_exec_server
             .as_ref()
             .or(context.jobserver_from_env()?)
@@ -559,15 +736,48 @@ pub(super) fn dispatch(
             let remaining = deadline.map_or(Duration::from_secs(MAX_WAIT_SECONDS), |until| {
                 until.saturating_duration_since(Instant::now())
             });
-            claim.prepare_exclusive_command(command, remaining)?
+            claim
+                .prepare_exclusive_command(command, remaining)
+                .context("prepare original exclusive command")?
         } else {
-            claim.prepare_command(command)?
+            claim
+                .prepare_command(command)
+                .context("prepare original fixed command")?
         };
         ensure!(
             deadline.is_none_or(|until| Instant::now() < until),
             "native fixed admission timed out; no command started"
         );
-        let mut owner = prepared.spawn_group_with_signal_forwarding()?;
+        let launch_deadline =
+            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(MAX_WAIT_SECONDS));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let mut owner = if let Some(image) = native_image {
+            let scheduler = original_exec_server
+                .as_ref()
+                .or(context.jobserver_from_env()?)
+                .context("native execution-start requires the same original GNU server")?
+                .clone();
+            // SAFETY: this command was built here without caller callbacks,
+            // cwd/stdio redirection, arg0 or env_clear. Only preparation's own
+            // descriptor callback is replaced. This SAME original GNU server
+            // consumed its admitted implicit credit above and is paused while
+            // the child runs; the returned owner retains the complete group.
+            unsafe {
+                prepared.spawn_loaded_group_with_signal_forwarding_before(
+                    image,
+                    scheduler,
+                    options.execution_start,
+                    launch_deadline,
+                )
+            }
+        } else {
+            prepared.spawn_group_with_signal_forwarding_before(launch_deadline)
+        }
+        .context("launch original fixed command group")?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let mut owner = prepared
+            .spawn_group_with_signal_forwarding_before(launch_deadline)
+            .context("launch original fixed command group")?;
         let status = wait_owner(&mut owner)?;
         // Keep the original claim through the actual owning wait. This entry
         // inherits console streams; it owns no detached output-reader task.
@@ -623,6 +833,51 @@ mod tests {
     use super::*;
     fn words(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn selected_tool_requires_an_explicit_absolute_image_without_path_or_shell_fallback() {
+        for command in [
+            vec!["fixed-tool"],
+            vec!["fixed-tool", "/native/tool"],
+            vec!["fixed-tool", "--"],
+            vec!["fixed-tool", "--", "tool"],
+            vec!["fixed-tool", "--", "./tool"],
+        ] {
+            assert!(command_intent(&words(&command)).is_err(), "{command:?}");
+        }
+        let command = words(&["fixed-tool", "--", "/native/tool", "--cpus", "99", ";"]);
+        let CommandIntent::Tool { program, args } = command_intent(&command).unwrap() else {
+            panic!("explicit selected tool became ordinary Targo dispatch");
+        };
+        assert_eq!(program, OsStr::new("/native/tool"));
+        assert_eq!(args, words(&["--cpus", "99", ";"]).as_slice());
+    }
+
+    #[test]
+    fn selected_tool_without_original_custody_cannot_open_its_image_or_acquire_a_new_claim() {
+        // This nonexistent image must not even be opened before authentic
+        // original custody. In particular, no ordinary/unmanaged fallback is
+        // attempted and no GlobalContext or machine admission is constructed.
+        let error = dispatch(
+            &words(&[
+                "--unverified",
+                "resource",
+                "fixed-tool",
+                "--",
+                "/missing-original-custody/native-tool",
+            ]),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an authenticated original fixed claim"),
+            "{error:#}"
+        );
     }
 
     #[test]

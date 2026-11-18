@@ -1675,6 +1675,18 @@ fn bootstrap_cargo_never_persists_compiler_queries_behind_its_shim() {
 /// answered from `.rustc_info.json` and the unit the first one built is kept: the E0514
 /// precondition. With the setting bootstrap's composed commands carry, the second generation
 /// rebuilds, a repeat is still reused, and switching back rebuilds again.
+///
+/// Each generation is rebuilt in place, at the one path the shim's environment names, as x.py
+/// rebuilds a stage's compiler behind an unchanged `RUSTC_REAL`. Targo keys its persisted
+/// queries on the shim's path and content, the libraries of the sysroot a `--print=sysroot`
+/// query through the shim reports, and, on Unix, the complete environment. The driver answers
+/// that query from the one compiler this test resolves, as bootstrap's shim answers it from
+/// the seed in `Mode::Std`, the mode whose setting this test applies; so an in-place rebuild
+/// changes none of the key. (In other modes the shim answers from the driver itself, whose
+/// refilled stage sysroot moves Targo's key.) A generation selected by pointing a variable at
+/// another file would be asked afresh and could not show the stale answer. For the same reason
+/// every run passes one snapshot of this process's environment, which other test threads may
+/// change between runs.
 #[cfg(unix)]
 #[test]
 fn a_driver_rebuilt_behind_the_fixed_shim_is_seen_by_bootstraps_cargo() {
@@ -1719,10 +1731,12 @@ fn a_driver_rebuilt_behind_the_fixed_shim_is_seen_by_bootstraps_cargo() {
     // Bootstrap's shim: one path, one set of bytes and times for the whole test.
     let shim = directory.path().join("rustc-shim");
     executable(&shim, "#!/bin/sh\nexec \"$TRUST_TEST_RUSTC_REAL\" \"$@\"\n".to_string());
-    let generation = |name: &str| {
-        let driver = directory.path().join(format!("driver-{name}"));
+    // The driver: one path for the whole test, rebuilt with new bytes for each generation.
+    let driver = directory.path().join("driver");
+    let rebuild = |name: &str| {
+        let next = directory.path().join("driver.next");
         executable(
-            &driver,
+            &next,
             format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = -vV ]; then\n\
@@ -1734,26 +1748,28 @@ fn a_driver_rebuilt_behind_the_fixed_shim_is_seen_by_bootstraps_cargo() {
                  exec \"$TRUST_TEST_RUSTC_ACTUAL\" \"$@\"\n"
             ),
         );
-        driver
+        fs::rename(&next, &driver).unwrap();
     };
-    let (first, second) = (generation("a"), generation("b"));
 
     let target_dir = directory.path().join("target");
     let invocation_log = directory.path().join("rustc-invocations");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
     let explicit_lane =
         Command::new(&cargo).args(["--unverified", "--version"]).output().unwrap().status.success();
-    let run = |driver: &Path, cache_rustc_info: Option<&OsStr>| {
+    let inherited: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+    let run = |cache_rustc_info: Option<&OsStr>| {
         let mut command = Command::new(&cargo);
         if explicit_lane {
             command.arg("--unverified");
         }
         command
+            .env_clear()
+            .envs(inherited.iter().map(|(key, value)| (key, value)))
             .current_dir(&crate_dir)
             .args(["check", "--offline", "--quiet", "--target-dir"])
             .arg(&target_dir)
             .env("RUSTC", &shim)
-            .env("TRUST_TEST_RUSTC_REAL", driver)
+            .env("TRUST_TEST_RUSTC_REAL", &driver)
             .env("TRUST_TEST_RUSTC_ACTUAL", &actual)
             .env("TRUST_RUSTC_INVOCATION_LOG", &invocation_log)
             .env("CARGO_INCREMENTAL", "0");
@@ -1822,7 +1838,8 @@ fn a_driver_rebuilt_behind_the_fixed_shim_is_seen_by_bootstraps_cargo() {
     let persisted = || fs::read_to_string(target_dir.join(".rustc_info.json")).ok();
 
     // The old bootstrap: Cargo's persisted cache on.
-    run(&first, None);
+    rebuild("a");
+    run(None);
     let built = compiled();
     assert_eq!(built, 1, "the first generation compiles the library once");
     assert!(
@@ -1830,7 +1847,8 @@ fn a_driver_rebuilt_behind_the_fixed_shim_is_seen_by_bootstraps_cargo() {
         "the control needs Cargo to persist the first generation's `-vV`: {:?}",
         persisted()
     );
-    run(&second, None);
+    rebuild("b");
+    run(None);
     assert_eq!(
         compiled(),
         built,
@@ -1841,16 +1859,17 @@ fn a_driver_rebuilt_behind_the_fixed_shim_is_seen_by_bootstraps_cargo() {
 
     // Bootstrap now: the value its composed commands carry.
     let composed = composed.as_deref();
-    run(&second, composed);
+    run(composed);
     assert_eq!(
         compiled(),
         built + 1,
         "with bootstrap's setting ({composed:?}) the new driver's `-vV` must be asked for and \
          the unit rebuilt"
     );
-    run(&second, composed);
+    run(composed);
     assert_eq!(compiled(), built + 1, "an unchanged driver still reuses the unit");
-    run(&first, composed);
+    rebuild("a");
+    run(composed);
     assert_eq!(compiled(), built + 2, "switching back is a change too");
 }
 

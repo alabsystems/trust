@@ -112,6 +112,35 @@ fn entry(f: &mut FunctionBuilder<'_>, types: &[Ty]) -> Vec<ValueId> {
     values
 }
 
+/// A bounded proposal grammar only. Names select candidate syntax; they do
+/// not establish dictionary meaning, erasure, or permission. The complete
+/// original dictionary remains in ArithmeticProposal::erased_prefix.
+fn candidate_dictionary_prefix(operation: &str, dictionary: &Expr) -> bool {
+    if matches!(strip(dictionary).kind(), ExprKind::Const(name, levels)
+        if *name == Name::from_string(&format!("instH{operation}UInt64")) && levels.is_empty())
+    {
+        return true;
+    }
+    // Genuine closed default-instance bridges. Do not unfold providers,
+    // accept local variables, or infer arithmetic from an instance body.
+    let (bridge, provider_name) = match operation {
+        "Add" => ("instHAdd", "instAddUInt64"),
+        "Mul" => ("instHMul", "instMulUInt64"),
+        _ => return false,
+    };
+    let ExprKind::App(typed_bridge, provider) = strip(dictionary).kind() else {
+        return false;
+    };
+    let ExprKind::App(head, carrier) = strip(typed_bridge).kind() else {
+        return false;
+    };
+    uint64(carrier)
+        && matches!(strip(head).kind(), ExprKind::Const(name, levels)
+            if *name == Name::from_string(bridge) && matches!(levels.as_slice(), [clean_kernel::Level::Zero]))
+        && matches!(strip(provider).kind(), ExprKind::Const(name, levels)
+            if *name == Name::from_string(provider_name) && levels.is_empty())
+}
+
 /// Proposed arithmetic is derived from the actual application tree. Its
 /// retained prefix is DATA, not a Rust validation of Prelude/erasure semantics.
 fn arithmetic(
@@ -124,6 +153,7 @@ fn arithmetic(
     used: &mut BTreeSet<usize>,
 ) -> Result<ValueId, String> {
     *budget = budget.checked_sub(1).ok_or("candidate arithmetic node bound")?;
+    let original = e;
     let e = strip(e);
     if let ExprKind::BVar(index) = e.kind() {
         used.insert(*index as usize);
@@ -152,11 +182,9 @@ fn arithmetic(
             return Err("candidate direct arithmetic prefix unsupported".into());
         }
     } else {
-        let instance = Name::from_string(&format!("instH{operation}UInt64"));
         if split != 4
             || !args[..3].iter().all(|ty| uint64(ty))
-            || !matches!(strip(args[3]).kind(), ExprKind::Const(name, levels)
-                if *name == instance && levels.is_empty())
+            || !candidate_dictionary_prefix(operation, args[3])
         {
             return Err("candidate arithmetic dictionary/type prefix unsupported".into());
         }
@@ -171,7 +199,7 @@ fn arithmetic(
     };
     rows.push(ArithmeticProposal {
         owner: owner.clone(),
-        source: e.clone(),
+        source: original.clone(),
         erased_prefix: args[..split].iter().map(|e| (*e).clone()).collect(),
         result,
         operation,

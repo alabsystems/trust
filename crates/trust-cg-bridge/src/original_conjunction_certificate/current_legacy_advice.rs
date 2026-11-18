@@ -11,18 +11,18 @@ impl OriginalConjunctionCertificate {
         // Seed only from a successful normal current-context replay. This test
         // producer never repairs, relabels or accepts a stale v1 environment.
         self.packet.replay(self.original_equations())?;
-        let (goal, context) =
-            crate::verify_output_instantiate::original_conjunction_goal_version(
-                &self.packet.original, 1,
-            )
-            .ok_or("test legacy advice: original is outside model 1")?;
+        let (goal, context) = crate::verify_output_instantiate::original_conjunction_goal_version(
+            &self.packet.original,
+            1,
+        )
+        .ok_or("test legacy advice: original is outside model 1")?;
         let (_, proof) = self.packet.terms.restore()?;
         let environment = environment(&context, 1)?;
         let mut packet = self.packet.clone();
         packet.model = 1;
         packet.context_sha256 = encoded_hash(&context, MAX_ORIGINAL_BYTES)?.0;
         packet.context = context;
-        packet.terms = TermPacket::capture(&goal, &proof)?;
+        packet.terms = TermPacket::capture(&goal, &proof)?.into();
         packet.goal_sha256 = encoded_hash(&goal, 64 * 1024 * 1024)?.0;
         packet.proof_sha256 = encoded_hash(&proof, 64 * 1024 * 1024)?.0;
         packet.environment_sha256 = environment_digest(&environment, 1)?;

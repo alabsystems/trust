@@ -383,6 +383,113 @@ fn authenticated_targo_rejects_late_build_script_process_authority() {
     );
 }
 
+// Trust: opaque fixture values exercise compiler input ownership only. They
+// are not encoded compiler pairings and never activate native worker/SDK mode.
+#[cargo_test]
+fn native_pairing_input_is_compiler_only_and_value_changes_rebuild_its_consumer() {
+    const KEY: &str = "TRUST_TARGO_PAIRED_COMPILER_PROFILE";
+    let p = project()
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers=['legacy','consumer']\nresolver='2'\n",
+        )
+        .file(
+            "legacy/Cargo.toml",
+            "[package]\nname='pairing_legacy_script'\nversion='0.0.0'\nedition='2021'\n",
+        )
+        .file(
+            "legacy/build.rs",
+            r#"
+            fn main() {
+                const KEY: &str = "TRUST_TARGO_PAIRED_COMPILER_PROFILE";
+                assert!(option_env!("TRUST_TARGO_PAIRED_COMPILER_PROFILE").is_none(),
+                    "compiler input was baked into build-script code");
+                // The historical source producer did this exact replay. A
+                // modern engine must withhold its input, not allow the replay.
+                println!("cargo:rerun-if-env-changed={KEY}");
+                if let Some(value) = std::env::var_os(KEY) {
+                    println!("cargo:rustc-env={KEY}={}", value.into_string().unwrap());
+                }
+                println!("cargo:rustc-env=SAFE_PAIRING_SCRIPT=absent");
+            }
+        "#,
+        )
+        .file(
+            "legacy/src/main.rs",
+            r#"
+            fn main() {
+                assert_eq!(env!("SAFE_PAIRING_SCRIPT"), "absent");
+                println!("legacy-checked");
+            }
+        "#,
+        )
+        // This independent target has no build script or dependency on the
+        // legacy package. Only its actual compiler env-dep can notice a change.
+        .file(
+            "consumer/Cargo.toml",
+            "[package]\nname='pairing_compiler_consumer'\nversion='0.0.0'\nedition='2021'\n",
+        )
+        .file(
+            "consumer/src/main.rs",
+            r#"
+            fn main() {
+                println!("{}", option_env!("TRUST_TARGO_PAIRED_COMPILER_PROFILE").unwrap());
+            }
+        "#,
+        )
+        .build();
+    let targo = p
+        .root()
+        .join(format!("targo{}", std::env::consts::EXE_SUFFIX));
+    fs::hard_link(crate::utils::cargo_exe(), &targo).unwrap();
+    let compiler = targo_compat_rustc();
+    for value in ["compiler-input-one", "compiler-input-two"] {
+        p.process(&targo)
+            .args(&["--unverified", "build", "--workspace", "--offline", "-j1"])
+            .env("RUSTC", &compiler)
+            .env(KEY, value)
+            .run();
+        p.process(p.bin("pairing_legacy_script"))
+            .with_stdout_contains("legacy-checked")
+            .run();
+        p.process(p.bin("pairing_compiler_consumer"))
+            .with_stdout_data(format!("{value}\n"))
+            .run();
+    }
+}
+
+#[cargo_test]
+fn native_pairing_input_still_cannot_be_supplied_by_build_script_output() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &basic_manifest("pairing_output_refusal", "0.0.0"),
+        )
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                println!("cargo:rustc-env=TRUST_TARGO_PAIRED_COMPILER_PROFILE=not-a-producer");
+            }
+        "#,
+        )
+        .file(
+            "src/lib.rs",
+            "compile_error!(\"untrusted pairing output reached target compiler\");",
+        )
+        .build();
+    let targo = p
+        .root()
+        .join(format!("targo{}", std::env::consts::EXE_SUFFIX));
+    fs::hard_link(crate::utils::cargo_exe(), &targo).unwrap();
+    p.process(&targo)
+        .args(&["--unverified", "check", "--offline", "-j1"])
+        .env("RUSTC", targo_compat_rustc())
+        .with_status(101)
+        .with_stderr_contains("[..]authenticated Targo refuses build-script `cargo::rustc-env` authority variable `TRUST_TARGO_PAIRED_COMPILER_PROFILE`[..]")
+        .run();
+}
+
 // Trust: the same proxy and compiler path must complete an allowed late-env
 // compile. This makes the negative case's root-compiler sentinel nonvacuous.
 #[cargo_test]

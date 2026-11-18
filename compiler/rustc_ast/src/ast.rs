@@ -4300,7 +4300,7 @@ impl Guard {
 /// mean anything was elaborated, registered, or kernel-checked.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, Debug, StableHash)]
 pub enum CleanDeclKind {
-    /// File-header marker; bare-environment admission is checked later by Clean.
+    /// File-header syntax only; elaboration still requires a fresh bare module.
     Prelude,
     Def,
     /// One plain alias or the named directions of an iff alias.

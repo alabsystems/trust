@@ -136,6 +136,17 @@ use trust_ir::{BodyGate, FuncTy, Function, Inst, Module, Producer};
 use super::{FrontendRefusal, GenericPolicy, local_body_def, upstream_entry};
 
 mod closure_source;
+mod closure_once;
+
+/// Trust: a retained compiler-owned shim body, authenticated independently from
+/// source definition rows. The original module and function identity are kept.
+pub(crate) fn closure_once_handoff<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    symbol: &str,
+) -> Result<Option<trust_thir_lower::ExactAssembledBodyForCodegen>, String> {
+    closure_once::handoff(tcx, instance, symbol)
+}
 
 /// The body-gate AUTHORITY this lane stamps on every body it APPENDS to `star`.
 ///
@@ -1103,10 +1114,9 @@ fn source_closure_handoff<'tcx>(
             "a type/const-instantiated parent has no identity-keyed source body".into(),
         ));
     }
-    if closure.kind() != ty::ClosureKind::FnOnce || closure.upvar_tys().is_empty() {
-        return Err(refuse(
-            "only a capturing FnOnce value has the typed source environment convention".into(),
-        ));
+    let borrowed_zero = closure.kind() == ty::ClosureKind::Fn && closure.upvar_tys().is_empty();
+    if !borrowed_zero && closure.kind() != ty::ClosureKind::FnOnce {
+        return Err(refuse("source closure has no admitted typed environment convention".into()));
     }
     let selected = tcx
         .sess
@@ -1114,14 +1124,20 @@ fn source_closure_handoff<'tcx>(
             |handoff| handoff.exact_body(tcx, local),
         )
         .map_err(|error| refuse(format!("exact source handoff refused: {error:?}")))?;
-    closure_source::validate(
-        &selected.module,
-        selected.func_id,
-        symbol,
-        closure.upvar_tys().len(),
-        trust_thir_lower::crate_module::TRUST_DIRECT_LANE_AUTHORITY,
-    )
-    .map_err(refuse)?;
+    if borrowed_zero {
+        let source = ty::Ty::new_closure(tcx, def, instance.args);
+        let origin = trust_thir_lower::source_closure_type_origin(tcx, source)
+            .ok_or_else(|| refuse("concrete zero-frame source identity is unavailable".into()))?;
+        closure_source::validate_borrowed_zero(
+            &selected.module, selected.func_id, symbol, &origin,
+            trust_thir_lower::crate_module::TRUST_DIRECT_LANE_AUTHORITY,
+        ).map_err(refuse)?;
+    } else {
+        closure_source::validate(
+            &selected.module, selected.func_id, symbol, closure.upvar_tys().len(),
+            trust_thir_lower::crate_module::TRUST_DIRECT_LANE_AUTHORITY,
+        ).map_err(refuse)?;
+    }
     if reaches_clean_body(&selected.module, selected.func_id)
         || reaches_declaration(&selected.module, selected.func_id)
     {
@@ -1774,6 +1790,22 @@ pub(crate) fn plan<'tcx>(
                 detail: "Rustc links this upstream instance externally; it is never imported as a local copy".into(),
             }))
         } else {
+            // Trust: retain the real ClosureOnce mono item. Only the Compiler
+            // lane has the distinct ABI agreement for its ignored empty receiver;
+            // this does not turn a synthetic row into a source definition.
+            let shim = if tcx.sess.trust_cg_f1_backend_is_compiler() {
+                closure_once_handoff(tcx, instance, &symbol)
+            } else { Ok(None) };
+            match shim {
+                Ok(Some(selected)) => { items.push(ItemPlan::Handoff(selected)); continue; }
+                Err(detail) => {
+                    items.push(ItemPlan::Refused(Some(FrontendRefusal::InstanceAssembly {
+                        symbol, detail,
+                    })));
+                    continue;
+                }
+                Ok(None) => {}
+            }
             match local_body_def(tcx, instance, &symbol, GenericPolicy::AdmitConcrete) {
             Err(refusal) => ItemPlan::Refused(Some(refusal)),
             Ok(_) if tcx.def_kind(instance.def_id()) == rustc_hir::def::DefKind::Closure => {

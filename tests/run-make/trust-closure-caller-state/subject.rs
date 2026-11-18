@@ -1,3 +1,4 @@
+#![feature(fn_traits)]
 // Caller storage preserves values, capture pointers, copies, moves and aliases.
 pub fn by_value_repeated() -> u32 {
     let mut value = 0u32;
@@ -130,4 +131,127 @@ pub fn ordinary_tuple_guard() -> u32 {
     let mut value = 1u32;
     { let mut pair = (&mut value,); let alias = &mut pair; *alias.0 += 1; }
     value
+}
+
+// Consuming the inner closure forces a real by-value FnOnce capture. Both
+// environments retain the original mutable reference; neither is a snapshot.
+pub fn nested_once_effects() -> u32 {
+    let mut value = 7u32;
+    {
+        let reference = &mut value;
+        let inner = move || { let moved = reference; *moved += 3; *moved };
+        let outer = move || { let moved = inner; moved() };
+        outer();
+    }
+    value
+}
+
+pub fn nested_once_failure() -> u32 {
+    let mut value = 7u32;
+    let reference = &mut value;
+    let inner = move || { let moved = reference; *moved += 3; 41u32 };
+    let outer = move || { let moved = inner; moved() };
+    let status = outer();
+    value + status
+}
+
+// Equal capture images belong to different real closure bodies. Moving both
+// through a concrete outer environment must retain each original target.
+pub fn distinct_nested_once_targets() -> u32 {
+    let mut left = 3u32;
+    let mut right = 7u32;
+    {
+        let left_ref = &mut left;
+        let first = move || { let moved = left_ref; *moved += 1; };
+        let right_ref = &mut right;
+        let second = move || { let moved = right_ref; *moved += 10; };
+        let outer = move || {
+            let moved_first = first;
+            let moved_second = second;
+            moved_first();
+            moved_second();
+        };
+        // Shared borrows observe one original typed environment home. They do
+        // not consume it; its later move still carries the original pointers.
+        if !std::ptr::eq(&outer, &outer) { return 999; }
+        outer();
+    }
+    left * 100 + right
+}
+
+pub fn mutable_once_home_guard() -> bool {
+    let mut value = 7u32;
+    let reference = &mut value;
+    let mut callback = move || { let moved = reference; *moved += 1; };
+    let address = &mut callback as *mut _;
+    let same = std::ptr::eq(address, address);
+    callback();
+    same
+}
+
+pub fn once_home_address_escape_guard() -> *const () {
+    let mut value = 7u32;
+    let reference = &mut value;
+    let callback = move || { let moved = reference; *moved += 1; };
+    &callback as *const _ as *const ()
+}
+
+// A raw pointer binding can acquire later consumers. Immediate ptr::eq
+// coercions do not license even a local named address of the environment.
+pub fn once_home_address_binding_guard() -> bool {
+    let mut value = 7u32;
+    let reference = &mut value;
+    let callback = move || { let moved = reference; *moved += 1; };
+    let address = &callback as *const _;
+    let same = std::ptr::eq(address, address);
+    callback();
+    same
+}
+
+mod same_spelling {
+    pub fn eq<T>(left: *const T, right: *const T) -> bool { left == right }
+}
+
+// A same-spelled ordinary function has no compiler pointer-comparison identity.
+pub fn once_home_other_comparison_guard() -> bool {
+    let mut value = 7u32;
+    let reference = &mut value;
+    let callback = move || { let moved = reference; *moved += 1; };
+    let same = same_spelling::eq(&callback, &callback);
+    callback();
+    same
+}
+
+// A nested environment containing a stack borrow must not manufacture an
+// outlives-frame witness merely because its outer value is an aggregate.
+pub fn nested_once_escape_guard() -> *mut u32 {
+    let mut value = 7u32;
+    let reference = &mut value;
+    let inner = move || { let moved = reference; moved };
+    let outer = move || { let moved = inner; moved() };
+    outer() as *mut u32
+}
+
+// Capture analysis infers Fn here; the explicit built-in FnOnce invocation
+// therefore resolves to rustc's ClosureOnce shim, not the source body Item.
+pub fn zero_capture_once() -> u32 {
+    let callback = || 41u32;
+    core::ops::FnOnce::call_once(callback, ())
+}
+
+pub fn zero_capture_once_receiver_effects() -> u32 {
+    let mut evaluations = 0u32;
+    let callback = { evaluations += 1; || 41u32 };
+    let result = core::ops::FnOnce::call_once(callback, ());
+    evaluations * 100 + result
+}
+
+pub fn zero_capture_direct_fn() -> u32 {
+    let callback = || 43u32;
+    callback()
+}
+
+pub fn zero_capture_direct_fn_mut_request() -> u32 {
+    let mut callback = || 47u32;
+    core::ops::FnMut::call_mut(&mut callback, ())
 }

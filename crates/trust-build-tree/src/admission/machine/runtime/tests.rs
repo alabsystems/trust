@@ -53,7 +53,9 @@ fn fixture(root: &Path, native: &Path) -> RuntimeFixedClaim {
         Requirements::new(Some(root.join("worktree.lock")), 4, 1, false, 1).unwrap(),
     )
     .unwrap();
-    let claim = reserve(&mut queue, 3).publish_fixed(width(8), width(6)).unwrap();
+    let claim = reserve(&mut queue, 3)
+        .publish_fixed(width(8), width(6), FixedPublication::ExistingLease)
+        .unwrap();
     RuntimeFixedClaim::new(claim, pool).unwrap()
 }
 
@@ -112,7 +114,9 @@ fn runtime_reacquire_waits_for_original_queue_memory_and_real_competing_locks() 
     // A fit older request must not be bypassed by the resize owner.
     assert!(!runtime.try_reacquire_observed(Some(1 << 30)).unwrap());
     assert_eq!(runtime.budget().unwrap(), width(2));
-    let competing = reserve(&mut earlier, 3).publish_fixed(width(8), width(6)).unwrap();
+    let competing = reserve(&mut earlier, 3)
+        .publish_fixed(width(8), width(6), FixedPublication::ExistingLease)
+        .unwrap();
     assert!(!runtime.try_reacquire_observed(Some(1 << 30)).unwrap());
     assert_eq!(original.client().available().unwrap(), 1);
     drop(competing);
@@ -150,7 +154,9 @@ fn runtime_cannot_lend_the_original_explicit_minimum() {
     let native = tempfile::tempdir().unwrap();
     let pool = Pool::open_in(native.path(), width(8)).unwrap();
     let mut queue = coordinator(root.path(), 3);
-    let claim = reserve(&mut queue, 3).publish_fixed(width(8), width(6)).unwrap();
+    let claim = reserve(&mut queue, 3)
+        .publish_fixed(width(8), width(6), FixedPublication::ExistingLease)
+        .unwrap();
     let mut runtime = RuntimeFixedClaim::new(claim, pool).unwrap();
     assert!(!runtime.try_lend().unwrap());
     assert_eq!(runtime.budget().unwrap(), width(6));

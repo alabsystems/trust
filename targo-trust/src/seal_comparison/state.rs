@@ -7,9 +7,8 @@
 //! ```
 //!
 //! A verdict is recorded with the digest of the bytes it was decided from. A
-//! later invocation keeps a recorded verdict whose inputs are unchanged and
-//! decides the consumers that have finished since, so the command can be run
-//! again at any point of a cut, on any machine that holds the state.
+//! later invocation derives the verdict again from the saved runs. It keeps
+//! the report on disk if it matches the newly computed report byte for byte.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -19,6 +18,7 @@ use serde_json::{Value, json};
 
 use super::records::{self, Loaded, Run};
 use super::{Comparison, Verdict, compare, incomparable};
+use crate::audit_comparison::parse::read_bytes;
 
 pub(crate) const VERDICT_SCHEMA: &str = "trust.seal-consumer-verdict.v1";
 const VERDICT_FILE: &str = "verdict.json";
@@ -28,7 +28,7 @@ const VERDICT_FILE: &str = "verdict.json";
 pub(crate) enum Outcome {
     Decided {
         verdict: Verdict,
-        /// The recorded verdict was kept: its inputs are byte-identical.
+        /// The recorded report is byte-identical to the recomputed report.
         reused: bool,
         report: Value,
     },
@@ -71,25 +71,6 @@ fn report(deployed: &Run, candidate: &Run, comparison: &Comparison) -> Value {
     })
 }
 
-fn recorded(path: &Path, deployed: &Run, candidate: &Run) -> Option<(Verdict, Value)> {
-    let bytes = std::fs::read(path).ok()?;
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
-    let digest = |side: &str| value.get(side)?.get("digest")?.as_str().map(str::to_owned);
-    if value.get("schema")?.as_str()? != VERDICT_SCHEMA
-        || digest("deployed")? != deployed.digest
-        || digest("candidate")? != candidate.digest
-    {
-        return None;
-    }
-    let verdict = match value.get("verdict")?.as_str()? {
-        "PASS" => Verdict::Pass,
-        "SHARED_RED" => Verdict::SharedRed,
-        "NEW_RED" => Verdict::NewRed,
-        _ => return None,
-    };
-    Some((verdict, value))
-}
-
 /// Decide one consumer from its directory, recording a new verdict.
 pub(crate) fn decide(directory: &Path) -> Outcome {
     let load = |side: &str| records::load(&directory.join(side));
@@ -108,13 +89,10 @@ pub(crate) fn decide(directory: &Path) -> Outcome {
             candidate.record.consumer
         ));
     }
-    if let Some(why) = incomparable(&deployed.record, &candidate.record) {
+    if let Some(why) = incomparable(&deployed, &candidate) {
         return Outcome::Incomparable(why);
     }
     let path = directory.join(VERDICT_FILE);
-    if let Some((verdict, report)) = recorded(&path, &deployed, &candidate) {
-        return Outcome::Decided { verdict, reused: true, report };
-    }
     let comparison = compare(&deployed, &candidate);
     let report = report(&deployed, &candidate, &comparison);
     let mut bytes = match serde_json::to_vec_pretty(&report) {
@@ -122,6 +100,11 @@ pub(crate) fn decide(directory: &Path) -> Outcome {
         Err(error) => return Outcome::Incomparable(format!("cannot encode the verdict: {error}")),
     };
     bytes.push(b'\n');
+    // The saved report is an output. Only this invocation's comparison can
+    // decide the verdict and disclosures.
+    if matches!(read_bytes(&path), Ok(recorded) if recorded == bytes) {
+        return Outcome::Decided { verdict: comparison.verdict, reused: true, report };
+    }
     if let Err(error) = crate::durable_io::atomic_write_private(&path, &bytes) {
         return Outcome::Incomparable(format!("cannot record {}: {error}", path.display()));
     }

@@ -7,13 +7,16 @@
 
 use trust_ir::{
     Block, BlockId, CallingConv, ClosureTy, ClosureTyId, FuncId, FuncTy, FuncTyId, Function, Inst,
-    InstrNode, Linkage, Producer, ValueId,
+    InstrNode, Linkage, Producer, Ty, ValueId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Shape {
-    pub(crate) closure: ClosureTyId,
-    pub(crate) body: FuncId,
+/// Structural data only; callers must separately authenticate source, frame and ABI.
+pub struct Shape {
+    pub closure: ClosureTyId,
+    pub body: FuncId,
+    /// A concrete capture-free Fn body borrows its owned environment.
+    pub borrowed_zero: bool,
 }
 
 pub(crate) fn physical_signature(closure: &ClosureTy, apparent: &FuncTy) -> Option<FuncTy> {
@@ -38,10 +41,13 @@ pub(crate) fn build(
     if id == shape.body {
         return None;
     }
+    if shape.borrowed_zero && !closure.captures.is_empty() {
+        return None;
+    }
     let physical = physical_signature(closure, apparent)?;
     let n = u32::try_from(physical.params.len()).ok()?;
     let capture_count = u32::try_from(closure.captures.len()).ok()?;
-    let result = n.checked_add(1)?;
+    let result = n.checked_add(if shape.borrowed_zero { 2 } else { 1 })?;
     let env = ValueId::new(n);
     let mut block = Block::new(BlockId::new(0));
     for (i, ty) in physical.params.iter().enumerate() {
@@ -55,7 +61,27 @@ pub(crate) fn build(
         })
         .with_result(env),
     );
-    let mut args = vec![env];
+    let body_env = if shape.borrowed_zero {
+        // This is the actual typed owned environment, borrowed for the source
+        // Fn body. A Unit seed would erase its target and nominal frame.
+        let pointer = ValueId::new(n.checked_add(1)?);
+        let ty = Ty::Closure(shape.closure);
+        block.body.push(
+            InstrNode::new(Inst::Alloca { ty: ty.clone(), count: None, align: Some(1) })
+                .with_result(pointer),
+        );
+        block.body.push(InstrNode::new(Inst::Store {
+            ty,
+            ptr: pointer,
+            value: env,
+            volatile: false,
+            align: Some(1),
+        }));
+        pointer
+    } else {
+        env
+    };
+    let mut args = vec![body_env];
     args.extend((capture_count..n).map(ValueId::new));
     let call = InstrNode::new(Inst::Call { callee: shape.body, args });
     let returns = if apparent.returns.is_empty() {
@@ -77,7 +103,7 @@ pub(crate) fn build(
 /// Recover only the exact construction protocol emitted above. Used before
 /// assembly allocates any function IDs, so malformed synthetic bodies cannot
 /// acquire an adapter identity or silently shed operations during transport.
-pub(crate) fn inspect(
+pub fn inspect(
     function: &Function,
     closures: &[ClosureTy],
     signatures: &[FuncTy],
@@ -89,10 +115,13 @@ pub(crate) fn inspect(
     if *func != function.id {
         return None;
     }
-    let Inst::Call { callee, .. } = &block.body.get(1)?.inst else {
+    let borrowed_zero = matches!(&block.body.get(1)?.inst,
+        Inst::Alloca { ty: Ty::Closure(id), .. } if id == ty);
+    let call_index = if borrowed_zero { 3 } else { 1 };
+    let Inst::Call { callee, .. } = &block.body.get(call_index)?.inst else {
         return None;
     };
-    let shape = Shape { closure: *ty, body: *callee };
+    let shape = Shape { closure: *ty, body: *callee, borrowed_zero };
     let closure = closures.get(ty.as_usize())?;
     let apparent = signatures.get(closure.func.as_usize())?;
     if signatures.get(function.ty.as_usize())? != &physical_signature(closure, apparent)? {
@@ -127,7 +156,12 @@ pub(crate) fn licensed_adapters(
             continue;
         };
         module.validate_closure_layouts().ok()?;
-        module.closure_layout_descriptor(shape.closure).ok().flatten()?;
+        let frame = module.closure_layout_descriptor(shape.closure).ok().flatten()?;
+        if shape.borrowed_zero
+            && (frame.size != 0 || frame.align != 1 || !frame.capture_offsets.is_empty())
+        {
+            return None;
+        }
         let body = source.get(shape.body.as_usize())?;
         if body.id != shape.body || body.is_declaration() || body.producer != Some(Producer::TRust)
         {
@@ -154,7 +188,8 @@ mod tests {
         let apparent = FuncTy { params: vec![Ty::I32], returns, is_vararg: false, abi: None };
         let closure = ClosureTy { func: FuncTyId::new(0), captures };
         let physical = physical_signature(&closure, &apparent).unwrap();
-        let shape = Shape { closure: ClosureTyId::new(0), body: FuncId::new(1) };
+        let shape =
+            Shape { closure: ClosureTyId::new(0), body: FuncId::new(1), borrowed_zero: false };
         let function =
             build(FuncId::new(100), FuncTyId::new(1), "adapter".into(), shape, &closure, &apparent)
                 .unwrap();
@@ -198,7 +233,11 @@ mod tests {
         let (closures, signatures, adapter) = fixture(vec![Ty::Ptr, Ty::I32], vec![Ty::I32]);
         assert_eq!(
             inspect(&adapter, &closures, &signatures),
-            Some(Shape { closure: ClosureTyId::new(0), body: FuncId::new(1) })
+            Some(Shape {
+                closure: ClosureTyId::new(0),
+                body: FuncId::new(1),
+                borrowed_zero: false
+            })
         );
         assert_eq!(
             adapter.blocks[0].params.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>(),
@@ -350,7 +389,7 @@ mod tests {
             FuncId::new(2),
             FuncTyId::new(3),
             "adapter".into(),
-            Shape { closure: ClosureTyId::new(0), body: FuncId::new(1) },
+            Shape { closure: ClosureTyId::new(0), body: FuncId::new(1), borrowed_zero: false },
             &closure,
             &apparent,
         )
@@ -389,6 +428,102 @@ mod tests {
             trust_ir::interpret::Interpreter::with_module(&module)
                 .execute_func(FuncId::new(0), [])
                 .is_err()
+        );
+    }
+
+    fn zero_capture_fixture() -> trust_ir::Module {
+        use trust_ir::Constant;
+        let mut module = executable_fixture(15);
+        module.closure_types[0].captures.clear();
+        module.closure_layouts[0].size = 0;
+        module.closure_layouts[0].align = 1;
+        module.closure_layouts[0].capture_offsets.clear();
+        module.func_types[2].params = vec![Ty::Ptr, Ty::I32];
+        module.func_types[3] =
+            physical_signature(&module.closure_types[0], &module.func_types[0]).unwrap();
+        module.functions[2] = build(
+            FuncId::new(2),
+            FuncTyId::new(3),
+            "zero_adapter".into(),
+            Shape { closure: ClosureTyId::new(0), body: FuncId::new(1), borrowed_zero: true },
+            &module.closure_types[0],
+            &module.func_types[0],
+        )
+        .unwrap();
+        let v = ValueId::new;
+        module.functions[0].blocks[0].body = vec![
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(41) }).with_result(v(0)),
+            InstrNode::new(Inst::MakeClosure {
+                ty: ClosureTyId::new(0),
+                func: FuncId::new(2),
+                captures: vec![],
+            })
+            .with_result(v(1)),
+            InstrNode::new(Inst::CallIndirect {
+                callee: v(1),
+                sig: FuncTyId::new(0),
+                args: vec![v(0)],
+                calling_conv: CallingConv::Rust,
+            })
+            .with_result(v(2)),
+            InstrNode::new(Inst::Return { values: vec![v(2)] }),
+        ];
+        module.functions[1].blocks =
+            vec![Block::new(BlockId::new(0)).with_param(v(0), Ty::Ptr).with_param(v(1), Ty::I32)];
+        module.functions[1].blocks[0].body =
+            vec![InstrNode::new(Inst::Return { values: vec![v(1)] })];
+        module
+    }
+
+    #[test]
+    fn capture_free_fn_adapter_borrows_the_actual_typed_environment() {
+        let module = zero_capture_fixture();
+        assert!(
+            trust_ir_build::validate_module(&module).is_empty(),
+            "{:?}",
+            trust_ir_build::validate_module(&module)
+        );
+        let shape =
+            inspect(&module.functions[2], &module.closure_types, &module.func_types).unwrap();
+        assert!(shape.borrowed_zero);
+        assert_eq!(licensed_adapters(&module, 2), Some(vec![FuncId::new(2)]));
+        let before = module.stable_digest();
+        let result = trust_ir::interpret::Interpreter::with_module(&module)
+            .execute_func(FuncId::new(0), [])
+            .unwrap();
+        assert_eq!(result.returns[0].as_int().unwrap().as_signed(), 41);
+        assert_eq!(result.host_calls, 0);
+        assert_eq!(module.stable_digest(), before);
+    }
+
+    #[test]
+    fn empty_environment_adapter_refuses_seeds_captures_and_extra_effects() {
+        let module = zero_capture_fixture();
+        let mut changed = module.functions[2].clone();
+        let Inst::Alloca { ty, .. } = &mut changed.blocks[0].body[1].inst else { unreachable!() };
+        *ty = Ty::Unit;
+        assert!(inspect(&changed, &module.closure_types, &module.func_types).is_none());
+        let mut changed = module.functions[2].clone();
+        let Inst::Store { value, .. } = &mut changed.blocks[0].body[2].inst else { unreachable!() };
+        *value = ValueId::new(0);
+        assert!(inspect(&changed, &module.closure_types, &module.func_types).is_none());
+        let mut changed = module.functions[2].clone();
+        changed.blocks[0].body.insert(3, InstrNode::new(Inst::Unreachable));
+        assert!(inspect(&changed, &module.closure_types, &module.func_types).is_none());
+        let mut captured = module.closure_types[0].clone();
+        captured.captures.push(Ty::Ptr);
+        let shape =
+            Shape { closure: ClosureTyId::new(0), body: FuncId::new(1), borrowed_zero: true };
+        assert!(
+            build(
+                FuncId::new(2),
+                FuncTyId::new(3),
+                "bad".into(),
+                shape,
+                &captured,
+                &module.func_types[0]
+            )
+            .is_none()
         );
     }
 

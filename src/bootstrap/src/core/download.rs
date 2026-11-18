@@ -102,10 +102,6 @@ impl Config {
         download_file(dwn_ctx, &self.out, url, dest_path, help_on_error);
     }
 
-    fn unpack(&self, tarball: &Path, dst: &Path, pattern: &str) {
-        unpack(&self.exec_ctx, tarball, dst, pattern);
-    }
-
     /// Returns whether the SHA256 checksum of `path` matches `expected`.
     #[cfg(test)]
     pub(crate) fn verify(&self, path: &Path, expected: &str) -> bool {
@@ -1188,13 +1184,18 @@ fn materialize_stage0_paired_linker(root: &Path, host: &str) {
     if !host.ends_with("-apple-darwin") {
         return;
     }
-    assert!(!host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)),
-            "noncanonical paired linker host");
+    assert!(
+        !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)),
+        "noncanonical paired linker host"
+    );
     let source_relative = PathBuf::from("lib/rustlib").join(host).join("bin/rust-lld");
     let source = root.join(&source_relative);
     let destination = root.join("bin/rust-lld");
     if !path_entry_exists(&source) {
-        assert!(!path_entry_exists(&destination), "paired linker root role lacks its archived host image");
+        assert!(
+            !path_entry_exists(&destination),
+            "paired linker root role lacks its archived host image"
+        );
         return;
     }
     #[cfg(not(unix))]
@@ -1206,6 +1207,7 @@ fn materialize_stage0_paired_linker(root: &Path, host: &str) {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
         use sha2::Digest;
 
         let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
@@ -1215,12 +1217,20 @@ fn materialize_stage0_paired_linker(root: &Path, host: &str) {
             // exclusive descriptor-relative creation cannot follow a replaced
             // lexical bin alias out of the original staged directory.
             // Darwin mode_t is u16: C variadic arguments require integer promotion.
-            let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), access | flags, mode as libc::c_int) };
-            assert!(fd >= 0, "paired linker role open refused: {}", std::io::Error::last_os_error());
+            let fd = unsafe {
+                libc::openat(parent.as_raw_fd(), name.as_ptr(), access | flags, mode as libc::c_int)
+            };
+            assert!(
+                fd >= 0,
+                "paired linker role open refused: {}",
+                std::io::Error::last_os_error()
+            );
             unsafe { File::from_raw_fd(fd) }
         };
-        let root_file = t!(fs::OpenOptions::new().read(true)
-            .custom_flags(flags | libc::O_DIRECTORY).open(root));
+        let root_file = t!(fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags | libc::O_DIRECTORY)
+            .open(root));
         let root_metadata = t!(root_file.metadata());
         let mut directories = vec![(root.to_path_buf(), root_file, root_metadata)];
         let parent = |relative: &Path, dirs: &mut Vec<(PathBuf, File, fs::Metadata)>| {
@@ -1228,7 +1238,12 @@ fn materialize_stage0_paired_linker(root: &Path, host: &str) {
             let mut path = root.to_path_buf();
             for component in relative.parent().unwrap().components() {
                 path.push(component);
-                let file = open_at(&dirs[index].1, component.as_os_str(), libc::O_RDONLY | libc::O_DIRECTORY, 0);
+                let file = open_at(
+                    &dirs[index].1,
+                    component.as_os_str(),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                );
                 let metadata = t!(file.metadata());
                 assert!(metadata.is_dir(), "paired linker parent is not a real directory");
                 dirs.push((path.clone(), file, metadata));
@@ -1241,13 +1256,19 @@ fn materialize_stage0_paired_linker(root: &Path, host: &str) {
         let name = std::ffi::OsStr::new("rust-lld");
         let original = open_at(&directories[source_parent].1, name, libc::O_RDONLY, 0);
         let source_metadata = t!(original.metadata());
-        assert!(source_metadata.is_file() && source_metadata.mode() & 0o111 != 0,
-                "paired linker host image is not regular executable");
+        assert!(
+            source_metadata.is_file() && source_metadata.mode() & 0o111 != 0,
+            "paired linker host image is not regular executable"
+        );
         // lstat is only an existence hint. Every actual open is anchored to the
         // retained selected-parent descriptor, with exclusive/no-follow flags.
         if !path_entry_exists(&destination) {
-            let mut selected = open_at(&directories[selected_parent].1, name,
-                                       libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600);
+            let mut selected = open_at(
+                &directories[selected_parent].1,
+                name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            );
             let mut input = &original;
             t!(std::io::copy(&mut input, &mut selected));
             t!(selected.set_permissions(source_metadata.permissions()));
@@ -1256,36 +1277,76 @@ fn materialize_stage0_paired_linker(root: &Path, host: &str) {
         let selected = open_at(&directories[selected_parent].1, name, libc::O_RDONLY, 0);
         let selected_metadata = t!(selected.metadata());
         assert!(selected_metadata.is_file(), "paired linker root role is not regular");
-        assert_ne!((source_metadata.dev(), source_metadata.ino()),
-                   (selected_metadata.dev(), selected_metadata.ino()),
-                   "paired linker roles must have distinct executable inodes");
-        assert_eq!(source_metadata.mode(), selected_metadata.mode(), "paired linker role modes differ");
-        let key = |m: &fs::Metadata| (m.dev(), m.ino(), m.mode(), m.uid(), m.gid(),
-            m.size(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec());
+        assert_ne!(
+            (source_metadata.dev(), source_metadata.ino()),
+            (selected_metadata.dev(), selected_metadata.ino()),
+            "paired linker roles must have distinct executable inodes"
+        );
+        assert_eq!(
+            source_metadata.mode(),
+            selected_metadata.mode(),
+            "paired linker role modes differ"
+        );
+        let key = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.mode(),
+                m.uid(),
+                m.gid(),
+                m.size(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
         let digest = |file: &File, expected: &fs::Metadata, directory: &File| {
-            assert_eq!(key(&t!(file.metadata())), key(expected), "paired linker changed before hashing");
+            assert_eq!(
+                key(&t!(file.metadata())),
+                key(expected),
+                "paired linker changed before hashing"
+            );
             let mut input = file;
             let mut value = sha2::Sha256::new();
             let mut buffer = [0u8; 64 * 1024];
             loop {
                 let count = t!(input.read(&mut buffer));
-                if count == 0 { break; }
+                if count == 0 {
+                    break;
+                }
                 value.update(&buffer[..count]);
             }
             let named = open_at(directory, name, libc::O_RDONLY, 0);
-            assert_eq!(key(&t!(file.metadata())), key(expected), "paired linker changed while hashing");
-            assert_eq!(key(&t!(named.metadata())), key(expected), "paired linker named role changed");
+            assert_eq!(
+                key(&t!(file.metadata())),
+                key(expected),
+                "paired linker changed while hashing"
+            );
+            assert_eq!(
+                key(&t!(named.metadata())),
+                key(expected),
+                "paired linker named role changed"
+            );
             value.finalize()
         };
-        assert_eq!(digest(&original, &source_metadata, &directories[source_parent].1),
-                   digest(&selected, &selected_metadata, &directories[selected_parent].1),
-                   "paired linker root role differs from its archived host image");
+        assert_eq!(
+            digest(&original, &source_metadata, &directories[source_parent].1),
+            digest(&selected, &selected_metadata, &directories[selected_parent].1),
+            "paired linker root role differs from its archived host image"
+        );
         let directory_key = |m: &fs::Metadata| (m.dev(), m.ino(), m.mode(), m.uid(), m.gid());
         for (path, file, before) in directories {
-            assert_eq!(directory_key(&t!(file.metadata())), directory_key(&before),
-                       "paired linker retained directory changed");
-            assert_eq!(directory_key(&t!(fs::symlink_metadata(&path))), directory_key(&before),
-                       "paired linker lexical directory role changed");
+            assert_eq!(
+                directory_key(&t!(file.metadata())),
+                directory_key(&before),
+                "paired linker retained directory changed"
+            );
+            assert_eq!(
+                directory_key(&t!(fs::symlink_metadata(&path))),
+                directory_key(&before),
+                "paired linker lexical directory role changed"
+            );
         }
     }
 }

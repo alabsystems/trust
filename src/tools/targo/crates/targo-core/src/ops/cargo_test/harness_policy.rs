@@ -50,6 +50,9 @@ pub(crate) struct Admission {
 
 #[derive(Clone, Debug)]
 pub(crate) struct HarnessPolicy {
+    /// Ordinary tests' narrowing process-activity policy. Plans retain their
+    /// existing output-stall clock and its own original run lifecycle.
+    supervision: Option<cargo_util::ChildSupervision>,
     default_weight: usize,
     /// `default_weight` is a test plan's `[run] test-weight`.
     planned_weight: bool,
@@ -89,9 +92,35 @@ impl HarnessPolicy {
     ///
     /// With a test plan, the entries are the plan's `[harness]` table, and a
     /// non-empty `build.test-harnesses` beside it is refused.
-    pub(crate) fn load(ws: &Workspace<'_>, plan: Option<&ResolvedPlan>) -> CargoResult<Self> {
+    pub(crate) fn load(
+        ws: &Workspace<'_>,
+        plan: Option<&ResolvedPlan>,
+        requested: Option<cargo_util::ChildSupervision>,
+    ) -> CargoResult<Self> {
+        anyhow::ensure!(
+            plan.is_none() || requested.is_none(),
+            "ordinary child supervision cannot replace a test plan's execution policy"
+        );
         refuse_unknown_keys(ws.gctx())?;
         let config = ws.gctx().build_config()?;
+        anyhow::ensure!(
+            config.test_stall_seconds != Some(0),
+            "build.test-stall-seconds must be positive"
+        );
+        let configured_supervision = if plan.is_none() {
+            config
+                .test_stall_seconds
+                .map(|seconds| {
+                    cargo_util::ChildSupervision::new(std::time::Duration::from_secs(seconds), None)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let supervision = match (configured_supervision, requested) {
+            (Some(configured), Some(requested)) => Some(configured.narrowed_by(requested)),
+            (configured, requested) => configured.or(requested),
+        };
         anyhow::ensure!(
             config.test_weight != Some(0),
             "build.test-weight must be positive"
@@ -116,6 +145,7 @@ impl HarnessPolicy {
             None => ("build.test-harnesses", configured),
         };
         let mut policy = Self {
+            supervision,
             default_weight,
             planned_weight,
             default_memory: plan
@@ -290,6 +320,10 @@ impl HarnessPolicy {
             memory: entry.memory_mib.unwrap_or(self.default_memory),
             seconds: entry.seconds.unwrap_or(0),
         })
+    }
+
+    pub(crate) fn supervision(&self) -> Option<cargo_util::ChildSupervision> {
+        self.supervision
     }
 }
 

@@ -75,7 +75,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -540,7 +540,19 @@ def which(name: str) -> str | None:
 
 
 CONTROLLED_GIT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-SUBMODULE_UPDATE_TIMEOUT_SECONDS = 10 * 60
+# A submodule acquisition, and a local Git operation over a whole tree, ends for
+# lack of progress and never on a total. A gitlink child's transfer grows with its
+# repository, and one total of 600 s ended moving acquisitions on 2026-11-14, -15
+# and -16 (trust-ir, clean, main itself). Progress is bytes: regular-file bytes
+# arriving under the paths the operation fills, and whatever the child prints.
+# A child ends once its progress over the last SUBMODULE_STALL_WINDOW_SECONDS stays
+# below SUBMODULE_FLOOR_BYTES_PER_SECOND. The floor is far under any transfer and
+# under one progress line a second; a child that neither writes nor prints for the
+# whole window is what it ends. An operation that shows nothing until it is done (a
+# whole-tree status, one command of the source working cache) has the window itself.
+SUBMODULE_STALL_WINDOW_SECONDS = 10 * 60
+SUBMODULE_FLOOR_BYTES_PER_SECOND = 16
+SUBMODULE_PROGRESS_SAMPLE_SECONDS = 5
 SUBMODULE_UPDATE_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024
 CONTROLLED_GIT_CONFIG_OVERRIDES = (
     f"core.hooksPath={os.devnull}",
@@ -563,6 +575,12 @@ CONTROLLED_GIT_CONFIG_OVERRIDES = (
     "protocol.https.allow=always",
     "protocol.ssh.allow=never",
 )
+# The one core.sshCommand a Trust checkout may carry: the keepalive that
+# scripts/install-git-hooks.sh writes into the clone it installs the push hook in
+# (TRUST_SSH_KEEPALIVE_COMMAND in scripts/hooks/_ssh_keepalive.sh; a test holds the two
+# equal). No Git command of this owner can run it: each carries the overrides above,
+# which deny every transport but https, ssh by name.
+INSTALLED_SSH_KEEPALIVE_COMMAND = "ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
 
 
 def _root_owned_executable_path_chain(path: Path) -> bool:
@@ -670,15 +688,16 @@ def _controlled_git_command(arguments: list[str] | tuple[str, ...]) -> list[str]
     return command
 
 
-def tool_version(
+def _native_tool_query(
     path: str,
-    args: tuple[str, ...] = ("--version",),
+    args: tuple[str, ...],
     *,
     environment: dict[str, str] | None = None,
     cwd: str | None = None,
-) -> str:
+) -> subprocess.CompletedProcess | None:
+    """The existing native metadata probe, shared by version and bindir reads."""
     try:
-        out = subprocess.run(
+        return subprocess.run(
             [path, *args],
             text=True,
             capture_output=True,
@@ -687,9 +706,22 @@ def tool_version(
             cwd=cwd,
             timeout=10,
         )
-        return (out.stdout or out.stderr).splitlines()[0] if (out.stdout or out.stderr) else ""
     except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def tool_version(
+    path: str,
+    args: tuple[str, ...] = ("--version",),
+    *,
+    environment: dict[str, str] | None = None,
+    cwd: str | None = None,
+    require_success: bool = False,
+) -> str:
+    out = _native_tool_query(path, args, environment=environment, cwd=cwd)
+    if out is None or (require_success and out.returncode != 0):
         return ""
+    return (out.stdout or out.stderr).splitlines()[0] if (out.stdout or out.stderr) else ""
 
 
 def _no_bytecode_environment() -> dict[str, str]:
@@ -1516,15 +1548,171 @@ def minted_seed_pin(root: Path) -> str | None:
     return None
 
 
-def fetch_seed_payloads(root: Path, date: str, attempts: int = 2) -> bool:
-    """Fetch the exact pinned seed assets into the canonical dist dir via `agh`.
+# The stage-0 seed as an atpkg keyed tree (DC-16c; aterm's crates/atpkg/src/keyed_tree.rs,
+# DC-16b): `<prefix>/trees.noindex/trust-stage0/<host>/<key>/` beside its ready marker
+# `<key>.ready`, holding the pinned archives by their file names, where `<key>` is the SHA-256
+# of STAGE0_TREE_KEY_SCHEMA's text naming the channel manifest hash `src/stage0` pins.
+STAGE0_TREE_PROGRAM = "trust-stage0"
+STAGE0_TREE_KEY_SCHEMA = "trust-stage0-tree-key/v1"
+# The key inputs a validated seed's dist directory carries, which a builder packs it under
+# (`atpkg-publish pack-tree --key-inputs`).
+STAGE0_TREE_KEY_FILE = ".trust-stage0-tree-key"
 
-    The release coordinates come from the seed ledger
+
+def atpkg_store_prefix() -> Path | None:
+    """atpkg's per-user store prefix (aterm's `atpkg::platform::default_prefix`)."""
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "aterm" / "pkg"
+    if sys.platform.startswith("linux"):
+        return home / ".local" / "share" / "aterm" / "pkg"
+    return None
+
+
+def stage0_tree_key_inputs(root: Path) -> str | None:
+    """The key inputs of the seed `src/stage0` pins: its channel manifest hash."""
+    pins, _ = parse_stage0_pins(root)
+    manifest = pins.get("compiler_channel_manifest_hash", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest):
+        return None
+    return f"{STAGE0_TREE_KEY_SCHEMA}\ncompiler_channel_manifest_hash {manifest}\n"
+
+
+def stage1_seed_enabled(config_content: bytes | None) -> bool:
+    """`rust.trust-stage1-seed` of the selected bootstrap config (default true). At false,
+    nothing a Trust tree takes from another tree or a package is taken: the stage-0 seed
+    comes from the release `src/stage0` pins name, never from atpkg's store (DC-16c)."""
+    if config_content is None:
+        return True
+    import tomllib  # main() re-execs onto python >= 3.11 before this runs
+
+    try:
+        rust = tomllib.loads(config_content.decode("utf-8")).get("rust", {})
+    except (UnicodeError, tomllib.TOMLDecodeError):
+        return True
+    return not (isinstance(rust, dict) and rust.get("trust-stage1-seed") is False)
+
+
+def record_stage0_tree_key(root: Path, date: str) -> None:
+    """Write the key inputs into the validated seed's dist directory (ignored by git:
+    `.gitignore`'s `.trust-stage0-tree-key` row), the text a builder packs that directory
+    under as atpkg's `trust-stage0` tree."""
+    inputs = stage0_tree_key_inputs(root)
+    dest = root / "bootstrap" / "trust-stage0" / "dist" / date / STAGE0_TREE_KEY_FILE
+    if inputs is not None and dest.parent.is_dir() and not dest.is_symlink():
+        dest.write_text(inputs, encoding="utf-8")
+
+
+def _clonefile(source: Path, dest: Path) -> None:
+    """A copy-on-write clone of the regular file `source` at the free name `dest`
+    (`clonefile(2)`, not following a link): never a link and never a byte copy, so a volume
+    that cannot clone, or another volume, refuses (atpkg's `cow_clone_file`)."""
+    if sys.platform != "darwin":
+        raise OSError(f"no copy-on-write clone on {sys.platform}; the store is not read")
+    import ctypes
+    import ctypes.util
+
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+    clone_nofollow = 0x0001
+    if libc.clonefile(os.fsencode(source), os.fsencode(dest), clone_nofollow) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(source))
+
+
+def _tree_complete(tree: Path) -> bool:
+    """atpkg's complete tree: a real directory beside a ready marker whose first line is ok."""
+    marker = tree.with_name(tree.name + ".ready")
+    try:
+        if not stat.S_ISDIR(os.lstat(tree).st_mode) or not stat.S_ISREG(os.lstat(marker).st_mode):
+            return False
+        return marker.read_text(encoding="utf-8").splitlines()[:1] == ["ok"]
+    except (OSError, UnicodeError):
+        return False
+
+
+def take_seed_from_store(root: Path, date: str, host: str) -> list[str]:
+    """Clone the missing pinned archives from atpkg's `trust-stage0` tree of this seed's key.
+
+    Each archive is taken only when it is a regular file of the store's complete tree whose
+    SHA-256 is its `src/stage0` pin; `validate_seed` rehashes every payload afterwards and
+    decides. Returns the pinned paths taken; prints why the store gave none.
+    """
+    prefix = atpkg_store_prefix()
+    inputs = stage0_tree_key_inputs(root)
+    if prefix is None or inputs is None:
+        print("  atpkg store: no store on this platform, or src/stage0 pins no channel manifest")
+        return []
+    key = hashlib.sha256(inputs.encode("utf-8")).hexdigest()
+    tree = prefix / "trees.noindex" / STAGE0_TREE_PROGRAM / host / key
+    if not _tree_complete(tree):
+        print(f"  atpkg store: no {STAGE0_TREE_PROGRAM} tree of key {key[:12]} for {host}")
+        return []
+    _, payloads = parse_stage0_pins(root)
+    base = root / "bootstrap" / "trust-stage0"
+    dest_dir = base / "dist" / date
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    taken = []
+    for relative in missing_seed_payloads(root, payloads):
+        source = tree / Path(relative).name
+        dest = base / relative
+        try:
+            if not stat.S_ISREG(os.lstat(source).st_mode):
+                print(f"  atpkg store: {source.name} is not a regular file; not taken")
+                continue
+            if _sha256_file(source) != payloads[relative]:
+                print(f"  atpkg store: {source.name} is not the archive src/stage0 pins; not taken")
+                continue
+            staged = dest.with_name(f"{dest.name}.store-{os.getpid()}")
+            if os.path.lexists(staged):
+                staged.unlink()
+            _clonefile(source, staged)
+            os.replace(staged, dest)
+        except OSError as error:
+            print(f"  atpkg store: cannot clone {source.name} ({error}); not taken")
+            continue
+        taken.append(relative)
+    if taken:
+        print(f"  atpkg store: cloned {len(taken)} pinned archive(s) from {STAGE0_TREE_PROGRAM} "
+              f"tree {key[:12]}")
+        # atpkg's record of the tree's use, which keeps it from `aterm pkg gc`.
+        try:
+            tree.with_name(key + ".used").touch()
+        except OSError:
+            pass
+    return taken
+
+
+def fetch_seed_payloads(root: Path, date: str, attempts: int = 2,
+                        host: str | None = None, use_store: bool = True) -> bool:
+    """Fetch the exact pinned seed assets into the canonical dist dir.
+
+    atpkg's store is tried first (`take_seed_from_store`, DC-16c) unless `use_store` is false
+    (`rust.trust-stage1-seed = false`); what it does not hold comes through `agh`. The release coordinates come from the seed ledger
     (`bootstrap/trust-stage0/seed-ledger.toml` `[release]`), so the download
     uses agh's repository-specific credential routing. Integrity does NOT depend
-    on this transport: every payload is re-hashed against the `src/stage0`
+    on either source: every payload is re-hashed against the `src/stage0`
     SHA-256 pins by `validate_seed` afterwards.
     """
+    _, payloads = parse_stage0_pins(root)
+    prefix = f"dist/{date}/"
+    for relative in sorted(payloads):
+        asset = relative.removeprefix(prefix)
+        if not relative.startswith(prefix) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.xz", asset
+        ):
+            print(f"  unsupported pinned seed asset path: {relative}")
+            return False
+    if not payloads:
+        print("  src/stage0 declares no pinned seed assets; refusing a wildcard download")
+        return False
+    if use_store:
+        take_seed_from_store(root, date, host or host_triple())
+    else:
+        print("  atpkg store: not read (rust.trust-stage1-seed = false)")
+    missing = missing_seed_payloads(root, payloads)
+    if not missing:
+        return True
     agh = which("agh")
     aterm = None if agh else which("aterm")
     if not agh and not aterm:
@@ -1536,20 +1724,9 @@ def fetch_seed_payloads(root: Path, date: str, attempts: int = 2) -> bool:
         print("  seed ledger declares no [release]; cannot fetch the pinned seed")
         return False
     repo, tag = release
-    _, payloads = parse_stage0_pins(root)
-    prefix = f"dist/{date}/"
     assets = []
-    for relative in sorted(payloads):
-        asset = relative.removeprefix(prefix)
-        if not relative.startswith(prefix) or not re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._+-]*\.tar\.xz", asset
-        ):
-            print(f"  unsupported pinned seed asset path: {relative}")
-            return False
-        assets.extend(["--asset", asset])
-    if not assets:
-        print("  src/stage0 declares no pinned seed assets; refusing a wildcard download")
-        return False
+    for relative in sorted(missing):
+        assets.extend(["--asset", relative.removeprefix(prefix)])
     dest = root / "bootstrap" / "trust-stage0" / "dist" / date
     dest.mkdir(parents=True, exist_ok=True)
     for attempt in range(1, attempts + 1):
@@ -1603,7 +1780,8 @@ def validate_seed(root: Path, host: str | None = None) -> bool:
     return rc == 0
 
 
-def resolve_seed(root: Path, allow_fetch: bool, host: str | None = None) -> bool:
+def resolve_seed(root: Path, allow_fetch: bool, host: str | None = None,
+                 use_store: bool = True) -> bool:
     """Materialize + validate the pinned Trust stage0 seed. True = usable."""
     pins, payloads = parse_stage0_pins(root)
     date = pins.get("compiler_date")
@@ -1615,15 +1793,20 @@ def resolve_seed(root: Path, allow_fetch: bool, host: str | None = None) -> bool
         print(f"  {len(missing)}/{len(payloads)} pinned payloads not materialized")
         if not allow_fetch:
             return False
-        print("  fetching the seed release declared in the seed ledger ...")
-        if not fetch_seed_payloads(root, date):
+        print("  taking the seed from atpkg's store, else the release the seed ledger declares ...")
+        if not fetch_seed_payloads(root, date, host=host, use_store=use_store):
             return False
         missing = missing_seed_payloads(root, payloads)
         if missing:
             print(f"  still missing after fetch: {missing}")
             return False
     print("  validating payload digests against src/stage0 (fail-closed) ...")
-    return validate_seed(root, host)
+    if not validate_seed(root, host):
+        return False
+    # A check (`allow_fetch=False`) leaves the checkout as it found it.
+    if allow_fetch:
+        record_stage0_tree_key(root, date)
+    return True
 
 
 # The one symlink `build` may be: a link to the sibling REAL directory
@@ -1804,6 +1987,36 @@ def _submodule_url_is_allowed(value: str) -> bool:
     )
 
 
+def _submodule_branch_is_plain(value: str) -> bool:
+    """Admit only a literal branch name, or `.`, as an indexed `branch` declaration.
+
+    Git reads `submodule.<name>.branch` in one place: `git submodule update --remote`,
+    which moves a child to that branch's tip in place of its indexed gitlink. No command
+    of this owner, of daily_toolchain_stage.py or of submodule_sync.sh passes `--remote`:
+    a child is acquired at its indexed gitlink id and at nothing else, so the declaration
+    names nothing that is fetched, checked out or run here. It is admitted because a
+    repository this owner materializes may declare one (aterm's vendor/astream has since
+    2026-09-24, which ended the first train tick to reach before_cut), and it is held to
+    a name that could be neither an option, a refspec nor a revision expression if a
+    later command did read it. `ignore`, `shallow`, `fetchRecurseSubmodules` and every
+    other key stay refused: each changes what a command this owner does run reports or
+    fetches.
+    """
+    if value == ".":
+        return True
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    )
+    return len(value) <= 255 and all(
+        part
+        and part[0] not in "-."
+        and not part.endswith((".", ".lock"))
+        and ".." not in part
+        and all(character in allowed for character in part)
+        for part in value.split("/")
+    )
+
+
 def _agh_source_identity(executable: Path) -> dict[str, object]:
     """Bind the selected multicall spelling as well as its physical program."""
     if not executable.is_absolute():
@@ -1835,6 +2048,37 @@ def _agh_source_environment() -> dict[str, str]:
     return environment
 
 
+@contextmanager
+def _agh_transfer_paths(destination: Path, environment: dict[str, str], parent: Path | None = None):
+    """Give this Agh process its own temporary directory and observe its actual byte growth.
+
+    Agh does a transfer in a scratch directory under TMPDIR and moves the result into
+    the destination only when it is complete (agh 0.206.0: a checkout closure's whole
+    download, gigabytes of it), so the bound watches both. ``parent`` is a directory
+    the caller owns on the destination's volume, reclaimed with it (a run's or a
+    build's directory, a stage's container); the system temporary directory when
+    None, where nothing reclaims what a failed transfer keeps.
+    """
+    private = Path(tempfile.mkdtemp(prefix="agh-", suffix=".noindex", dir=parent)).resolve()
+    child = {**environment, "TMPDIR": str(private)}
+    if os.name == "nt":
+        child.update(TMP=str(private), TEMP=str(private))
+    try:
+        paths = (destination,) if private.is_relative_to(destination.resolve()) else (destination, private)
+        yield child, paths
+    except BaseException:
+        # Agh can run Git in its own process group. A failed outer wait cannot
+        # establish that every writer has retired, even if its leader is gone.
+        try:
+            print(f"Agh transfer to {destination} failed; retaining private temporary directory {private}",
+                  file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            pass
+        raise
+    else:
+        shutil.rmtree(private)
+
+
 def _agh_source_fetch(
     url: str,
     destination: Path,
@@ -1844,12 +2088,29 @@ def _agh_source_fetch(
     execute=None,
     checkout_cache: Path | None = None,
     checkout_closure: bool = False,
+    native_exact: bool = False,
+    scratch_parent: Path | None = None,
 ) -> dict[str, object]:
     """Fetch through Agh's owner routing, then independently read its exact ref.
 
     No credential is extracted and no GitHub Git/anonymous fallback exists.
     Keep the lexical `agh` executable: it may be a multicall symlink to aterm.
     Callers own destination custody and any subsequent checkout transaction.
+    An injected executor either returns its process result or raises on failure
+    and returns None on success; it gives Agh its own _agh_transfer_paths.
+
+    Without one, Agh's scratch is made by _agh_transfer_paths inside
+    ``scratch_parent``: a failed transfer keeps it, and there its caller reclaims
+    it (ended Aghs had left 556 scratch directories, 30.7 GB, in m86's system
+    temporary directory by 2026-11-17).
+
+    ``native_exact`` asks Agh for its unfiltered fetch negotiated against the
+    destination (``FetchScope::NativeExact``) instead of the selected-checkout
+    closure an exact commit otherwise gets. The closure is a blob-filtered
+    fetch into a fresh repository: installed in a store other checkouts read
+    (a second worktree's submodule store), it leaves the pin's history
+    reachable without its files, so gc, ``log -p`` and checkouts of those
+    commits fail there, and a later fetch never repairs it.
     """
     canonical_url = url if url.endswith(".git") else url + ".git"
     if not _submodule_url_is_allowed(canonical_url):
@@ -1876,27 +2137,35 @@ def _agh_source_fetch(
     command = [str(executable), "repo", "fetch", repository, str(destination),
                "--ref", source_ref, "--into", private_ref]
     exact_source = re.fullmatch(r"[0-9a-f]{40}", source_ref) is not None
+    if native_exact and (checkout_closure or checkout_cache is not None):
+        raise RuntimeError("Agh native exact fetch takes no checkout closure or cache")
     if checkout_closure and not exact_source:
         raise RuntimeError("Agh checkout closure requires an exact immutable source commit")
     if checkout_cache is not None and not exact_source:
         raise RuntimeError("Agh checkout cache requires an exact immutable source commit")
     # Exact pinned compilers need the complete selected checkout, with or
     # without a cache. Explicit closure requests never accept a mutable ref.
-    if exact_source:
+    if exact_source and not native_exact:
         command.append("--checkout-closure")
     if checkout_cache is not None:
         command.extend(("--checkout-cache", str(checkout_cache)))
+    if execute is not None and scratch_parent is not None:
+        raise RuntimeError("an injected Agh executor makes its own transfer directory")
     environment = _agh_source_environment()
     try:
-        if execute is None:
-            result = _run_submodule_update_process(
-                command, environment=environment,
-                timeout_seconds=SUBMODULE_UPDATE_TIMEOUT_SECONDS, credential_gh=None,
-            )
-            if result.returncode != 0:
+        # Injected executors own their child and its temporary directory.
+        transfer = (_agh_transfer_paths(destination, environment, scratch_parent) if execute is None
+                    else nullcontext((environment, ())))
+        with transfer as (child, paths):
+            if execute is None:
+                result = _run_submodule_update_process(
+                    command, environment=child, timeout_seconds=None, credential_gh=None,
+                    progress=_SubmoduleProgress(f"Agh's fetch of {repository}", paths),
+                )
+            else:
+                result = execute(command, child)
+            if result is not None and result.returncode != 0:
                 raise RuntimeError(f"owner-routed Agh source fetch failed (exit {result.returncode})")
-        else:
-            execute(command, environment)
     finally:
         if _agh_source_identity(executable) != identity:
             raise RuntimeError("Agh source transport changed during acquisition")
@@ -1924,6 +2193,11 @@ def fetch_source_pin_main(argv: list[str]) -> int:
     parser.add_argument("--url", required=True)
     parser.add_argument("--directory", required=True, type=Path)
     parser.add_argument("--pin", required=True)
+    parser.add_argument(
+        "--native-exact", action="store_true",
+        help="unfiltered fetch negotiated against the destination, for a store other "
+        "checkouts read (scripts/submodule_sync.sh); no blob-filtered closure",
+    )
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[0-9a-f]{40}", args.pin):
         parser.error("--pin requires one exact forty-digit commit ID")
@@ -1951,7 +2225,8 @@ def fetch_source_pin_main(argv: list[str]) -> int:
         # not every historical checkout's blobs. Keep Agh's authenticated owner,
         # immutable/private-ref readback and the same bounded refusal behavior.
         _agh_source_fetch(args.url, args.directory, args.pin, private_ref,
-                          checkout_closure=True)
+                          checkout_closure=not args.native_exact,
+                          native_exact=args.native_exact)
         tree = subprocess.run(
             _controlled_git_command(["-C", str(args.directory), "cat-file", "-t", args.pin + "^{tree}"]),
             env=environment, capture_output=True, text=True, check=False, timeout=30,
@@ -2567,8 +2842,109 @@ def _terminate_submodule_process_tree(
         time.sleep(0.02)
 
 
+class _SubmoduleStalled(subprocess.TimeoutExpired):
+    """A child ended by _SubmoduleProgress; its text says what it had received."""
+
+    def __init__(self, command: object, window: float, reason: str) -> None:
+        super().__init__(command, window)
+        self.reason = reason
+
+    def __str__(self) -> str:
+        return self.reason
+
+
+def _submodule_progress_bytes(paths: tuple[Path, ...]) -> int:
+    """Bytes of the regular files under ``paths``; links are not followed."""
+    total = 0
+    pending = [os.fspath(path) for path in paths]
+    while pending:
+        current = pending.pop()
+        try:
+            metadata = os.lstat(current)
+            if stat.S_ISREG(metadata.st_mode):
+                total += metadata.st_size
+            elif stat.S_ISDIR(metadata.st_mode):
+                with os.scandir(current) as entries:
+                    pending.extend(entry.path for entry in entries)
+        except OSError:
+            continue  # a transfer renames and removes its own files while it is read
+    return total
+
+
+class _SubmoduleProgress:
+    """Bound one child by its progress (SUBMODULE_STALL_WINDOW_SECONDS above).
+
+    ``label`` names the operation in the refusal: the submodule, the repository
+    or the local Git command. ``paths`` are what the child fills. Only growth
+    counts, since a transfer also moves and removes its own temporary files.
+    Measuring a large tree is itself slow, so the next sample waits twenty times
+    the last one's cost, at most a quarter of the window.
+    """
+
+    def __init__(self, label: str, paths: tuple[Path, ...] = (), *,
+                 window: float = SUBMODULE_STALL_WINDOW_SECONDS,
+                 floor: float = SUBMODULE_FLOOR_BYTES_PER_SECOND,
+                 clock=time.monotonic, measure=_submodule_progress_bytes) -> None:
+        self.label, self.paths = label, tuple(paths)
+        self.window, self.floor = window, floor
+        self._clock, self._measure = clock, measure
+        self._lock = threading.Lock()
+        self._printed = 0
+        self._samples: list[tuple[float, int]] = []
+
+    def printed(self, count: int) -> None:
+        with self._lock:
+            self._printed += count
+
+    def begin(self) -> None:
+        now = self._clock()
+        self._size = self._measure(self.paths)
+        self._seen = 0
+        self.received = 0
+        self._moved_at = now
+        self._samples = [(now, 0)]
+        self._next = now + min(SUBMODULE_PROGRESS_SAMPLE_SECONDS, self.window / 4)
+
+    def check(self, command: object) -> None:
+        """Raise _SubmoduleStalled when the last window's progress is below the floor."""
+        now = self._clock()
+        if not self._samples or now < self._next:
+            return
+        measuring = time.monotonic()
+        size = self._measure(self.paths)
+        cost = time.monotonic() - measuring
+        with self._lock:
+            printed = self._printed
+        gained = max(0, size - self._size) + printed - self._seen
+        self._size, self._seen = size, printed
+        if gained:
+            self.received += gained
+            self._moved_at = now
+        self._samples.append((now, self.received))
+        # Keep the newest sample that is at least one window old as the base.
+        while len(self._samples) > 1 and self._samples[1][0] <= now - self.window:
+            del self._samples[0]
+        self._next = now + min(self.window / 4, max(SUBMODULE_PROGRESS_SAMPLE_SECONDS, 20 * cost))
+        since, base = self._samples[0]
+        if now - since < self.window:
+            return
+        rate = (self.received - base) / (now - since)
+        if rate < self.floor:
+            # What is counted is what this process can see. A transport that holds its
+            # transfer elsewhere until it is complete, and prints nothing, moves neither
+            # count while its bytes arrive (Agh 0.205.0), so the refusal claims only an
+            # observation, never that the child received nothing or stood still.
+            raise _SubmoduleStalled(command, self.window, (
+                f"{self.label} showed too little progress: {self.received} bytes observed under "
+                f"its watched paths and on its output, {rate:.1f} bytes/s over its last "
+                f"{now - since:.0f} s against a floor of {self.floor:g} bytes/s, and none observed "
+                f"for the last {now - self._moved_at:.0f} s; bytes it holds elsewhere are not seen"
+            ))
+
+
 def _wait_submodule_process_group(
-    process: subprocess.Popen[bytes], timeout_seconds: int | float
+    process: subprocess.Popen[bytes], timeout_seconds: int | float | None,
+    progress: _SubmoduleProgress | None = None,
 ) -> int:
     """Observe a POSIX leader without reaping it, then retire its whole group.
 
@@ -2579,8 +2955,20 @@ def _wait_submodule_process_group(
     its fixed Git is expected to wait for normal transports and taskkill is
     attempted after the leader returns.
     """
+    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     if os.name == "nt":
-        return_code = process.wait(timeout=timeout_seconds)
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+            try:
+                return_code = process.wait(
+                    timeout=remaining if progress is None else min(0.2, remaining or 0.2))
+                break
+            except subprocess.TimeoutExpired:
+                if progress is None:
+                    raise
+                progress.check(process.args)
         _terminate_submodule_process_tree(
             process, leader_already_exited=True
         )
@@ -2588,7 +2976,6 @@ def _wait_submodule_process_group(
     if not _submodule_wait_custody_available():
         raise RuntimeError("submodule transport requires nonreaping child wait support")
 
-    deadline = time.monotonic() + timeout_seconds
     while True:
         result = os.waitid(
             os.P_PID,
@@ -2604,13 +2991,15 @@ def _wait_submodule_process_group(
                     "submodule Git leader was not reaped after group termination"
                 )
             return process.returncode
-        remaining = deadline - time.monotonic()
+        if progress is not None:
+            progress.check(process.args)
+        remaining = 0.02 if deadline is None else deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired(process.args, timeout_seconds)
         time.sleep(min(0.02, remaining))
 
 
-def _relay_bounded_submodule_output(stream: object) -> None:
+def _relay_bounded_submodule_output(stream: object, progress: _SubmoduleProgress | None = None) -> None:
     """Drain child output completely while bounding terminal/CI disclosure."""
     emitted = 0
     truncated = False
@@ -2632,6 +3021,8 @@ def _relay_bounded_submodule_output(stream: object) -> None:
             chunk = stream.read(64 * 1024)  # type: ignore[attr-defined]
             if not chunk:
                 break
+            if progress is not None:
+                progress.printed(len(chunk))
             remaining = max(0, SUBMODULE_UPDATE_OUTPUT_LIMIT_BYTES - emitted)
             if remaining:
                 visible = chunk[:remaining]
@@ -2656,10 +3047,16 @@ def _run_submodule_update_process(
     command: list[str],
     *,
     environment: dict[str, str],
-    timeout_seconds: int | float,
+    timeout_seconds: int | float | None,
     credential_gh: Path | None,
+    progress: _SubmoduleProgress | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    """Run one targeted update with a process-tree deadline.
+    """Run one targeted update under process-tree custody, bounded by its progress.
+
+    ``progress`` ends a child whose bytes, arriving under its paths or printed,
+    stay below the floor rate for the stall window, with _SubmoduleStalled; a
+    child that keeps moving runs however long it takes. ``timeout_seconds`` is a
+    total for a caller that has one, and None otherwise.
 
     Output is drained concurrently and relayed to the invoking terminal/CI log
     up to a fixed byte ceiling.  It is never accumulated in Python memory or a
@@ -2685,17 +3082,19 @@ def _run_submodule_update_process(
     process: subprocess.Popen[bytes] | None = None
     relay: threading.Thread | None = None
     try:
+        if progress is not None:
+            progress.begin()
         process = subprocess.Popen(command, **options)
         if process.stdout is None:
             raise RuntimeError("submodule process omitted its owned output pipe")
         relay = threading.Thread(
             target=_relay_bounded_submodule_output,
-            args=(process.stdout,),
+            args=(process.stdout, progress),
             name="trust-submodule-output",
             daemon=True,
         )
         relay.start()
-        return_code = _wait_submodule_process_group(process, timeout_seconds)
+        return_code = _wait_submodule_process_group(process, timeout_seconds, progress)
     except BaseException as error:
         try:
             if process is not None:
@@ -2705,7 +3104,7 @@ def _run_submodule_update_process(
                 error,
                 f"submodule process-tree termination also failed: {termination_error}"
             )
-        if isinstance(error, subprocess.TimeoutExpired):
+        if isinstance(error, subprocess.TimeoutExpired) and not isinstance(error, _SubmoduleStalled):
             raise subprocess.TimeoutExpired(command, timeout_seconds) from error
         raise
     finally:
@@ -2955,9 +3354,17 @@ def _reject_local_git_execution_authority(
     status/update/provenance command can consume it. Only this recreator's
     source root may retain the maintained hooks path (`scripts/hooks`,
     `scripts/hooks-pin`, or an absolute path `_maintained_absolute_hooks_path`
-    admits) and an empty worktree scope or disabled sparse controls, as may a
+    admits), the ssh keepalive the hook installer writes beside it
+    (`INSTALLED_SSH_KEEPALIVE_COMMAND`, that literal and no other command) and an
+    empty worktree scope or disabled sparse controls, as may a
     checkout admitted by `admitted_trust_checkout`. Every other worktree scope is rejected
     after inspection; command-line overrides remain the final boundary.
+
+    The keepalive is admitted with the hooks path because one installer writes both:
+    a clone that pushes through the hook carries both, so a gate that kept the first
+    and refused the second refused every such clone. That ended the fleet train's
+    landing worktree at its first read on 2026-11-17 and refuses this recreator in a
+    developer's hook-installed checkout.
     """
     records = _repository_git_config_records(repository)
     source_root = repository.resolve() in {repo_root().resolve(), *_ADMITTED_TRUST_CHECKOUTS}
@@ -2977,7 +3384,14 @@ def _reject_local_git_execution_authority(
         executable_setting = (
             key.startswith("include.")
             or key.startswith("includeif.")
-            or key == "core.sshcommand"
+            or (
+                key == "core.sshcommand"
+                and not (
+                    source_root
+                    and scope == "local"
+                    and value == INSTALLED_SSH_KEEPALIVE_COMMAND
+                )
+            )
             or key == "core.gitproxy"
             or key == "core.askpass"
             or key == "core.attributesfile"
@@ -3179,13 +3593,19 @@ def _indexed_submodules(repository: Path) -> list[IndexedSubmodule]:
             raise RuntimeError(
                 f"unsafe indexed .gitmodules name in record {record_number} of {repository}"
             )
-        if variable not in {"path", "url", "update"}:
+        if variable not in {"path", "url", "update", "branch"}:
             raise RuntimeError(
                 f"unsupported indexed .gitmodules key in record {record_number} of {repository}"
             )
         if variable == "update" and value.lower() != "checkout":
             raise RuntimeError(
                 f"custom indexed submodule update authority is forbidden in {repository}"
+            )
+        # Admitted and never acted on: the child is acquired at its indexed gitlink id.
+        if variable == "branch" and not _submodule_branch_is_plain(value):
+            raise RuntimeError(
+                f"unsafe indexed submodule branch in record {record_number} of {repository}; "
+                "expected a plain branch name (the value is not printed)"
             )
         fields = declarations.setdefault(name, {})
         if variable in fields:
@@ -3401,18 +3821,28 @@ def _submodule_index_identity(repository: Path) -> tuple[Path, tuple[int, ...], 
     return path, before, digest
 
 
-def _local_submodule_git(arguments: list[str], *, bounded: bool = False, absent_ok: bool = False):
+def _local_submodule_git(arguments: list[str], *, bounded: bool = False, absent_ok: bool = False,
+                         whole_tree: bool = False):
     # Even accidental missing-object reads/checkout cannot perform a raw fetch.
+    # ``bounded`` is an operation that writes a tree (the checkout): it runs under
+    # process-tree custody and ends only for lack of progress in the repository it
+    # names with -C. ``whole_tree`` is a read of every path of a checkout (status, the
+    # index listing): it prints nothing until it is done, so it has the stall window
+    # and not the 30 s of a constant-size query. On 2026-11-16 a status of
+    # first-party/ty, 404,378 files on a Mac at load 30, ended a tick at 30 s.
     environment = _provenance_git_environment()
     environment.update(GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
     command = _controlled_git_command(["-c", "protocol.https.allow=never",
                                       "-c", "submodule.recurse=false", *arguments])
     if bounded:
-        result = _run_submodule_update_process(command, environment=environment,
-                     timeout_seconds=SUBMODULE_UPDATE_TIMEOUT_SECONDS, credential_gh=None)
+        tree = (Path(arguments[1]),) if arguments[:1] == ["-C"] and len(arguments) > 2 else ()
+        operation = arguments[2] if tree else arguments[0]
+        result = _run_submodule_update_process(
+            command, environment=environment, timeout_seconds=None, credential_gh=None,
+            progress=_SubmoduleProgress(f"local Git {operation}" + (f" in {tree[0]}" if tree else ""), tree))
     else:
-        result = subprocess.run(command, env=environment, capture_output=True,
-                                check=False, timeout=30)
+        result = subprocess.run(command, env=environment, capture_output=True, check=False,
+                                timeout=SUBMODULE_STALL_WINDOW_SECONDS if whole_tree else 30)
     if result.returncode and not (absent_ok and result.returncode == 1):
         raise RuntimeError(f"fixed local Git submodule operation failed (exit {result.returncode})")
     return result
@@ -3436,7 +3866,8 @@ def _prepare_source_working_cache(repository: Path, commit: str, donor: Path | N
     return namespace["prepare_checkout"](
         repository, commit, donor,
         git_command=_controlled_git_command(["-c", "submodule.recurse=false"]),
-        environment=environment, timeout=SUBMODULE_UPDATE_TIMEOUT_SECONDS,
+        # One bound for each of its local Git commands, none of which shows progress.
+        environment=environment, timeout=SUBMODULE_STALL_WINDOW_SECONDS,
         verify_physical=_source_working_cache_physical)
 
 
@@ -3445,7 +3876,7 @@ def _source_working_cache_physical(repository: Path) -> dict:
     # owner. Index stat caches cannot establish complete source bytes.
     errors = []
     entries = _parse_index_entries(_local_submodule_git(
-        ["-C", str(repository), "ls-files", "--stage", "-z"]).stdout, errors, "working DATA cache")
+        ["-C", str(repository), "ls-files", "--stage", "-z"], whole_tree=True).stdout, errors, "working DATA cache")
     object_format = _local_submodule_git(["-C", str(repository), "rev-parse", "--show-object-format"]).stdout.decode().strip()
     digest, mismatches, normalized = _capture_working_tree_snapshot(
         repository, entries, object_format, errors, "working DATA cache")
@@ -3560,6 +3991,17 @@ def _validate_staged_submodule(stage: Path, identity) -> None:
 
 def _submodule_exclusive_move(parent: Path, container: Path):
     """Pin both owned directories; atomic install never replaces any destination."""
+    if container.parent != parent:
+        raise RuntimeError("submodule staging must remain inside its destination parent")
+    return _owned_directory_exclusive_move(parent, container, nested=True)
+
+
+def _source_object_exclusive_move(parent: Path, container: Path):
+    """Transfer retired object DATA between two independently owned directories."""
+    return _owned_directory_exclusive_move(parent, container, nested=False)
+
+
+def _owned_directory_exclusive_move(parent: Path, container: Path, *, nested: bool):
     if os.name == "nt":
         # Windows rename refuses existing destinations; bookend both ancestors.
         identities = {path: _submodule_file_identity(path)[:3] for path in (parent, container)}
@@ -3577,7 +4019,8 @@ def _submodule_exclusive_move(parent: Path, container: Path):
     parent_fd = os.open(parent, flags)
     container_fd = None
     try:
-        container_fd = os.open(container.name, flags, dir_fd=parent_fd)
+        container_fd = (os.open(container.name, flags, dir_fd=parent_fd) if nested
+                        else os.open(container, flags))
         descriptors = {parent: parent_fd, container: container_fd}
         library = ctypes.CDLL(None, use_errno=True)
         if sys.platform == "darwin":
@@ -3782,16 +4225,18 @@ def _install_missing_submodule(repository: Path, indexed: IndexedSubmodule,
         _local_submodule_git(["init", "--quiet", "--template=", "--object-format=sha1", str(stage)])
         if _submodule_index_identity(repository) != index or _indexed_submodules(repository) != indexed_before:
             raise RuntimeError("parent submodule index changed before acquisition")
+        # Agh's scratch sits beside the stage in this container, on its volume. A failed
+        # transfer keeps it, and with it the container (unknown entries are never removed).
+        options: dict[str, Path] = {"scratch_parent": container}
+        if checkout_cache is not None:
+            options["checkout_cache"] = checkout_cache
         try:
-            if checkout_cache is None:
-                _agh_source_fetch(indexed.url, stage, indexed.oid,
-                                  "refs/agh/bootstrap-submodule/" + indexed.oid)
-            else:
-                _agh_source_fetch(indexed.url, stage, indexed.oid,
-                                  "refs/agh/bootstrap-submodule/" + indexed.oid,
-                                  checkout_cache=checkout_cache)
+            _agh_source_fetch(indexed.url, stage, indexed.oid,
+                              "refs/agh/bootstrap-submodule/" + indexed.oid, **options)
+        except _SubmoduleStalled as error:
+            raise RuntimeError(f"owner-routed Agh submodule acquisition of {indexed.path} ended: {error}") from error
         except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f"owner-routed Agh submodule acquisition timed out after {SUBMODULE_UPDATE_TIMEOUT_SECONDS}s") from error
+            raise RuntimeError(f"owner-routed Agh submodule acquisition of {indexed.path} timed out: {error}") from error
         _validate_staged_submodule(stage, identity)
         private_ref = "refs/agh/bootstrap-submodule/" + indexed.oid
         fetched = _local_submodule_git(["-C", str(stage), "rev-parse", "--verify", private_ref]).stdout.decode().strip()
@@ -3803,8 +4248,9 @@ def _install_missing_submodule(repository: Path, indexed: IndexedSubmodule,
         kind = _local_submodule_git(["-C", str(stage), "cat-file", "-t", indexed.oid]).stdout.strip()
         if kind != b"commit":
             raise RuntimeError("indexed submodule OID is not the exact commit object")
-        working = _prepare_source_working_cache(
-            stage, indexed.oid, working_cache if working_cache is not None else checkout_cache)
+        # A declared object cache is Agh's only: Git checks the child out from the objects
+        # Agh acquired. Only an explicit --source-working-cache is a working DATA donor.
+        working = _prepare_source_working_cache(stage, indexed.oid, working_cache)
         _local_submodule_git(["-C", str(stage), "checkout", "--quiet", "--detach",
                               "--no-recurse-submodules", indexed.oid, "--"], bounded=True)
         working.verify()
@@ -3813,7 +4259,8 @@ def _install_missing_submodule(repository: Path, indexed: IndexedSubmodule,
         detached = _local_submodule_git(["-C", str(stage), "symbolic-ref", "--quiet", "HEAD"], absent_ok=True)
         if head != indexed.oid or detached.returncode != 1:
             raise RuntimeError("staged submodule is not detached at the indexed commit")
-        status = _local_submodule_git(["-C", str(stage), "status", "--porcelain=v1", "--untracked-files=all", "--ignored", "--ignore-submodules=all"])
+        status = _local_submodule_git(["-C", str(stage), "status", "--porcelain=v1", "--untracked-files=all", "--ignored", "--ignore-submodules=all"],
+                                      whole_tree=True)
         if status.stdout.strip():
             raise RuntimeError("staged submodule has changed or unknown source files")
         _indexed_submodules(stage)  # Validate nested indexed URL/OID before installation.
@@ -4253,16 +4700,24 @@ def _capture_atpkg_pack(build_table: dict[str, object] | None = None) -> dict[st
     current = store / "current"
     if not current.is_symlink():
         raise ValueError(f"atpkg trust current must name the active pack: {current}")
-    pack = current.resolve(strict=True)
+    current_target = os.readlink(current)
+    pack = store / current_target
     if (
-        not pack.name.isascii()
-        or not pack.name.isdigit()
-        or str(int(pack.name)) != pack.name
+        pack.parent != store
+        or store.resolve(strict=True) != store
+        or re.fullmatch(r"0|[1-9][0-9]{0,19}", pack.name) is None
         or int(pack.name) > (1 << 64) - 1
-        or pack.parent != store.resolve(strict=True)
-        or (store / pack.name).is_symlink()
     ):
         raise ValueError(f"atpkg trust current is not a direct numbered store pack: {pack}")
+    physical = pack
+    if pack.is_symlink():
+        # atpkg leaves its stable numeric tool paths in place when excluding a
+        # payload from Spotlight. Admit only its exact relative sibling alias.
+        physical = pack.with_name(f"{pack.name}.noindex")
+        if os.readlink(pack) != physical.name:
+            raise ValueError(f"atpkg trust build does not have its owned .noindex alias: {pack}")
+    if not stat.S_ISDIR(physical.lstat().st_mode) or current.resolve(strict=True) != physical:
+        raise ValueError(f"atpkg trust current is not a direct numbered store pack: {physical}")
     if (pack / "toolchain").is_symlink():
         raise ValueError("atpkg WiredSysroot is not exact-tree-attestable")
     tools = {}
@@ -4270,7 +4725,7 @@ def _capture_atpkg_pack(build_table: dict[str, object] | None = None) -> dict[st
         expected = pack / "bin" / name
         if build_table is not None and build_table.get(key) != str(expected):
             raise ValueError(f"atpkg stage0 {key} must name exactly {expected}")
-        tools[key] = _atpkg_file_identity(expected, within=pack)
+        tools[key] = _atpkg_file_identity(expected, within=physical)
 
     # active_builds() is last-writer-wins if managed shims name different builds.
     # Refuse that ambiguity, including extra Trust shims outside the five tools.
@@ -4289,7 +4744,7 @@ def _capture_atpkg_pack(build_table: dict[str, object] | None = None) -> dict[st
         if (
             not target.is_relative_to(pack)
             or ".." in target.parts
-            or not target.resolve(strict=True).is_relative_to(pack)
+            or not target.resolve(strict=True).is_relative_to(physical)
         ):
             raise ValueError(f"atpkg mixed or missing active Trust shim target: {shim} -> {target}")
         active_shims[shim.name] = {
@@ -4328,8 +4783,9 @@ def _capture_atpkg_pack(build_table: dict[str, object] | None = None) -> dict[st
         raise ValueError("atpkg local status build/tree_root does not bind the active pack")
     return {
         "pack_local_path": str(pack),
+        **({"pack_physical_path": str(physical)} if physical != pack else {}),
         "build": int(pack.name),
-        "current_link_target": os.readlink(current),
+        "current_link_target": current_target,
         "configured_tools": tools,
         "active_shims": active_shims,
         # Only the selected record is load-bearing; unrelated package updates and
@@ -4367,8 +4823,9 @@ def _capture_atpkg_stage0_authority(build_table):
                 "atpkg verify did not report the exact selected-build tree Match "
                 f"(exit {proof.returncode}): {(proof.stdout + proof.stderr).strip()}"
             )
+        physical = before.get("pack_physical_path", before["pack_local_path"])
         measured = subprocess.run(
-            [verifier, "tree-root", str(before["pack_local_path"])],
+            [verifier, "tree-root", str(physical)],
             capture_output=True, text=True, timeout=120,
         )
         if (
@@ -4970,8 +5427,10 @@ def resolve_stage0_selection(root: Path, args: argparse.Namespace) -> Stage0Sele
                 print(f"  local atpkg candidate rejected: {details}; trying pinned archives")
 
     print("  resolving pinned Trust stage0 archives (src/stage0)")
+    # A config --force-config replaces does not decide; the one it writes keeps the default.
+    use_store = stage1_seed_enabled(None if args.force_config else content)
     if resolve_seed(root, allow_fetch=not args.no_fetch and not args.check,
-                    host=getattr(args, "host", None) or host_triple()):
+                    host=getattr(args, "host", None) or host_triple(), use_store=use_store):
         print("  pinned archives validated — bootstrapping Trust without stock rust")
         return selected("seed")
     if args.require_seed or existing_mode == "seed":
@@ -5039,9 +5498,76 @@ def links_with_own_lld(stage0_mode: str, atpkg_root: Path | None, host: str) -> 
     return False
 
 
+def darwin_external_llvm_linker(llvm_config: str) -> str:
+    """Select the external LLVM's paired Clang for Rust links, not its C compiler.
+
+    Apple's Clang driver selects Apple's libLTO, which can be older than the
+    supplied LLVM's static bitcode archives. Clang from the selected LLVM
+    installation supplies its matching libLTO through the existing Darwin
+    driver contract. These ordinary native-tool records select configuration
+    DATA; they do not grant LLVM source, SDK or linker qualification.
+    """
+    selected = which(llvm_config) or llvm_config
+    llvm = _native_tool_record(
+        EXPLICIT_LLVM_CONFIG, selected, ("--version",), identity_success_required=True)
+    if llvm.get("status") != "bound":
+        raise RuntimeError("cannot select the Darwin Rust linker: explicit llvm-config is not bound")
+    # llvm-config can itself be a launcher outside the installation. Its
+    # declared bindir, not executable proximity, selects the paired driver.
+    bindir = _native_tool_query(selected, ("--bindir",))
+    raw = bindir.stdout if bindir is not None and bindir.returncode == 0 else ""
+    raw = raw[:-1] if raw.endswith("\n") else raw
+    if not raw or any(char in raw for char in "\r\n\0") or not Path(raw).is_absolute():
+        raise RuntimeError("external llvm-config did not report one absolute bindir; no Darwin linker selected")
+    driver = Path(raw) / "clang"
+    clang = _native_tool_record(
+        "external LLVM Clang linker", str(driver), ("--version",), identity_success_required=True)
+    llvm_version = re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+[^\s]*", str(llvm.get("identity", "")))
+    clang_version = re.search(r"\bclang version ([^\s]+)", str(clang.get("identity", "")))
+    if (clang.get("status") != "bound" or not os.access(driver, os.X_OK)
+            or llvm_version is None or clang_version is None
+            or llvm_version.group(0) != clang_version.group(1)):
+        raise RuntimeError(
+            "external LLVM requires its matching executable Clang driver for Darwin Rust links: "
+            f"{driver}; llvm-config={llvm.get('identity', '')!r}, "
+            f"clang={clang.get('identity', '')!r}. Install the complete matching LLVM toolchain "
+            "or retain an explicitly configured compatible target linker; no system-linker fallback."
+        )
+    return str(driver)
+
+
+def darwin_external_llvm_native_linker(llvm_config: str, clang: str) -> str:
+    """Pair native LLD's CMake link with the selected LLVM's bitcode reader.
+
+    The Rust target linker does not control CMake's C++ executable links.
+    Keep Apple's SDK-aware C/C++ entrypoints and select the matching Mach-O
+    linker through Bootstrap's existing llvm.use-linker contract instead.
+    """
+    selected = which(llvm_config) or llvm_config
+    llvm = _native_tool_record(
+        EXPLICIT_LLVM_CONFIG, selected, ("--version",), identity_success_required=True)
+    # `clang` came from the independently reported bindir above, including
+    # when llvm-config itself is a launcher outside that installation.
+    linker = Path(clang).with_name("ld64.lld")
+    native = _native_tool_record(
+        "external LLVM native linker", str(linker), ("--version",),
+        identity_success_required=True)
+    llvm_version = re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+[^\s]*", str(llvm.get("identity", "")))
+    native_version = re.search(r"\bLLD ([^\s]+)", str(native.get("identity", "")))
+    if (llvm.get("status") != "bound" or native.get("status") != "bound"
+            or not os.access(linker, os.X_OK) or llvm_version is None
+            or native_version is None or llvm_version.group(0) != native_version.group(1)):
+        raise RuntimeError(
+            "external LLVM requires its matching executable Mach-O linker for native links: "
+            f"{linker}; llvm-config={llvm.get('identity', '')!r}, "
+            f"linker={native.get('identity', '')!r}; no system-linker fallback.")
+    return str(linker)
+
+
 def write_config(
     root: Path, host: str, force: bool, llvm_config: str | None = None, seed_mode: bool = False,
     *, selection: Stage0Selection | None = None,
+    llvm_zstd_pkg_config_dir: str | None = None,
 ) -> WrittenBootstrapConfig:
     """Return the exact reused/generated byte identity, not a later reread."""
     existing, existing_content = _existing_bootstrap_config(root)
@@ -5051,6 +5577,10 @@ def write_config(
         selection = Stage0Selection("seed" if seed_mode else "genesis", existing, existing_content)
     if (existing, existing_content) != (selection.config_path, selection.config_content):
         raise RuntimeError("bootstrap config changed after stage0 selection; rerun without overwriting the concurrent edit")
+    if llvm_zstd_pkg_config_dir is not None:
+        directory = Path(llvm_zstd_pkg_config_dir)
+        if not directory.is_absolute() or not directory.is_dir() or not (directory / "libzstd.pc").is_file():
+            raise RuntimeError("LLVM zstd input must be an absolute existing directory containing libzstd.pc")
     target = existing or root / "bootstrap.toml"
     if existing and not force:
         import tomllib
@@ -5058,6 +5588,10 @@ def write_config(
         table = tomllib.loads(existing_content.decode("utf-8")).get("build", {})
         if not isinstance(table, dict) or _declared_bootstrap_mode(existing_content, table) != selection.mode:
             raise RuntimeError(f"{existing} disagrees with selected {selection.mode} mode; use --force-config to change it")
+        if llvm_zstd_pkg_config_dir is not None:
+            configured = tomllib.loads(existing_content.decode("utf-8")).get("target", {}).get(host, {})
+            if configured.get("llvm-zstd-pkg-config-dir") != llvm_zstd_pkg_config_dir:
+                raise RuntimeError("existing config has a different LLVM zstd input; use --force-config to change it")
         print(f"  reusing existing config at {existing}")
         return WrittenBootstrapConfig(existing, hashlib.sha256(existing_content).hexdigest())
     py = find_python_ge_311() or sys.executable
@@ -5086,6 +5620,11 @@ def write_config(
     )
     target_lines: list[str] = []
     apple_tool_lines: list[str] = []
+    if llvm_zstd_pkg_config_dir is not None:
+        # Both rustc_llvm and native LLD already consume this target contract.
+        # Their shared native-link owner validates the actual metadata/archive;
+        # no ambient pkg-config search-path override is needed.
+        target_lines.append("llvm-zstd-pkg-config-dir = " + json.dumps(llvm_zstd_pkg_config_dir, ensure_ascii=False))
     if llvm_config:
         # Link an external LLVM instead of building LLVM in-tree. The compiler
         # profile still builds LLD with CMake/Ninja. The LLVM major version must
@@ -5112,10 +5651,22 @@ def write_config(
         # just the compiler host: profiler_builtins also compiles C there.
         # Select Apple's native entrypoints, as the explicit compiler config
         # does, rather than reintroducing ambient compiler or include flags.
+        # Keep Apple's C/C++ SDK entrypoints. Both Rust and native CMake
+        # links must use the external LLVM's matching bitcode reader.
+        linker = darwin_external_llvm_linker(llvm_config) if llvm_config else "/usr/bin/clang"
+        if llvm_config:
+            native_linker = darwin_external_llvm_native_linker(llvm_config, linker)
+            llvm_section = "[llvm]\n"
+            if content.count(llvm_section) != 1:
+                raise RuntimeError("generated config has no unique LLVM section")
+            content = content.replace(
+                llvm_section,
+                llvm_section + "# Pair native CMake links with the selected LLVM's bitcode reader.\n"
+                + "use-linker = " + json.dumps(native_linker, ensure_ascii=False) + "\n", 1)
         for name, path in (("cc", "/usr/bin/clang"), ("cxx", "/usr/bin/clang++"),
-                           ("linker", "/usr/bin/clang"), ("ar", "/usr/bin/ar"),
+                           ("linker", linker), ("ar", "/usr/bin/ar"),
                            ("ranlib", "/usr/bin/ranlib")):
-            apple_tool_lines.append(f'{name} = "{path}"')
+            apple_tool_lines.append(f'{name} = {json.dumps(path, ensure_ascii=False)}')
         target_lines.extend(apple_tool_lines)
     if target_lines:
         content += f'\n[target.{host}]\n' + "\n".join(target_lines) + "\n"
@@ -8535,25 +9086,31 @@ def _ambient_build_authority_overrides(
     return dict(sorted(overrides.items()))
 
 
-def _native_tool_record(name: str, path: str | None, args: tuple[str, ...]) -> dict[str, object]:
+def _native_tool_record(
+    name: str, path: str | None, args: tuple[str, ...], *, identity_success_required: bool = False,
+) -> dict[str, object]:
     record: dict[str, object] = {"name": name, "resolved_local_path": path}
     if path is None:
         record["status"] = "missing"
         return record
     candidate = Path(path)
     try:
+        resolved = str(candidate.resolve())
+        digest = _sha256_file(candidate)
+        identity_options = {"require_success": True} if identity_success_required else {}
+        identity = tool_version(
+            path, args,
+            environment=(_provenance_git_environment() if name == "git" else None),
+            **identity_options,
+        )
+        if identity_success_required and not identity:
+            raise OSError("required native identity probe did not succeed")
         record.update(
             {
                 "status": "bound",
-                "resolved_real_path": str(candidate.resolve()),
-                "sha256": _sha256_file(candidate),
-                "identity": tool_version(
-                    path,
-                    args,
-                    environment=(
-                        _provenance_git_environment() if name == "git" else None
-                    ),
-                ),
+                "resolved_real_path": resolved,
+                "sha256": digest,
+                "identity": identity,
             }
         )
     except OSError as error:
@@ -12863,11 +13420,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Explicit existing native Targo used only for selected tool Cargo graph inspection.")
     p.add_argument("--source-object-cache", action="append", default=[], metavar="GITLINK=REPOSITORY",
                    help="Give Agh a read-only exact-object cache for one indexed first-party checkout; "
-                        "matching regular working bytes are optional native CoW DATA hints too.")
+                        "it supplies Agh objects only, never working files: Git checks the child out.")
     p.add_argument("--source-working-cache", action="append", default=[], metavar="GITLINK=DIRECTORY",
                    help="Use a separate read-only regular-file DATA donor for native CoW source "
                         "materialization; never Git or publication authority. Every reused byte is "
-                        "checked against the independently acquired target, with normal Git fallback.")
+                        "checked against the independently acquired target, with normal Git fallback. "
+                        "It saves disk at a cost in time: first-party/ty took 887 s on m86 against "
+                        "Git's own checkout in 30 to 100 s, by the machine's load.")
     p.add_argument(
         "--no-build",
         action="store_true",
@@ -12891,6 +13450,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "match what rustc_llvm expects. The stage receipt records such an LLVM as "
         "external and never states its identity (the build binds the llvm-config "
         "executable, not what it points at), so --require-llvm-identity refuses it.",
+    )
+    p.add_argument(
+        "--llvm-zstd-pkg-config-dir",
+        action=_GivenOnceNotEmpty,
+        default=None,
+        help="Absolute directory containing the selected libzstd.pc for LLVM's static "
+        "dependency. Writes target.<host>.llvm-zstd-pkg-config-dir for rustc_llvm and "
+        "native LLD; the native-link owner checks the selected metadata and archive.",
     )
     p.add_argument(
         "extra",
@@ -13269,7 +13836,8 @@ def main(argv: list[str] | None = None) -> int:
     print("\nWriting bootstrap config:")
     try:
         written_config = write_config(root, host, args.force_config, args.llvm_config,
-                                      seed_mode=seed_mode, selection=selection)
+                                      seed_mode=seed_mode, selection=selection,
+                                      llvm_zstd_pkg_config_dir=args.llvm_zstd_pkg_config_dir)
     except (RuntimeError, OSError, ValueError) as error:
         print(f"\nBootstrap config refused: {error}")
         return 1

@@ -23,13 +23,20 @@
 //! Coverage: a full cross of edge values (zero, one, limb boundaries, 2^64,
 //! 2^128, multi-limb giants) plus deterministic pseudo-random multi-limb
 //! pairs, for `add`, `sub` (truncated), `mul`, `div` (`n/0 = 0`), `mod`
-//! (`n%0 = n`), `beq`, and `ble`. Operands stay ≤ 4 limbs so `mul` remains
+//! (`n%0 = n`), `beq`, `ble`, `land`, `lor`, and `xor`, including the actual
+//! pinned C entry points and checked projection/clone observations. Separate
+//! admitted domains exercise natural-valued shifts and powers. Operands stay
+//! ≤ 4 limbs so `mul` remains
 //! inside the kernel's 16-limb `checked_mul_big` bound — past it the kernel
 //! deliberately leaves the term stuck, which the harness treats as a hard
 //! failure rather than a skip, so the bound moving would be NOTICED here.
 
 use clean_kernel::{BigNat, Environment, Expr, ExprKind, Literal, TypeChecker};
 use trust_bignum::Nat;
+
+#[path = "support/handles.rs"]
+mod handles;
+use handles::*;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -89,7 +96,7 @@ fn as_runtime_value(kernel: &BigNat) -> Nat {
     Nat::from_limbs(kernel.limbs().to_vec())
 }
 
-/// One agreement check, all seven operations, one pair of limb vectors.
+/// Arithmetic, comparison, projection and clone agreement for one operand pair.
 ///
 /// Both sides are constructed from the SAME limbs; the comparison is on
 /// values (canonical form), with the decimal renderings in the failure
@@ -97,15 +104,20 @@ fn as_runtime_value(kernel: &BigNat) -> Nat {
 fn assert_agreement(tc: &TypeChecker<'_>, a_limbs: &[u64], b_limbs: &[u64]) {
     let a = Nat::from_limbs(a_limbs.to_vec());
     let b = Nat::from_limbs(b_limbs.to_vec());
+    let a_handle = Handle::from_limbs(a_limbs);
+    let b_handle = Handle::from_limbs(b_limbs);
 
-    let arith: [(&str, Nat); 5] = [
-        ("Nat.add", a.add(&b)),
-        ("Nat.sub", a.sub(&b)),
-        ("Nat.mul", a.mul(&b)),
-        ("Nat.div", a.div(&b)),
-        ("Nat.mod", a.rem(&b)),
+    let arith: [(&str, Nat, Binary); 8] = [
+        ("Nat.add", a.add(&b), trust_bignum_nat_add),
+        ("Nat.sub", a.sub(&b), trust_bignum_nat_sub),
+        ("Nat.mul", a.mul(&b), trust_bignum_nat_mul),
+        ("Nat.div", a.div(&b), trust_bignum_nat_div),
+        ("Nat.mod", a.rem(&b), trust_bignum_nat_mod),
+        ("Nat.land", a.land(&b), trust_bignum_nat_land),
+        ("Nat.lor", a.lor(&b), trust_bignum_nat_lor),
+        ("Nat.xor", a.xor(&b), trust_bignum_nat_xor),
     ];
-    for (op, ours) in arith {
+    for (op, ours, shim) in arith {
         let kernel = kernel_nat(tc, op, a_limbs, b_limbs);
         assert_eq!(
             as_runtime_value(&kernel),
@@ -113,10 +125,30 @@ fn assert_agreement(tc: &TypeChecker<'_>, a_limbs: &[u64], b_limbs: &[u64]) {
             "`{op}` diverged on a = {a}, b = {b}: kernel limbs {:?}, runtime {ours}",
             kernel.limbs(),
         );
+        let actual_abi = a_handle.apply(shim, &b_handle);
+        assert_eq!(actual_abi.value(), &ours, "C ABI `{op}` on {a} / {b}");
     }
 
     assert_eq!(kernel_bool(tc, "Nat.beq", a_limbs, b_limbs), a == b, "beq on a = {a}, b = {b}");
     assert_eq!(kernel_bool(tc, "Nat.ble", a_limbs, b_limbs), a <= b, "ble on a = {a}, b = {b}");
+    assert_eq!(unsafe { trust_bignum_nat_beq(a_handle.pointer(), b_handle.pointer()) }, a == b);
+    assert_eq!(unsafe { trust_bignum_nat_ble(a_handle.pointer(), b_handle.pointer()) }, a <= b);
+    // The two projection rows are distinct: a total kernel predicate, and a
+    // checked scalar projection only inside that predicate's true domain.
+    let fits = kernel_bool(tc, "Nat.ble", a_limbs, &[u64::MAX]);
+    assert_eq!(unsafe { trust_bignum_nat_fits_u64(a_handle.pointer()) }, fits);
+    if fits {
+        let literal = kernel_nat(tc, "Nat.add", a_limbs, &[]);
+        let expected = match literal.limbs() {
+            [] => 0,
+            [value] => *value,
+            other => panic!("kernel fits_u64 admitted multiple limbs: {other:?}"),
+        };
+        assert_eq!(unsafe { trust_bignum_nat_to_u64(a_handle.pointer()) }, expected);
+    }
+    let clone = a_handle.duplicate();
+    assert_eq!(clone.value(), &as_runtime_value(&kernel_nat(tc, "Nat.add", a_limbs, &[])));
+    assert_ne!(clone.pointer(), a_handle.pointer());
 }
 
 /// xorshift64* — deterministic, seeded, dependency-free. Randomness here is
@@ -231,6 +263,47 @@ fn subtraction_truncates_identically_across_the_boundary() {
 }
 
 #[test]
+fn natural_shifts_agree_through_the_actual_abi_on_kernel_admitted_values() {
+    let env = kernel_environment();
+    let tc = TypeChecker::new(&env);
+    for limbs in edge_values() {
+        let input = Handle::from_limbs(&limbs);
+        for count in [0, 1, 63, 64, 65, 127, 255, 512] {
+            let amount = Handle::new(count);
+            for (head, operation) in [
+                ("Nat.shiftLeft", trust_bignum_nat_shift_left as Binary),
+                ("Nat.shiftRight", trust_bignum_nat_shift_right as Binary),
+            ] {
+                let actual = input.apply(operation, &amount);
+                assert_eq!(
+                    actual.value(),
+                    &as_runtime_value(&kernel_nat(&tc, head, &limbs, &[count]))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn natural_powers_agree_through_the_actual_abi_on_kernel_admitted_values() {
+    let env = kernel_environment();
+    let tc = TypeChecker::new(&env);
+    // Eight-limb results remain within the kernel's sixteen-limb reduction
+    // guard. This domain is not a runtime exponent or result-size limit.
+    for limbs in [vec![], vec![1], vec![2], vec![u64::MAX], vec![0, 1], vec![7, 1]] {
+        let base = Handle::from_limbs(&limbs);
+        for exponent in 0..8 {
+            let count = Handle::new(exponent);
+            let actual = base.apply(trust_bignum_nat_pow, &count);
+            assert_eq!(
+                actual.value(),
+                &as_runtime_value(&kernel_nat(&tc, "Nat.pow", &limbs, &[exponent]))
+            );
+        }
+    }
+}
+
+#[test]
 fn an_empty_environment_folds_no_nat_head() {
     // The negative twin of `kernel_environment`: the same application over an
     // environment that declares no `Nat.*` head stays stuck for every
@@ -240,7 +313,21 @@ fn an_empty_environment_folds_no_nat_head() {
     // longer measures what the I6 row says it does.
     let env = Environment::new();
     let tc = TypeChecker::new(&env);
-    for op in ["Nat.add", "Nat.sub", "Nat.mul", "Nat.div", "Nat.mod", "Nat.beq", "Nat.ble"] {
+    for op in [
+        "Nat.add",
+        "Nat.sub",
+        "Nat.mul",
+        "Nat.div",
+        "Nat.mod",
+        "Nat.beq",
+        "Nat.ble",
+        "Nat.land",
+        "Nat.lor",
+        "Nat.xor",
+        "Nat.pow",
+        "Nat.shiftLeft",
+        "Nat.shiftRight",
+    ] {
         let applied = binop_expr(op, &[7], &[3]);
         let reduced = tc.whnf(&applied);
         assert_eq!(reduced, applied, "`{op} 7 3` reduced in an empty environment");

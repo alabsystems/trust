@@ -179,10 +179,10 @@ gate_selected() {
 # (`run_trust_conformance.py` was the other, on a fixture deleted with its producer.)
 # Do not silence a red here to get green; the red is the instrument working.
 #
-# Two rows in that block are green ONLY once something lands with them:
-# `release.certified-scoreboard` names a baseline file that does not exist yet
-# (without --baseline the scoreboard exits 0 unconditionally, which is a green
-# that proves nothing), and `slow.corpus-census-faithfulness` needs the census
+# Two rows in that block require their evidence inputs. The original prose
+# baseline for `release.certified-scoreboard` is retained. The release lane
+# requires a complete compiler-report baseline before judging its count.
+# `slow.corpus-census-faithfulness` needs the census
 # binary built (its awk summary now exits 4 on KERNEL_REJECTED != 0,
 # scripts/corpus_census.sh:147).
 #
@@ -1489,9 +1489,11 @@ release.cite-discharge|release|soundness|true|never|python3 scripts/trust_cite_d
 release.crates-io-native-compat|release|compatibility|true|never|bash scripts/compat_check.sh
 release.ddc-double-compilation|release|soundness|false|never|bash scripts/ddc_compare.sh seed upstream --dry-run
 release.fresh-clone-seed-consume|release|bootstrap|true|never|bash scripts/ci_fresh_clone_consume_test.sh --stage 2
+release.f1-native-question-binding|slow,release|soundness|true|never|python3 scripts/check_f1_native_question_binding.py --targo "$(pwd -P)/build/host/stage2/bin/targo" --target-dir "$(pwd -P)/build/f1-native-question-binding-target.noindex"
 release.lambda-calculus-downstream-diagnostic|release|diagnostic|false|never|scripts/collect_lambda_calculus_diagnostic.py --repo-root . --output build/evidence/lambda-calculus-diagnostic.json
 release.mint-and-prove-seed|release|bootstrap|true|never|S=build/seed-$(date -u +%Y%m%dT%H%M%SZ); bash scripts/mint_and_prove_seed.sh --seed-dir $S --proof-build-dir $S-proof
 release.native-solver-sample-verification|release|soundness|true|never|python3 scripts/run_native_solver_sample_verification.py
+slow.internal-lint-incremental-process|slow,release|compile|true|never|python3 scripts/tests/internal_lint_incremental_process.py --targo "$(pwd -P)/build/host/stage2/bin/targo" --rustc "$(pwd -P)/build/host/stage2/bin/trustc" --evidence "$(pwd -P)/build/evidence/internal-lint-incremental-$(date -u +%Y%m%dT%H%M%S)-$$"
 release.off-stock-rust-preflight|release|supply-chain|true|never|bash scripts/prove_rust_free_build.sh
 release.realcode-coverage-receipt|release|evidence|true|never|python3 scripts/collect_realcode_coverage_evidence.py --repo-root . --output build/evidence/realcode-coverage-receipt.json
 release.repro-backend-dylib-selfcompare|slow,release|reproducibility|true|never|bash scripts/repro_build_selfcompare.sh
@@ -1540,7 +1542,7 @@ release.widthconv-strict|release|soundness|true|never|TARGO="$(pwd -P)/build/hos
 release.budget-strict|release|soundness|true|never|TARGO="$(pwd -P)/build/host/stage2/bin/targo" bash scripts/trust_budget_strict_gate.sh
 release.bitfield-strict|release|soundness|true|never|bash scripts/trust_bitfield_strict_gate.sh
 release.floatbits-strict|release|soundness|true|never|TARGO="$(pwd -P)/build/host/stage2/bin/targo" bash scripts/trust_floatbits_strict_gate.sh
-fast.floatbits-twin-parity|fast,release|soundness|true|2026-09-30|python3 scripts/trust_floatbits_twin_parity.py crates/trust-floatbits/src/lib.rs crates/trust-floatbits/src/contracts.rs
+fast.floatbits-twin-parity|fast,release|soundness|true|2026-09-30|scripts/trust_floatbits_twin_parity.py crates/trust-floatbits/src/lib.rs crates/trust-floatbits/src/contracts.rs
 release.strict-pass-frontier|release|soundness|true|never|bash scripts/trust_strict_pass_frontier.sh
 fast.kernel-authority-vacuity|fast,release|soundness|true|2026-09-30|python3 scripts/check_kernel_authority_vacuity.py
 release.check-all|release|harness|true|never|bash scripts/check_all.sh

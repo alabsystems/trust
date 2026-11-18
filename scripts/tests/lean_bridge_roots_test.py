@@ -331,5 +331,25 @@ else:
         self.assertNotIn("TrustIr.Proofs.MemorySafety", seen)
 
 
+class CoreManifestProvenanceTests(unittest.TestCase):
+    def test_core_origin_names_no_installer_the_producer_cannot_observe(self):
+        # The producer admits a Lean toolchain by its version readback, whether elan or
+        # LEAN_TOOLCHAIN_BIN supplied it. The vendored origin must be the producer's own
+        # template, which names no installer; a hand-edited or stale stamp fails here.
+        script = (REPO / "scripts/regen-trustir-oleans.sh").read_text()
+        template = "f'origin = \"{toolchain} release toolchain, lib/lean\"',"
+        self.assertEqual(script.count(template), 1)
+        self.assertNotIn("elan-installed", script)
+        provenance = tomllib.loads(
+            (REPO / "vendor/lean-core-oleans/MANIFEST.toml").read_text())["provenance"]
+        self.assertEqual(provenance["origin"],
+                         provenance["lean_toolchain"] + " release toolchain, lib/lean")
+
+    def test_a_change_to_the_core_manifest_reruns_this_module_at_landing(self):
+        from scripts.lib import land_select
+        self.assertIn("scripts.tests.lean_bridge_roots_test",
+                      land_select.validation_test_modules(["vendor/lean-core-oleans/MANIFEST.toml"]))
+
+
 if __name__ == "__main__":
     unittest.main()

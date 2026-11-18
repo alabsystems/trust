@@ -3,8 +3,9 @@
 
 //! Original directory custody before a genuine cache-lock acquisition. The
 //! directory, its name and this carrier never construct a cache, Seed or SDK.
+use std::path::Path;
+
 use super::*;
-use std::{os::unix::ffi::OsStrExt as _, path::Path};
 
 pub const PREPARATION_CACHE_DIRECTORY_RIGHTS_MARKER: u8 = 0x7c;
 
@@ -17,9 +18,7 @@ pub struct PreparationCacheDirectoryDelivery {
 }
 impl PreparationCacheDirectoryDelivery {
     pub(crate) fn received(descriptions: Vec<OwnedFd>, valid: bool) -> Self {
-        Self {
-            actual: PreparationOutputDelivery::received(descriptions, valid),
-        }
+        Self { actual: PreparationOutputDelivery::received(descriptions, valid) }
     }
 
     /// Move the same descriptions directly into State before interpreting

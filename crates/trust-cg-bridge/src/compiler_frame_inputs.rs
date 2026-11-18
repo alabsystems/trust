@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
-use trust_cg_codegen::aot_frame_inputs::AotFrameLayoutObservation;
+use trust_cg_codegen::aot_frame_inputs::{AotFrameLayoutObservation, AotSourceAllocationRequest};
 use trust_cg_ir::regs::{X29, X30};
 use trust_types::Formula;
 
@@ -66,6 +66,12 @@ pub struct PendingFrameInput {
     pub producer_slot_count: usize,
     pub producer_layout: Option<ProducerFrameLayout>,
     pub producer_slots: Vec<trust_cg_ir::function::StackSlot>,
+    /// Static source-site/SSA-to-slot DATA, rebound to this exact object,
+    /// complete producer layout and original compiler input. A rewritten
+    /// adapter input which is not retained remains an explicit error here.
+    /// These records grant no runtime allocation identity or memory proof.
+    pub source_stack_allocations:
+        Result<trust_cg_lower::source_stack_allocations::SourceStackAllocations, String>,
     pub entry_sp: Option<Formula>,
     pub entry_memory_sha256: Option<String>,
     pub envelope: FrameEnvelopeInput,
@@ -384,6 +390,9 @@ pub(crate) fn attach(
     if names != by_name.keys().copied().collect() {
         return Err("actual Compiler frame/object population differs".into());
     }
+    // No framed request means no allocation index or whole-module hash. For
+    // actual requests, share one fresh binding across the entire object.
+    let allocation_request = std::cell::OnceCell::new();
     for certificate in &mut report.certificates {
         // The full internal observer is temporary. Frameless functions keep
         // no duplicate trace, and framed requests retain only bounded inputs.
@@ -414,7 +423,7 @@ pub(crate) fn attach(
         };
         let observation = certificate.memory_observation.as_ref();
         certificate.frame_inputs = Some(PendingFrameInput {
-            schema: "trust.pending-semR-frame-input.v1",
+            schema: "trust.pending-semR-frame-input.v2",
             symbol: certificate.symbol.clone(),
             object_sha256: report.object_sha256.clone(),
             text_sha256: certificate.text_sha256.clone(),
@@ -424,6 +433,14 @@ pub(crate) fn attach(
             producer_slot_count: row.stack_slots.len(),
             producer_layout: row.layout.as_ref().map(ProducerFrameLayout::from),
             producer_slots: row.stack_slots.clone(),
+            source_stack_allocations: allocation_request
+                .get_or_init(|| AotSourceAllocationRequest::new(input.object, input.m_cg))
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|request| row.bound_source_stack_allocations_for(request).cloned())
+                .map_err(|reason| {
+                    format!("source allocation inputs unavailable; exact adapter-source/lineage required: {reason}")
+                }),
             entry_sp: observation.and_then(|o| o.entry_sp.clone()),
             entry_memory_sha256: observation.and_then(|o| o.entry_memory_sha256.clone()),
             envelope: envelope(window, row),

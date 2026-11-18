@@ -43,6 +43,17 @@ impl TestCtx {
         Self { directory }
     }
 
+    /// Keep failed fixture inputs; the test explicitly closes only after success.
+    pub fn retain(mut self) -> Self {
+        self.directory.disable_cleanup(true);
+        self
+    }
+
+    /// Remove an explicitly retained fixture after all assertions have passed.
+    pub fn close(self) -> std::io::Result<()> {
+        self.directory.close()
+    }
+
     pub fn dir(&self) -> &Path {
         self.directory.path()
     }

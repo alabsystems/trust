@@ -8,7 +8,8 @@
 //! of the outputs of the units it compiled. There is one file for each
 //! selection: the build of a selection that finishes its graph last replaces
 //! the receipt before it, whichever of two overlapping builds
-//! (`-Zfine-grain-locking`) began first.
+//! (fine-grain locking: `-Zfine-grain-locking` or
+//! `build.shared-dependency-cache`) began first.
 //!
 //! WHAT A RECEIPT SAYS: the compile graph finished, and every unit it names is
 //! finalized on disk. The command can still fail after that, and the receipt
@@ -108,6 +109,7 @@ use serde::Serialize;
 
 use super::CompileMode;
 use crate::util::data_structures::HashMap;
+use crate::workspace::profiles::RequestedIncremental;
 
 /// The folder at the top of the build directory that holds the receipts.
 pub(super) const DIR: &str = ".targo-receipts";
@@ -126,7 +128,7 @@ pub(super) enum Ran {
 
 /// Each unit the job queue dispatched and how it ran: what it said at
 /// dispatch, or, for a dirty unit that turned fresh once it took its lock
-/// (`-Zfine-grain-locking`), what the recheck said. Beside it (DC-12b), when
+/// (fine-grain locking), what the recheck said. Beside it (DC-12b), when
 /// each dirty unit was dispatched, and the incremental folders the compile of
 /// each built unit wrote (`incremental_trim::written_by`).
 pub(super) struct Ledger<K> {
@@ -170,6 +172,11 @@ impl<K: Eq + Hash + Clone> Ledger<K> {
         self.started.remove(&unit);
         self.wrote.remove(&unit);
         self.ran.insert(unit, Ran::Fresh);
+    }
+
+    /// How the queue ran `unit` so far, where it dispatched it.
+    pub(super) fn ran(&self, unit: &K) -> Option<Ran> {
+        self.ran.get(unit).copied()
     }
 
     /// When the queue dispatched `unit` to be compiled: `None` for a unit it
@@ -277,14 +284,33 @@ pub(super) struct Root {
 /// alternates between: each root's flags and extra arguments, and the
 /// workspace wrapper. So `targo check` and `targo tippy` keep a receipt each,
 /// and a verified run's per-run transport does not make a new file of each
-/// run. It does not hold the rest of what that hash reads (a `--config`
-/// profile override, `-Zbuild-std`, `__CARGO_DEFAULT_LIB_METADATA`, whether
-/// target flags apply to the host): two builds that differ only there share
-/// one receipt, and each replaces the other's.
+/// run. It holds (DC-12e) whether the requested profile compiles incrementally
+/// (`incremental`), which `compute_metadata` hashes into a member's unit id
+/// too, so a plain build and the same selection built with
+/// `CARGO_INCREMENTAL=0` (aterm verify's main lane, in the same build
+/// directory) keep a receipt each, and neither withdraws the other's record
+/// of the units and incremental folders it used. It does not hold the rest of
+/// what that hash reads (another `--config` profile override, `-Zbuild-std`,
+/// `__CARGO_DEFAULT_LIB_METADATA`, whether target flags apply to the host):
+/// two builds that differ only there share one receipt, and each replaces the
+/// other's.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct Selection {
     /// Whether the build was a `--compile-time-deps` run.
     pub(super) compile_time_deps_only: bool,
+    /// Trust: DC-12e. Whether the requested profile compiles a workspace
+    /// member incrementally (`Profiles::requested_incremental`), as
+    /// `CARGO_INCREMENTAL`, `build.incremental`, a CI run and the profile's
+    /// own `incremental` setting resolve it. It is encoded, as a bool, only
+    /// where it differs from the profile's hard-coded default (on for `dev`
+    /// and what inherits it, off for `release` and what inherits it), so the
+    /// name of every receipt of a build compiled at that default is the name
+    /// it had before this key.
+    #[serde(
+        skip_serializing_if = "at_default",
+        serialize_with = "serialize_compiles"
+    )]
+    pub(super) incremental: RequestedIncremental,
     /// The requested profile (`dev`, `release`, a custom one).
     pub(super) profile: String,
     /// Its root units.
@@ -310,6 +336,20 @@ impl Selection {
         let digest = cargo_util::Sha256::new().update(&selection).finish_hex();
         Ok(format!("{}.json", &digest[..16]))
     }
+}
+
+/// Whether a selection's `incremental` is its profile's hard-coded default,
+/// which its encoding leaves out (`Selection::incremental`).
+fn at_default(incremental: &RequestedIncremental) -> bool {
+    incremental.compiles == incremental.by_default
+}
+
+/// A selection's `incremental`, encoded as whether it compiles incrementally.
+fn serialize_compiles<S: serde::Serializer>(
+    incremental: &RequestedIncremental,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bool(incremental.compiles)
 }
 
 /// What a build whose graph succeeded can say of itself (`at_finish`).
@@ -710,6 +750,10 @@ mod tests {
     fn selection(package: &str) -> Selection {
         Selection {
             compile_time_deps_only: false,
+            incremental: RequestedIncremental {
+                compiles: true,
+                by_default: true,
+            },
             profile: "dev".to_owned(),
             roots: BTreeSet::from([Root {
                 args: Vec::new(),
@@ -819,16 +863,7 @@ mod tests {
     /// A receipt of `selection("receipt-member")` with one compiled unit, of a
     /// build that began at `began_ms`.
     fn receipt(began_ms: u64) -> Receipt {
-        let unit = UnitUsed {
-            profile: Some("debug".to_owned()),
-            hash: MEMBER.to_owned(),
-            package: "receipt-member".to_owned(),
-            member: true,
-            built: true,
-            outputs: Vec::new(),
-            incremental: None,
-        };
-        Receipt::new(began_ms, selection("receipt-member"), vec![unit]).unwrap()
+        receipt_of(selection("receipt-member"), began_ms)
     }
 
     /// The names in the folder `dir`, sorted.
@@ -1255,5 +1290,138 @@ mod tests {
             "{receipted:?}"
         );
         assert_eq!(entries(&dir.join(DIR)), [NAME]);
+    }
+
+    /// `selection("receipt-member")` as a build whose requested profile
+    /// compiles incrementally or not (`compiles`) resolves it, where the
+    /// profile's hard-coded default is `by_default`.
+    fn compiled_as(compiles: bool, by_default: bool) -> Selection {
+        Selection {
+            incremental: RequestedIncremental {
+                compiles,
+                by_default,
+            },
+            ..selection("receipt-member")
+        }
+    }
+
+    /// A receipt of `selection` with the member's one unit, compiled, of a
+    /// build that began at `began_ms`.
+    fn receipt_of(selection: Selection, began_ms: u64) -> Receipt {
+        let unit = UnitUsed {
+            profile: Some("debug".to_owned()),
+            hash: MEMBER.to_owned(),
+            package: "receipt-member".to_owned(),
+            member: true,
+            built: true,
+            outputs: Vec::new(),
+            incremental: None,
+        };
+        Receipt::new(began_ms, selection, vec![unit]).unwrap()
+    }
+
+    /// DC-12e. A build with incremental compilation off (aterm verify's main
+    /// lane sets `CARGO_INCREMENTAL=0` in a build directory plain builds
+    /// share) is another selection than the same build with it on: it keeps a
+    /// receipt of its own beside the plain build's, which stays byte for byte,
+    /// and a build of it that keeps none withdraws its own receipt and not the
+    /// plain build's. Its selection encodes `"incremental":false`, in key
+    /// order, and a dev build with it on encodes no `incremental`, so the
+    /// plain build's receipt keeps the name and bytes it had before
+    /// (`NAME`, `FIXTURE`'s selection). In `release`, whose default is off,
+    /// a build with it off encodes none and one with it on encodes
+    /// `"incremental":true`.
+    ///
+    /// Negative control: two builds of the selection with incremental
+    /// compilation off share one receipt, the later replacing the earlier, so
+    /// the two receipts are the two selections', not two builds'. Without the
+    /// key the two selections would share `NAME`, and the build with it off
+    /// would replace the plain build's receipt, which the two-file and
+    /// byte-for-byte assertions refuse.
+    #[test]
+    fn a_build_without_incremental_keeps_its_own_receipt() {
+        let plain = compiled_as(true, true);
+        let off = compiled_as(false, true);
+        assert_eq!(plain.name().unwrap(), NAME);
+        assert_ne!(off.name().unwrap(), NAME);
+        let encoded = |selection: &Selection| {
+            String::from_utf8(serde_json::to_vec(selection).unwrap()).unwrap()
+        };
+        assert!(
+            !encoded(&plain).contains("incremental"),
+            "{}",
+            encoded(&plain)
+        );
+        assert!(
+            encoded(&off).starts_with(
+                r#"{"compile_time_deps_only":false,"incremental":false,"profile":"dev","#
+            ),
+            "{}",
+            encoded(&off)
+        );
+        let release = |compiles| Selection {
+            profile: "release".to_owned(),
+            ..compiled_as(compiles, false)
+        };
+        assert!(!encoded(&release(false)).contains("incremental"));
+        assert!(encoded(&release(true)).contains(r#","incremental":true,"profile":"release","#));
+        assert_ne!(
+            release(true).name().unwrap(),
+            release(false).name().unwrap()
+        );
+
+        let build = scratch();
+        let dir = build.path();
+        let receipts = dir.join(DIR);
+        let plain_receipt = receipt_of(plain.clone(), BEGAN_MS);
+        let plain_path = match at_finish(true, dir, || {
+            Told::Receipt(receipt_of(plain.clone(), BEGAN_MS))
+        }) {
+            Receipted::Written(path) => path,
+            receipted => panic!("{receipted:?}"),
+        };
+        assert_eq!(plain_path, receipts.join(NAME));
+        let plain_bytes = plain_receipt.encode().unwrap();
+        assert_eq!(fs::read(&plain_path).unwrap(), plain_bytes);
+
+        let off_path = match at_finish(true, dir, || {
+            Told::Receipt(receipt_of(off.clone(), BEGAN_MS + 1))
+        }) {
+            Receipted::Written(path) => path,
+            receipted => panic!("{receipted:?}"),
+        };
+        assert_ne!(off_path, plain_path);
+        assert_eq!(entries(&receipts).len(), 2);
+        assert_eq!(fs::read(&plain_path).unwrap(), plain_bytes);
+        let kept: serde_json::Value =
+            serde_json::from_slice(&fs::read(&off_path).unwrap()).unwrap();
+        assert_eq!(kept["selection"]["incremental"], false);
+        assert!(reads_as_used(&kept), "{kept}");
+
+        // Negative control: the next build of the same selection replaces its
+        // receipt; the plain build's stands.
+        let again = match at_finish(true, dir, || {
+            Told::Receipt(receipt_of(off.clone(), BEGAN_MS + 2))
+        }) {
+            Receipted::Written(path) => path,
+            receipted => panic!("{receipted:?}"),
+        };
+        assert_eq!(again, off_path);
+        assert_eq!(entries(&receipts).len(), 2);
+        assert_eq!(
+            fs::read(&off_path).unwrap(),
+            receipt_of(off.clone(), BEGAN_MS + 2).encode().unwrap()
+        );
+        assert_eq!(fs::read(&plain_path).unwrap(), plain_bytes);
+
+        // A build with incremental compilation off that keeps no receipt
+        // withdraws its own and leaves the plain build's.
+        let receipted = at_finish(true, dir, || Told::Untold(off.clone()));
+        assert!(
+            matches!(receipted, Receipted::Unstated { withdrawn: Ok(()) }),
+            "{receipted:?}"
+        );
+        assert_eq!(entries(&receipts), [NAME]);
+        assert_eq!(fs::read(&plain_path).unwrap(), plain_bytes);
     }
 }

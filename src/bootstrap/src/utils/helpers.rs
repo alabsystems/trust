@@ -628,6 +628,8 @@ pub(crate) fn exit_process(code: i32) -> ! {
     }
 }
 
+// Trust: its one caller, config.rs's rust-compatibility check, is `cfg(not(test))`.
+#[cfg_attr(test, expect(dead_code, reason = "called only from non-test code"))]
 pub fn fail(s: &str) -> ! {
     eprintln!("\n\n{s}\n\n");
     exit_process(1);

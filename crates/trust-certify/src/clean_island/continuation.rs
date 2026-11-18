@@ -228,6 +228,23 @@ impl CleanIslandSession {
         sources: &[&str],
         defer_reporting: bool,
     ) -> PreparedDeclarations {
+        self.prepare_declarations_with_reference_scope(sources, defer_reporting, None)
+    }
+
+    pub(super) fn prepare_pinned_source_declarations(
+        &mut self,
+        sources: &[&str],
+        baseline: &std::collections::BTreeSet<clean_kernel::Name>,
+    ) -> PreparedDeclarations {
+        self.prepare_declarations_with_reference_scope(sources, false, Some(baseline))
+    }
+
+    fn prepare_declarations_with_reference_scope(
+        &mut self,
+        sources: &[&str],
+        defer_reporting: bool,
+        source_baseline: Option<&std::collections::BTreeSet<clean_kernel::Name>>,
+    ) -> PreparedDeclarations {
         self.model_metadata_reads.clear();
         self.model_baseline_read = false;
         let (served, imported) = self.serve_trust_imports_named(sources);
@@ -238,7 +255,11 @@ impl CleanIslandSession {
         // Inside a keyed operation (`CheckAll` or `Prepare`, or their replay),
         // so this is that operation's own environment.
         let (env, file_ctx, _) = self.keyed.parts_mut();
-        let mut batch = if preludes.iter().all(String::is_empty) {
+        let mut batch = if let Some(baseline) = source_baseline {
+            crate::clean_island_batch::check_pinned_sources_batched(
+                env, file_ctx, sources, &preludes, false, baseline,
+            )
+        } else if preludes.iter().all(String::is_empty) {
             crate::clean_island_batch::check_islands_batched(env, file_ctx, sources)
         } else {
             crate::clean_island_batch::check_islands_batched_with_preludes(

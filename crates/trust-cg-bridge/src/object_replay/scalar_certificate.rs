@@ -130,22 +130,37 @@ pub(super) fn qualify_source(source: &TrustIrGateSource) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `word` is the encoding of `RET X30`: exactly these four bytes, in
+/// this order. A slice of any other length or content is not it.
+fn is_ret_x30_word(word: &[u8]) -> bool {
+    word == 0xd65f_03c0_u32.to_le_bytes()
+}
+
 fn u16_at(bytes: &[u8], at: usize) -> Result<u16, String> {
     let end = at.checked_add(2).ok_or("scalar certificate: offset overflow")?;
     Ok(u16::from_le_bytes(
-        bytes.get(at..end).ok_or("scalar certificate: truncated u16")?.try_into().unwrap(),
+        bytes
+            .get(at..end)
+            .and_then(|field| field.try_into().ok())
+            .ok_or("scalar certificate: truncated u16")?,
     ))
 }
 fn u32_at(bytes: &[u8], at: usize) -> Result<u32, String> {
     let end = at.checked_add(4).ok_or("scalar certificate: offset overflow")?;
     Ok(u32::from_le_bytes(
-        bytes.get(at..end).ok_or("scalar certificate: truncated u32")?.try_into().unwrap(),
+        bytes
+            .get(at..end)
+            .and_then(|field| field.try_into().ok())
+            .ok_or("scalar certificate: truncated u32")?,
     ))
 }
 fn u64_at(bytes: &[u8], at: usize) -> Result<u64, String> {
     let end = at.checked_add(8).ok_or("scalar certificate: offset overflow")?;
     Ok(u64::from_le_bytes(
-        bytes.get(at..end).ok_or("scalar certificate: truncated u64")?.try_into().unwrap(),
+        bytes
+            .get(at..end)
+            .and_then(|field| field.try_into().ok())
+            .ok_or("scalar certificate: truncated u64")?,
     ))
 }
 fn extent(bytes: &[u8], at: usize, count: usize, width: usize) -> Result<usize, String> {
@@ -312,9 +327,7 @@ pub(super) fn qualify_machine(
             decode_aarch64(bytes, pc).map_err(|e| format!("scalar certificate: decode {e}"))?;
         let last = index + 1 == text.len() / 4;
         if last {
-            if decoded.opcode != Opcode::Ret
-                || u32::from_le_bytes(bytes.try_into().unwrap()) != 0xd65f_03c0
-            {
+            if decoded.opcode != Opcode::Ret || !is_ret_x30_word(bytes) {
                 return Err("scalar certificate: final instruction must be RET X30".into());
             }
             let effects = Aarch64Semantics.effects(&state, &decoded).map_err(|e| e.to_string())?;

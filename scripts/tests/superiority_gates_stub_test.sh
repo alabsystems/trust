@@ -38,8 +38,9 @@ ok() { printf '  ok    %s\n' "$*"; }
 REPO="$TEST_ROOT/repo"
 BIN="$TEST_ROOT/toolchain/bin"
 FIX="$REPO/tests/trust-falsification/superiority"
-mkdir -p "$REPO/scripts" "$FIX/proved" "$FIX/mutant" "$BIN" || exit 2
+mkdir -p "$REPO/scripts/lib" "$FIX/proved" "$FIX/mutant" "$BIN" || exit 2
 cp "$SUP_GATE" "$CERT_GATE" "$REPO/scripts/" || exit 2
+cp "$SRC_ROOT/scripts/lib/trust_program_wire.py" "$REPO/scripts/lib/" || exit 2
 
 cat > "$BIN/trustc" <<'FAKE'
 #!/bin/sh
@@ -164,12 +165,47 @@ printf '== clean-certification gate ==\n'
 # JSON rows in the compiler's shape (-Ztrust-verify-output=json).
 row() { # id kind typed outcome [assurance]
   local ev=''
-  [[ -n ${5-} ]] && ev=',"proof_evidence":{"suite":"trust-certify","strength":{"reasoning":"Constructive","assurance":"'"$5"'"}}'
+  [[ -n ${5-} ]] && ev=',"proof_evidence":{"suite":"trust-certify","status":"'"$4"'","strength":{"reasoning":"Constructive","assurance":"'"$5"'"}}'
   printf '{"obligation_id":"vc:f__f:%s","kind":"%s","typed_kind":"%s","outcome":"%s"%s}' "$1" "$2" "$3" "$4" "$ev"
 }
-fn_result() { # rows...
-  local IFS=,
-  printf 'J TRUST_JSON:{"type":"function_result","function":"f::f","results":[%s]}' "$*"
+fn_result() { # fixture-name rows...
+  python3 -I - "$@" <<'PY'
+from collections import Counter
+import json
+import sys
+
+crate, *rows = sys.argv[1:]
+functions = {f"{crate}::{crate}": []}
+for raw in rows:
+    row = json.loads(raw)
+    function = f"{crate}::{row.pop('_test_function', crate)}"
+    functions.setdefault(function, []).append(row)
+
+def counts(results):
+    outcomes = Counter(row["outcome"] for row in results)
+    return dict(proved=outcomes["proved"], failed=outcomes["failed"],
+                unknown=sum(outcomes[kind] for kind in (
+                    "unknown", "timeout", "skipped", "unsupported", "canceled", "rejected")),
+                timed_out=outcomes["timeout"], skipped=outcomes["skipped"],
+                runtime_checked=outcomes["runtime_checked"], total=len(results))
+
+messages = [dict(type="function_result", function=function, results=results, **counts(results))
+            for function, results in functions.items()]
+summary_counts = {"total_" + key: value for key, value in counts(
+    [row for results in functions.values() for row in results]).items() if key != "total"}
+identities = dict(schema="trustc.coverage-function-identities.v1",
+                  eligible_functions=sorted(functions), processed_functions=sorted(functions))
+messages.extend((
+    dict(type="coverage_summary", eligible=len(functions), processed=len(functions), function_identities=identities,
+         memory=dict(schema="trust-memory-summary/v1", counters={})),
+    dict(type="crate_summary", functions_analyzed=len(functions), total_obligations=len(rows),
+         functions_verified=sum(bool(results) and all(row["outcome"] == "proved" for row in results)
+                                for results in functions.values()),
+         **summary_counts),
+))
+for message in messages:
+    print("J TRUST_JSON:" + json.dumps(dict(crate_name=crate, **message)))
+PY
 }
 BOUNDS_CERT=$(row bounds_check:0 slice SliceBoundsCheck proved Certified)
 BOUNDS_TRUSTED=$(row bounds_check:0 slice SliceBoundsCheck proved Trusted)
@@ -182,13 +218,13 @@ H_NOTE='H note: of which 1 kernel-certified by the clean CIC kernel (zero-trust 
 certifiable_fixtures() { # rev-mutant-row
   clear_fixtures
   for n in guarded_slice_bound for_range_index_bound while_range_index_bound rev_range_index_bound; do
-    fixture proved "$n" 0 "$(fn_result "$BOUNDS_CERT")" "$H_NOTE"
+    fixture proved "$n" 0 "$(fn_result "$n" "$BOUNDS_CERT")" "$H_NOTE"
   done
-  fixture mutant guarded_slice_bound 0 "$(fn_result "$BOUNDS_FAILED")"
+  fixture mutant guarded_slice_bound 0 "$(fn_result guarded_slice_bound "$BOUNDS_FAILED")"
   # The measured w17 shapes: a TRUE row Certified beside the refuted bounds row.
-  fixture mutant for_range_index_bound 0 "$(fn_result "$UNREACH_CERT" "$BOUNDS_FAILED")" "$H_NOTE"
-  fixture mutant while_range_index_bound 0 "$(fn_result "$BOUNDS_FAILED" "$ADD_CERT")" "$H_NOTE"
-  fixture mutant rev_range_index_bound 0 "$(fn_result "$UNREACH_CERT" "$1")" "$H_NOTE"
+  fixture mutant for_range_index_bound 0 "$(fn_result for_range_index_bound "$UNREACH_CERT" "$BOUNDS_FAILED")" "$H_NOTE"
+  fixture mutant while_range_index_bound 0 "$(fn_result while_range_index_bound "$BOUNDS_FAILED" "$ADD_CERT")" "$H_NOTE"
+  fixture mutant rev_range_index_bound 0 "$(fn_result rev_range_index_bound "$UNREACH_CERT" "$1")" "$H_NOTE"
 }
 
 printf 'C1: per-obligation judgment, and no refused variable reaches trustc (root cause)\n'
@@ -223,19 +259,19 @@ expect_no_line 'no PASS mutant row over dead compiles' '^PASS  mutant'
 
 printf 'C4: rows that are missing, uncertified or unjudgeable fail\n'
 certifiable_fixtures "$BOUNDS_FAILED"
-fixture proved guarded_slice_bound 0 "$(fn_result "$BOUNDS_TRUSTED")"
-fixture proved rev_range_index_bound 0 "$(fn_result "$BOUNDS_CERT" "$(row bounds_check:2 slice SliceBoundsCheck proved Trusted)")"
+fixture proved guarded_slice_bound 0 "$(fn_result guarded_slice_bound "$BOUNDS_TRUSTED")"
+fixture proved rev_range_index_bound 0 "$(fn_result rev_range_index_bound "$BOUNDS_CERT" "$(row bounds_check:2 slice SliceBoundsCheck proved Trusted)")"
 fixture mutant guarded_slice_bound 1 'J error[E0425]: cannot find value `x` in this scope'
-fixture mutant while_range_index_bound 0 "$(fn_result "$ADD_CERT")"
-fixture mutant for_range_index_bound 0 "$(fn_result "$(row bounds_check:1 slice SliceBoundsCheck proved Trusted)")"
+fixture mutant while_range_index_bound 0 "$(fn_result while_range_index_bound "$ADD_CERT")"
+fixture mutant for_range_index_bound 0 "$(fn_result for_range_index_bound "$(row bounds_check:1 slice SliceBoundsCheck proved Trusted)")"
 run trust_clean_certification_gate.sh
 rc=$?
 expect_rc "$rc" 1 'RED'
 expect_line 'Trusted-only bounds row is not certified' 'FAIL  proved   guarded_slice_bound  — NOT clean-certified: bounds row(s) bounds_check:0(proved) lack Certified assurance'
 expect_line 'every bounds row must be certified' 'FAIL  proved   rev_range_index_bound  — NOT clean-certified: bounds row(s) bounds_check:2(proved) lack Certified assurance'
-expect_line 'a mutant with no rows fails' 'FAIL  mutant   guarded_slice_bound  — no verification summary'
-expect_line 'a mutant without its bounds row fails' 'FAIL  mutant   while_range_index_bound  — no slice bounds obligation among 1 row(s)'
-expect_line 'a mutant whose bounds row is proved fails' 'FAIL  mutant   for_range_index_bound  — bounds obligation(s) bounds_check:1(proved) proved without certification'
+expect_line 'a mutant with no rows fails' 'FAIL  mutant   guarded_slice_bound  — compile exited 1'
+expect_line 'a mutant without its bounds row fails' 'FAIL  mutant   while_range_index_bound  — no slice bounds obligation in the fixture function'
+expect_line 'a mutant whose bounds row is proved fails' 'FAIL  mutant   for_range_index_bound  — fixture bounds obligation(s) bounds_check:1(proved) proved without certification'
 
 printf 'C5: a missing mutant fixture is a failure, not a skip\n'
 certifiable_fixtures "$BOUNDS_FAILED"
@@ -244,6 +280,49 @@ run trust_clean_certification_gate.sh
 rc=$?
 expect_rc "$rc" 1 'RED'
 expect_line 'missing mutant row' 'FAIL  mutant   rev_range_index_bound  — fixture missing'
+
+printf 'C6: an emitted mutant row cannot turn a refused compile green\n'
+certifiable_fixtures "$BOUNDS_FAILED"
+rev_rows=$(fn_result rev_range_index_bound "$BOUNDS_FAILED")
+for failed_exit in 75 101 137; do
+  fixture mutant rev_range_index_bound "$failed_exit" "$rev_rows"
+  run trust_clean_certification_gate.sh
+  rc=$?
+  expect_rc "$rc" 1 'RED'
+  expect_line 'refused or crashed mutant compile fails' "FAIL  mutant   rev_range_index_bound  — compile exited $failed_exit"
+  expect_no_line 'no PASS over the refused mutant' '^PASS  mutant   rev_range_index_bound'
+done
+
+printf 'C7: mutant evidence requires its complete, reconciled wire\n'
+for wire in "$(printf '%s\n' "$rev_rows" | sed '$d')" \
+            "$(fn_result for_range_index_bound "$BOUNDS_FAILED")" \
+            "$(printf '%s\n' "$rev_rows" | sed 's/"total_failed": 1/"total_failed": 0/')"; do
+  fixture mutant rev_range_index_bound 0 "$wire"
+  run trust_clean_certification_gate.sh
+  rc=$?
+  expect_rc "$rc" 1 'RED'
+  expect_line 'bad wire refuses' 'FAIL  mutant   rev_range_index_bound  — invalid verification wire:'
+  expect_no_line 'no PASS over incomplete or mismatched evidence' '^PASS  mutant   rev_range_index_bound'
+done
+
+printf 'C8: evidence belongs to the fixture body and the reported obligation\n'
+certifiable_fixtures "$BOUNDS_FAILED"
+nested_cert="${BOUNDS_TRUSTED%?}"',"diagnostic":{"assurance":"Certified"}}'
+helper_cert="${BOUNDS_CERT%?}"',"_test_function":"helper"}'
+helper_failed="${BOUNDS_FAILED%?}"',"_test_function":"helper"}'
+conflicting_status=$(printf '%s\n' "$BOUNDS_CERT" | sed 's/"status":"proved"/"status":"failed"/')
+fixture proved guarded_slice_bound 0 "$(fn_result guarded_slice_bound "$nested_cert")"
+fixture proved for_range_index_bound 0 "$(fn_result for_range_index_bound "$helper_cert")"
+fixture proved while_range_index_bound 0 "$(fn_result while_range_index_bound "$conflicting_status")"
+fixture mutant rev_range_index_bound 0 "$(fn_result rev_range_index_bound "$BOUNDS_TRUSTED" "$helper_failed")"
+run trust_clean_certification_gate.sh
+rc=$?
+expect_rc "$rc" 1 'RED for body and assurance mismatches'
+expect_line 'nested assurance cannot certify its containing row' 'FAIL  proved   guarded_slice_bound  — NOT clean-certified'
+expect_line 'a helper cannot replace the fixture bounds obligation' 'FAIL  proved   for_range_index_bound  — no slice bounds obligation in the fixture function'
+expect_line 'conflicting proof status refuses certification' 'FAIL  proved   while_range_index_bound  — inconsistent Certified outcome or proof status'
+expect_line 'a helper cannot refute the mutant fixture' 'FAIL  mutant   rev_range_index_bound  — fixture bounds obligation'
+expect_no_line 'mismatched rows cannot pass' '^PASS  (proved   (guarded_slice_bound|for_range_index_bound|while_range_index_bound)|mutant   rev_range_index_bound)'
 
 if ((failures)); then
   printf 'superiority_gates_stub_test: %d FAILED\n' "$failures"

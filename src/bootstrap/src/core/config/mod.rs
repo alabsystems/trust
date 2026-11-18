@@ -33,8 +33,8 @@ pub use toml::change_id::ChangeId;
 pub use toml::rust::BootstrapOverrideLld;
 pub use toml::target::Target;
 
-pub use self::config::InputLayout;
 pub(crate) use self::config::*;
+pub use self::config::{InputLayout, SeedConfiguration};
 use crate::utils::helpers;
 
 pub(crate) trait Merge {

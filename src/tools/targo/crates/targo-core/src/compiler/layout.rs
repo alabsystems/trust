@@ -400,7 +400,8 @@ impl Layout {
     /// itself and its compilation still holds it (in the Layout, or in the
     /// workload capsule `take_compile_leases` moved it to, which outlives
     /// `finish_compilation`'s use of this). False where the lock is shared
-    /// (`-Zfine-grain-locking`), borrowed from a retained original (a
+    /// (fine-grain locking: `-Zfine-grain-locking` or
+    /// `build.shared-dependency-cache`), borrowed from a retained original (a
     /// continued build), not taken (a file system without locking) or
     /// released.
     pub(crate) fn excludes_other_builds(&self) -> bool {
@@ -413,6 +414,11 @@ impl Layout {
     ///
     /// `dest` should be the final artifact directory name. Currently either
     /// "debug" or "release".
+    ///
+    /// Trust: the build directory lock is shared only where
+    /// `must_take_build_dir_lock_exclusively` is false, which a build passes
+    /// only under fine-grain locking (`BuildContext::fine_grain_locking`,
+    /// DC-17a); every other caller passes true.
     pub fn new(
         ws: &Workspace<'_>,
         target: Option<CompileTarget>,
@@ -507,9 +513,7 @@ impl Layout {
             if let Some(held) = original(&build_dest.as_path_unlocked().join(".cargo-build-lock"))?
             {
                 Some(held)
-            } else if ws.gctx().cli_unstable().fine_grain_locking
-                && !must_take_build_dir_lock_exclusively
-            {
+            } else if !must_take_build_dir_lock_exclusively {
                 Some(build_dest.open_ro_shared_create(
                     ".cargo-build-lock",
                     ws.gctx(),

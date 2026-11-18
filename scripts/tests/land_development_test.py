@@ -740,6 +740,12 @@ class CensusDevelopmentOwnershipTests(unittest.TestCase):
 
 class DevelopmentDiscoveryPreflightTests(unittest.TestCase):
     UNOWNED = (
+        "src/bootstrap/bootstrap.py",
+        "src/bootstrap/bootstrap_test.py",
+        "src/bootstrap/Cargo.toml",
+        "src/bootstrap/build.rs",
+        "src/bootstrap/src/main.rs",
+        "src/bootstrap/src/bin/main.rs",
         "compiler/rustc_mir_transform/src/trust_verify/tests/native_wp_source.rs",
         "crates/trust-router/Cargo.toml",
         "crates/trust-router/src/full_verification/native_trust_ir/index.rs",
@@ -793,6 +799,19 @@ class DevelopmentDiscoveryPreflightTests(unittest.TestCase):
         full.assert_not_called()
         manifest.assert_not_called()
         harvest.assert_not_called()
+
+    def test_bootstrap_library_and_registered_inputs_keep_their_existing_discovery(self):
+        # Passing the negative filter grants no owner or skipped check. Keep
+        # library sources, snapshots, registered validators and prose eligible
+        # for their existing discovery while refusing Python/executable inputs.
+        for path in ("src/bootstrap/src/core/build_steps/tool.rs",
+                     "src/bootstrap/src/core/builder/snapshots/x_check.snap",
+                     "tools/preflight.py",
+                     "README.md"):
+            with self.subTest(path=path):
+                base = self.commit(path)
+                _, _, changed = gate.development_discovery_inputs(base, "HEAD")
+                self.assertEqual(changed, [path])
 
     def test_each_existing_build_slot_regression_module_selects_complete_owner_suite(self):
         expected={"scripts.tests.build_slot_test","scripts.tests.build_slot_quiet_test",
@@ -2182,6 +2201,48 @@ class DevelopmentRetentionOwnerTests(unittest.TestCase):
 
 class DevelopmentVf5ProposalOwnerTests(DevelopmentRetentionOwnerTests):
     program_name = "produce_vf5_proposal"
+
+
+class DevelopmentTrainOwnerTests(DevelopmentRetentionOwnerTests):
+    program_name = "daily_toolchain_stage"
+
+    def test_exact_registered_retention_inputs_select_one_fresh_existing_suite(self):
+        # The producer has consumers beyond its own suite. Preserve the full
+        # existing row-table selection, including for a test-only edit.
+        program_tests = [
+            "scripts.tests.check_bootstrap_script_tests_test", "scripts.tests.daily_dependency_git_selection_test",
+            "scripts.tests.daily_toolchain_stage_test",
+            "scripts.tests.python_floor_test", "scripts.tests.sdk_diagnostic_test",
+        ]
+        fixture_tests = program_tests[:3]
+        for paths, expected in (((self.paths[0],), program_tests),
+                                ((self.paths[1],), fixture_tests),
+                                (self.paths, program_tests)):
+            with self.subTest(paths=paths):
+                graph, selected = self.changed(paths)
+                self.assertEqual(ls.validation_test_modules(paths), expected)
+                for path in paths:
+                    self.assertEqual(ls.classify(graph, path)[0], "everything")
+                scoped = development.scope(graph, selected)
+                self.assertEqual(scoped.errors, [])
+                self.assertEqual(scoped.tests, expected)
+                self.assertTrue(development.has_declared_source_ownership(graph.index, paths))
+                leg, = gate.development_legs(graph, selected, [], 1)
+                self.assertEqual(leg.command, [sys.executable, "scripts/land_gate.py", "validation-tests", *expected])
+                self.assertTrue(leg.force_run)
+                self.assertFalse(leg.cache_members)
+                selected.everything.append("unknown diagnostic graph fact")
+                self.assertEqual(development.scope(graph, selected).errors, ["unknown diagnostic graph fact"])
+
+    def test_actual_train_discovery_uses_its_declared_tests_without_a_full_rust_scan(self):
+        self.changed(self.paths)
+        with mock.patch.object(gate, "REPO_ROOT", self.root), \
+             mock.patch.object(ls, "build_graph", side_effect=AssertionError("full Rust scan forbidden")):
+            graph, selected, _ = gate.compute_discovery(
+                self.base, "HEAD", False, None, gate.DiscoveryProfile.DEVELOPMENT)
+        self.assertIsInstance(selected, gate.DeclaredDevelopmentSelection)
+        self.assertEqual(development.scope(graph, selected).errors, [])
+        self.assertEqual(development.scope(graph, selected).tests, ls.validation_test_modules(self.paths))
 
 
 class DevelopmentScopeTests(unittest.TestCase):

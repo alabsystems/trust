@@ -20,6 +20,9 @@ theorem p_dec : SEndian.decode MR_Endianness.LittleEndian MR_Signedness.Signed [
 theorem p_dec2 : SEndian.decode MR_Endianness.LittleEndian MR_Signedness.Unsigned [254, 255, 255, 255] = SOut.ok 4294967294 := rfl
 theorem p_pow2 : SInt.is_power_of_two 64 = true := rfl
 theorem p_pow3 : SInt.is_power_of_two 12 = false := rfl
+theorem p_pow_neg_exp : SInt.pow 2 (-1) = SOut.panic "called `Option::unwrap()` on a `None` value" := rfl
+theorem p_pow_wide_exp : SInt.pow 1 4294967296 = SOut.panic "called `Option::unwrap()` on a `None` value" := rfl
+theorem p_pow_neg_base : SInt.pow (-2) 3 = SOut.ok (-8) := rfl
 theorem p_str : SInt.toString (-120) = "-120" := rfl
 theorem p_map : SMap.insert Nat.beq [(1, (5:Int))] 2 7 = (none, [(1, 5), (2, 7)]) := rfl
 theorem p_sort : SList.sortByIntKeyS [((8:Int), true), (0, false), (4, true)] (fun (p : Int × Bool) (s : Unit) => SOut.ok (p.1, s)) () = SOut.ok ([(0, false), (4, true), (8, true)], ()) := rfl

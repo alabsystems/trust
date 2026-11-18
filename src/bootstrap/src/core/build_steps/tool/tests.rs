@@ -10,6 +10,9 @@ use super::*;
 // restores (tool_selection_tests), and the native targo, trustup and frontend
 // artifact graphs (native_artifact_tests).
 mod native_artifact_tests;
+// Trust (DC-16a): a stage 2 takes the batteries its change leaves alone from its
+// source toolchain.
+mod stage2_source_tests;
 // Trust: the crate-level features of the first-party crates Targo links, against
 // its sandbox (STAGE1-TARGO-AY-FEATURES-1).
 mod targo_linked_features;
@@ -400,16 +403,33 @@ fn solver_allocation_feature_stays_scoped_to_solver_tools() {
     let ay = ay_tool_build_recipe(compiler, output, target, context.dir());
     let native = targo_tool_build_recipe(compiler, output, target);
     let trustd = trustd_tool_build_recipe(compiler, output, target);
-    for (name, path, extra, has_allocator, has_min_specialization, has_specialization) in [
-        ("generic", "src/tools/targo", "", false, false, false),
-        (native.tool, native.path, native.allow_features, true, true, true),
-        (ay.tool, ay.path, ay.allow_features, true, true, false),
-        (trustd.tool, trustd.path, trustd.allow_features, true, true, true),
-        ("ty", "first-party/ty/crates/tla-cli", VERIFIER_BACKEND_ALLOW_FEATURES, true, true, true),
+    for (
+        name,
+        path,
+        extra,
+        has_allocator,
+        has_allocator_api,
+        has_min_specialization,
+        has_specialization,
+    ) in [
+        ("generic", "src/tools/targo", "", false, false, false, false),
+        (native.tool, native.path, native.allow_features, true, false, true, true),
+        (ay.tool, ay.path, ay.allow_features, true, true, true, false),
+        (trustd.tool, trustd.path, trustd.allow_features, true, false, true, true),
+        (
+            "ty",
+            "first-party/ty/crates/tla-cli",
+            VERIFIER_BACKEND_ALLOW_FEATURES,
+            true,
+            true,
+            true,
+            true,
+        ),
         (
             "clean",
             "first-party/clean/crates/clean",
             VERIFIER_BACKEND_ALLOW_FEATURES,
+            true,
             true,
             true,
             true,
@@ -438,7 +458,8 @@ fn solver_allocation_feature_stays_scoped_to_solver_tools() {
             .to_str()
             .unwrap();
         let allowed: HashSet<_> = features.split(',').collect();
-        assert_eq!(allowed.contains("allocator_api"), has_allocator, "{name}: {features}");
+        assert_eq!(allowed.contains("allocator_api"), has_allocator_api, "{name}: {features}");
+        assert_eq!(allowed.contains("allocator_ext"), has_allocator, "{name}: {features}");
         // Trust: ahash needs only min_specialization in AY; neither its full
         // specialization permission nor its allocator permission may leak.
         assert_eq!(
@@ -813,7 +834,7 @@ fn targo_trust_stage2_build_enables_in_process_verifier_features() {
     );
     assert_eq!(
         CARGO_TRUST_ALLOW_FEATURES,
-        "min_specialization,specialization,try_trait_v2,try_trait_v2_residual,allocator_api,trust_process_inherit_fds"
+        "min_specialization,specialization,try_trait_v2,try_trait_v2_residual,allocator_ext,trust_process_inherit_fds"
     );
     assert_eq!(trustd_cargo_args(), ["--locked", "--bin", "trustd"]);
 }
@@ -1378,12 +1399,12 @@ fn assert_intermediate_stage1_tool_graph(apple_cross_std: bool, same_line: bool)
             match recipe.tool {
                 // Trust: 17ce2ab3e5 lets AY's ahash build script request
                 // min_specialization (AY_ALLOW_FEATURES).
-                "ay" => "min_specialization,allocator_api",
+                "ay" => "min_specialization,allocator_api,allocator_ext",
                 // The native job service and verifier tools use the same
                 // proof runtime and child-only descriptor inheritance.
                 "targo" | "targo-trust" | "trustd" =>
-                    "min_specialization,specialization,try_trait_v2,try_trait_v2_residual,allocator_api,trust_process_inherit_fds",
-                "ty" | "clean" => "min_specialization,specialization,allocator_api",
+                    "min_specialization,specialization,try_trait_v2,try_trait_v2_residual,allocator_ext,trust_process_inherit_fds",
+                "ty" | "clean" => "min_specialization,specialization,allocator_api,allocator_ext",
                 _ => unreachable!(),
             }
         );
@@ -1608,6 +1629,24 @@ fn assert_intermediate_tool_scheduling_policy() {
         changed.push((key.into(), "unknown".into()));
         assert!(!ordinary(&build, changed), "{key}");
     }
+    // Trust: Bootstrap hands CARGOFLAGS* to every Cargo; only lockfile and network
+    // switches keep the audited posture.
+    for key in ["CARGOFLAGS", "CARGOFLAGS_BOOTSTRAP", "CARGOFLAGS_NOT_BOOTSTRAP"] {
+        for flags in [
+            "--config env.RUSTC_WRAPPER_REAL='/x/w'",
+            "--offline --config build.rustc-wrapper='w'",
+            "-Zadvanced-env",
+        ] {
+            let mut changed = ambient.clone();
+            changed.push((key.into(), flags.into()));
+            assert!(!ordinary(&build, changed), "{key}={flags}");
+        }
+        for flags in ["", "--offline", " --offline  --locked ", "--frozen"] {
+            let mut changed = ambient.clone();
+            changed.push((key.into(), flags.into()));
+            assert!(ordinary(&build, changed), "{key}={flags}");
+        }
+    }
     assert!(!ordinary(&build, vec![ambient[0].clone()]));
     assert!(ordinary(&build, vec![ambient[0].clone(), ("TRUST_NO_VERIFY".into(), "1".into())]));
     let mut opt_in = ambient.clone();
@@ -1634,6 +1673,38 @@ fn intermediate_tool_deferral_refuses_ambient_cargo_configuration() {
     fs::write(src.join(".cargo/config.toml"), include_str!("../../../../../../.cargo/config.toml"))
         .unwrap();
     assert!(intermediate_tool_cargo_configuration_known(&src, &home));
+    // Trust: a thread-stack size is the one `[env]` entry that cannot reach the
+    // compiler's selection or verification policy.
+    for text in [
+        "[env]\nRUST_MIN_STACK = '16777216'\n",
+        "[env]\nRUST_MIN_STACK = { value = '16777216', force = false }\n",
+        "[env]\nRUST_MIN_STACK = { value = '16777216' }\n",
+    ] {
+        fs::write(src.join(".cargo/config.toml"), text).unwrap();
+        assert!(intermediate_tool_cargo_configuration_known(&src, &home), "{text}");
+    }
+    for text in [
+        "[env]\nRUST_MIN_STACK = '16777216'\nTRUST_BOOTSTRAP_VERIFY_LIBRARY = 'core'\n",
+        "[env]\nRUSTFLAGS = '-Ztrust-verify=off'\n",
+        "[env]\nRUSTC_BOOTSTRAP = '1'\n",
+        "[env]\n",
+        "[env]\nTRUST_NO_VERIFY = '1'\n",
+        "[env]\nRUST_MIN_STACK = '1'\nRUSTC_BOOTSTRAP = '1'\n",
+        "[env]\nRUST_MIN_STACK = { value = '16777216', force = true }\n",
+        "[env]\nRUST_MIN_STACK = { value = '16M' }\n",
+        "[env]\nRUST_MIN_STACK = { value = 16777216, force = false }\n",
+        "[env]\nRUST_MIN_STACK = 16777216\n",
+        "[env]\nRUST_MIN_STACK = ''\n",
+        "[env]\nRUST_MIN_STACK = '16M'\n",
+        "[env]\nRUST_MIN_STACK = { value = '16777216', relative = true }\n",
+        "[env]\nRUST_MIN_STACK = { value = '16777216', force = 'yes' }\n",
+        "[env]\nRUST_MIN_STACK = { force = false }\n",
+        "[env]\nRUST_MIN_STACK = ['16777216']\n",
+        "env = 'RUST_MIN_STACK'\n",
+    ] {
+        fs::write(src.join(".cargo/config.toml"), text).unwrap();
+        assert!(!intermediate_tool_cargo_configuration_known(&src, &home), "{text}");
+    }
     for text in [
         "[build]\ntarget-dir = 7\n",
         "[build]\ntarget-dir = false\n",
@@ -1878,11 +1949,25 @@ fn compiletest_check_steps_allow_what_their_builds_allow() {
     assert_eq!(COMPILETEST_ALLOW_FEATURES, "trust_process_inherit_fds");
 }
 
+#[test]
+fn targo_doc_step_allows_what_targo_builds_allow() {
+    // Trust: documenting Targo compiles the graph Targo's build compiles (ay-sat's
+    // `allocator_ext` among it). Cargo's fingerprint does not record the shim's
+    // allow-list, so a narrower doc list passes on a warm tree and refuses a cold one;
+    // only its source names it.
+    let doc = include_str!("../doc.rs");
+    let start =
+        doc.find("tool_doc!(\n    Cargo,\n    \"src/tools/targo\",").expect("Targo's doc step");
+    let entry = &doc[start..start + doc[start..].find("\n);").expect("the entry closes")];
+    assert!(entry.contains("allow_features: tool::TARGO_ALLOW_FEATURES"), "{entry}");
+}
+
 // Trust: the real recipe must not select the target compiler/Std or a test feature.
 #[test]
-fn vf5_resource_preparer_is_the_source_built_host_snapshot_example() {
+fn vf5_resource_preparer_is_the_source_built_host_snapshot_binary() {
     let context = crate::utils::tests::TestCtx::new();
-    let build = crate::core::session::Session::new(context.config("build").stage(2).create_config());
+    let build =
+        crate::core::session::Session::new(context.config("build").stage(2).create_config());
     let builder = Builder::new(&build);
     let recipe = vf5_resource_tool_recipe(&builder);
     assert_eq!(recipe.mode, Mode::ToolBootstrap);
@@ -1892,13 +1977,13 @@ fn vf5_resource_preparer_is_the_source_built_host_snapshot_example() {
     assert_eq!(recipe.path, "crates/trust-certify");
     assert_eq!(recipe.tool, "prepare_vf5_inputs");
     assert_eq!(recipe.allow_features, VF5_RESOURCE_ALLOW_FEATURES);
-    assert_eq!(recipe.cargo_args, ["--example", "prepare_vf5_inputs"]);
-    assert_eq!(recipe.artifact_kind, ToolArtifactKind::Example);
+    assert_eq!(recipe.cargo_args, ["--bin", "prepare_vf5_inputs"]);
+    assert_eq!(recipe.artifact_kind, ToolArtifactKind::Binary);
     assert!(recipe.extra_features.is_empty());
     // Trust: exactly what ahash, ay-sat and trust-types' try-sugar declare.
     assert_eq!(
         recipe.allow_features,
-        "min_specialization,allocator_api,try_trait_v2,try_trait_v2_residual"
+        "min_specialization,allocator_ext,try_trait_v2,try_trait_v2_residual"
     );
     assert!(matches!(recipe.cargo_input(&builder), CargoInput::Seed));
 }
@@ -1906,7 +1991,8 @@ fn vf5_resource_preparer_is_the_source_built_host_snapshot_example() {
 #[test]
 fn vf5_resource_preparer_retains_the_solver_feature_sandbox() {
     let context = crate::utils::tests::TestCtx::new();
-    let build = crate::core::session::Session::new(context.config("build").stage(2).create_config());
+    let build =
+        crate::core::session::Session::new(context.config("build").stage(2).create_config());
     let builder = Builder::new(&build);
     let recipe = vf5_resource_tool_recipe(&builder);
     let mut cargo = prepare_tool_cargo(
@@ -1934,13 +2020,13 @@ fn vf5_resource_preparer_retains_the_solver_feature_sandbox() {
         "binary-dep-depinfo",
         "proc_macro_span",
         "min_specialization",
-        "allocator_api",
+        "allocator_ext",
         "try_trait_v2",
         "try_trait_v2_residual",
     ] {
         assert!(allowed.contains(feature), "missing {feature}: {features}");
     }
-    for feature in ["specialization", "trust_process_inherit_fds"] {
+    for feature in ["allocator_api", "specialization", "trust_process_inherit_fds"] {
         assert!(!allowed.contains(feature), "unrelated {feature}: {features}");
     }
 }
@@ -1953,9 +2039,8 @@ fn vf5_resource_dry_runs_discover_the_host_tool_without_running_policy() {
     // Both must consume BootstrapCommand without executing/parsing tool output.
     for dry_run in [DryRun::SelfCheck, DryRun::UserSelected] {
         let context = crate::utils::tests::TestCtx::new();
-        let mut build = crate::core::session::Session::new(
-            context.config("build").stage(1).create_config(),
-        );
+        let mut build =
+            crate::core::session::Session::new(context.config("build").stage(1).create_config());
         build.config.set_dry_run(dry_run);
         let builder = Builder::new(&build);
         assert!(builder.config.dry_run());
@@ -1985,14 +2070,16 @@ fn vf5_resource_dry_runs_discover_the_host_tool_without_running_policy() {
             .collect::<Vec<_>>();
         assert_eq!(
             preparers,
-            [(0, target, target, true,
-              vec!["--example".to_owned(), "prepare_vf5_inputs".to_owned()])],
+            [(0, target, target, true, vec!["--bin".to_owned(), "prepare_vf5_inputs".to_owned()])],
             "dry-run dependency discovery must retain the real host-tool recipe",
         );
         assert!(
-            cache.inspect_all_steps_of_type::<compile::Assemble, _>(|step, _| {
-                step.target_compiler.stage
-            }).into_iter().all(|stage| stage == 0),
+            cache
+                .inspect_all_steps_of_type::<compile::Assemble, _>(|step, _| {
+                    step.target_compiler.stage
+                })
+                .into_iter()
+                .all(|stage| stage == 0),
             "the snapshot host-tool route must not recurse into target assembly",
         );
     }

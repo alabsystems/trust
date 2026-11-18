@@ -30,11 +30,13 @@ fn command(project: &Path, world: &Path, target: &Path) -> Command {
         .env(
             "RUSTC",
             std::env::var_os("RUSTC").expect("explicit original compiler"),
-        )
-        .env(
-            "RUSTDOC",
-            std::env::var_os("RUSTDOC").expect("matching original rustdoc"),
         );
+    // These fixtures build and run native artifacts; none invokes rustdoc.
+    // Preserve an explicit matching tool when supplied, without requiring a
+    // documentation producer to exercise compiler cache reuse.
+    if let Some(rustdoc) = std::env::var_os("RUSTDOC") {
+        command.env("RUSTDOC", rustdoc);
+    }
     #[cfg(target_os = "macos")]
     command.env("SDKROOT", sdk_root(world));
     command
@@ -258,6 +260,90 @@ fn all_fresh(stage: &Value, fresh: bool) -> bool {
             && rows[0]["target"]["name"] == "linker_consumer"
             && rows[0]["fresh"] == fresh
     })
+}
+
+#[test]
+fn symlinked_source_directory_reuses_real_build_script_outputs() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::current_dir()
+        .unwrap()
+        .join(".ubd/native-cache-reuse.noindex");
+    fs::create_dir_all(&base).unwrap();
+    let world = tempfile::Builder::new()
+        .prefix("source-alias")
+        .tempdir_in(base)
+        .unwrap()
+        .keep();
+    fs::create_dir_all(world.join("evidence")).unwrap();
+    let target = world.join("target");
+    let alias = world.join("source-alias");
+    for name in ["first", "second"] {
+        let project = world.join(name);
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname='alias_consumer'\nversion='0.0.0'\nedition='2021'\n[workspace]\n[profile.dev]\ndebug=0\nincremental=false\n").unwrap();
+        fs::write(project.join("build.rs"), "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); println!(\"cargo:rustc-env=ALIAS_VALUE=alias-ok\"); }\n").unwrap();
+        fs::write(
+            project.join("src/main.rs"),
+            "fn main() { println!(\"{}\", env!(\"ALIAS_VALUE\")); }\n",
+        )
+        .unwrap();
+    }
+    symlink(world.join("first"), &alias).unwrap();
+    let lock = record(
+        command(&world.join("first"), &world, &target).args(["generate-lockfile", "--offline"]),
+        &world,
+        "lock",
+    );
+    assert!(lock.status.success(), "world={}", world.display());
+    fs::copy(
+        world.join("first/Cargo.lock"),
+        world.join("second/Cargo.lock"),
+    )
+    .unwrap();
+    for (label, expected_fresh) in [
+        ("cold", false),
+        ("warm", true),
+        ("retargeted", false),
+        ("rewarm", true),
+    ] {
+        if label == "retargeted" {
+            // Identical source bytes and manifest spelling, different actual
+            // cwd: the old compiler context must not authorize this target.
+            fs::remove_file(&alias).unwrap();
+            symlink(world.join("second"), &alias).unwrap();
+        }
+        let output = record(
+            build_command(&world.join("first"), &world, &target)
+                .arg("--manifest-path")
+                .arg(alias.join("Cargo.toml")),
+            &world,
+            label,
+        );
+        assert!(
+            output.status.success(),
+            "world={} stage={label}",
+            world.display()
+        );
+        let rows = artifacts(&output);
+        assert_eq!(rows.len(), 2, "world={} stage={label}", world.display());
+        assert!(
+            rows.iter().all(|row| row["fresh"] == expected_fresh),
+            "world={} stage={label} rows={rows:?}",
+            world.display()
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row["target"]["kind"] == json!(["custom-build"]))
+        );
+        let run = record(
+            &mut Command::new(executable(&output, "alias_consumer")),
+            &world,
+            &format!("{label}-program"),
+        );
+        assert!(run.status.success());
+        assert_eq!(run.stdout, b"alias-ok\n");
+    }
 }
 
 #[expect(
@@ -843,9 +929,15 @@ fn default_linker_mutation(change: DefaultLinkerChange) {
         let path = probe
             .get_envs()
             .find(|(key, _)| *key == name)
-            .and_then(|(_, value)| value)
-            .expect("explicit original compiler tool");
-        tools.push(json!({"role":name,"path":path,"sha256":digest(Path::new(path))}));
+            .and_then(|(_, value)| value);
+        if name == "RUSTC" {
+            assert!(path.is_some(), "explicit original compiler tool");
+        }
+        // No fixture invokes rustdoc. Bookend it when supplied, just as the
+        // build-only command preserves it, without inventing a tool identity.
+        if let Some(path) = path {
+            tools.push(json!({"role":name,"path":path,"sha256":digest(Path::new(path))}));
+        }
     }
     tools.push(json!({"role":"original-driver","path":driver,"sha256":digest(&driver)}));
     let wrapper_sources = ["initial", "shadow"].map(|name| {

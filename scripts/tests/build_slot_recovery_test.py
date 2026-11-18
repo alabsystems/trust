@@ -27,6 +27,7 @@ gate.ADOPTION_DIR = str(root / 'adopted')
 gate.cpu_capacity_directory = lambda: str(root / 'native')
 gate.available_gib = lambda: 128
 gate.worktree_lock_path = lambda: str(root / 'worktree.lock')
+gate.ledger_discovery = lambda env: None  # never the operator's real aterm ledger
 try:
     sys.exit(gate.main(sys.argv[3:]))
 except gate.AdmissionTimeout:
@@ -193,6 +194,7 @@ class RecoveryTests(unittest.TestCase):
              mock.patch.object(gate, 'cpu_capacity_directory', return_value=str(self.native)), \
              mock.patch.object(gate, 'available_gib', return_value=128), \
              mock.patch.object(gate, 'worktree_lock_path', return_value=str(self.root / 'worktree.lock')), \
+             mock.patch.object(gate, 'ledger_discovery', return_value=None), \
              mock.patch.object(gate.subprocess, 'Popen') as child:
             with self.assertRaises(gate.CpuBridgeUnavailable):
                 gate.main(['--cpus', '1', '--', 'must-not-start'])

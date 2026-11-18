@@ -3,8 +3,9 @@
 //!
 //! Trust (step 2 increment 7): plain local nongeneric Rust functions can also
 //! answer from their exact D28-conserved handoff. `rust_inventory` checks both
-//! retained THIR and canonical IR: only call-free primitive expressions with
-//! no implicit runtime services, required constants or function values qualify.
+//! retained THIR and canonical IR: primitive expressions, scalar local cells
+//! and the existing exact-source thin-pointer comparison model qualify only
+//! without implicit runtime services, required constants or function addresses.
 //! Existing MIR-based monomorphization checks remain; this increment retires
 //! the inventory walk for that fragment, not all MIR queries for the function.
 //!

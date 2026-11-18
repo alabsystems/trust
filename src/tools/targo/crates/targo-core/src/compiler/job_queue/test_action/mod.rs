@@ -160,8 +160,7 @@ impl TestState {
     pub(super) fn can_dispatch(&self) -> bool {
         // Trust: a test plan run held at a barrier starts no test executable
         // until its caller releases it (`ops::cargo_test::plan_clock`).
-        if !crate::ops::cargo_test::plan_clock::armed()
-            .is_none_or(|clock| clock.tests_may_start())
+        if !crate::ops::cargo_test::plan_clock::armed().is_none_or(|clock| clock.tests_may_start())
         {
             return false;
         }
@@ -695,6 +694,7 @@ impl DrainState<'_> {
         }
         let tests = self.tests.as_ref().expect("test state");
         let signals = tests.signals.clone();
+        let supervision = tests.options.policy.supervision();
         let workload = tests.options.workload.clone();
         let messages = self.messages.clone();
         let sink = if build_runner.bcx.build_config.emit_json() {
@@ -744,6 +744,7 @@ impl DrainState<'_> {
                                     watch.as_ref(),
                                     &signals,
                                     sink,
+                                    supervision,
                                 )
                             };
                             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -753,6 +754,7 @@ impl DrainState<'_> {
                                 watch.as_ref(),
                                 &signals,
                                 sink,
+                                supervision,
                             );
                             (result, None)
                         }

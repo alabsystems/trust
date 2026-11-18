@@ -4,8 +4,6 @@
 //! Actual pending native/shadow/common-M descriptions from the SAME original
 //! Host channel. Retaining these resources creates no executable unit, claim
 //! writer, adopted controller or independent Host approval.
-use std::os::fd::AsFd as _;
-
 use super::*;
 use crate::workload::host::keeper as wire;
 

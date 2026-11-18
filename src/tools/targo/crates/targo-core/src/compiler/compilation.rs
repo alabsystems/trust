@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use cargo_platform::CfgExpr;
+use cargo_platform::{Cfg, CfgExpr};
 use cargo_util::{ProcessBuilder, paths};
 
 use crate::compiler::BuildContext;
@@ -18,8 +18,8 @@ use crate::compiler::RustdocFingerprint;
 use crate::compiler::apply_env_config;
 use crate::compiler::{CompileKind, Unit, UnitHash};
 use crate::util::process_authority::{
-    configure_nested_unverified_targo_child, scrub_dynamic_loader_authority_env,
-    verified_tool_runtime_library_paths,
+    NativePairingInputRole, configure_nested_unverified_targo_child, prepare_native_pairing_input,
+    scrub_dynamic_loader_authority_env, verified_tool_runtime_library_paths,
 };
 use crate::util::{CargoResult, GlobalContext};
 use crate::workspace::Package;
@@ -459,7 +459,18 @@ impl<'gctx> Compilation<'gctx> {
             rustc.display_env_vars();
         }
         let cmd = fill_rustc_tool_env(rustc, unit);
-        let cmd = self.fill_env(cmd, &unit.pkg, None, unit.kind, ToolKind::Rustc)?;
+        let mut cmd = self.fill_env(cmd, &unit.pkg, None, unit.kind, ToolKind::Rustc)?;
+        // Trust: script code must not bake the producer-only input with
+        // option_env! and replay it later. The real frontend compiler keeps
+        // its unchanged original input and native env-dependency tracking.
+        prepare_native_pairing_input(
+            &mut cmd,
+            if unit.target.is_custom_build() {
+                NativePairingInputRole::BuildScript
+            } else {
+                NativePairingInputRole::Compiler
+            },
+        )?;
         Ok((cmd, role))
     }
 
@@ -522,13 +533,7 @@ impl<'gctx> Compilation<'gctx> {
 
     pub fn target_runner(&self, kind: CompileKind) -> Option<&(PathBuf, Vec<String>)> {
         let target_applies_to_host = self.gctx.target_applies_to_host().unwrap_or(true);
-        let kind = if !target_applies_to_host && kind.is_host() {
-            // Use explicit host target tuple when `target-applies-to-host=false`
-            // This ensures `host.runner` won't be accidentally applied to `cargo run` / `cargo test`.
-            explicit_host_kind(&self.host)
-        } else {
-            kind
-        };
+        let kind = execution_runner_kind(kind, &self.host, target_applies_to_host);
         self.runners.get(&kind).and_then(|x| x.as_ref())
     }
 
@@ -682,6 +687,10 @@ impl<'gctx> Compilation<'gctx> {
         kind: CompileKind,
         tool_kind: ToolKind,
     ) -> CargoResult<ProcessBuilder> {
+        // Trust (DC-24a): only Targo asks the unit source. No process the
+        // build starts sees it in either lane: not the compiler, a build
+        // script, a test or a run (each nested Targo would start its own).
+        cmd.env_remove(super::unit_source::UNIT_SOURCE_ENV);
         let verified_rustc_tool = crate::is_targo_invocation()
             && crate::trust_verified_targo()
             && tool_kind.is_rustc_tool();
@@ -1088,26 +1097,58 @@ fn target_runner(
     bcx: &BuildContext<'_, '_>,
     kind: CompileKind,
 ) -> CargoResult<Option<(PathBuf, Vec<String>)>> {
-    if let Some(runner) = bcx.target_data.target_config(kind).runner.as_ref() {
-        let path = runner.val.path.clone().resolve_program(bcx.gctx);
+    configured_target_runner(bcx.gctx, kind, bcx.target_data.target_config(kind), || {
+        Ok(bcx.target_data.info(kind).cfg().to_vec())
+    })
+}
+
+/// The same runtime-target mapping used by `Compilation::target_runner`.
+/// Host build configuration is not a run/test runner when it does not apply
+/// to targets; the explicit host target owns that execution instead.
+pub(crate) fn execution_runner_kind(
+    kind: CompileKind,
+    host: &str,
+    target_applies_to_host: bool,
+) -> CompileKind {
+    if !target_applies_to_host && kind.is_host() {
+        explicit_host_kind(host)
+    } else {
+        kind
+    }
+}
+
+/// Shared runner selection for compilation and invocation preflight. Cfg facts
+/// are requested only when a cfg runner exists and the literal table did not
+/// select a runner. The provider supplies metadata, never execution authority.
+pub(crate) fn configured_target_runner(
+    gctx: &GlobalContext,
+    kind: CompileKind,
+    config: &crate::context::TargetConfig,
+    target_cfg: impl FnOnce() -> CargoResult<Vec<Cfg>>,
+) -> CargoResult<Option<(PathBuf, Vec<String>)>> {
+    let target_applies_to_host = gctx.target_applies_to_host()?;
+    if let Some(runner) = config.runner.as_ref() {
+        let path = runner.val.path.clone().resolve_program(gctx);
         return Ok(Some((path, runner.val.args.clone())));
     }
 
     // With `target-applies-to-host = true`,
     // host artifacts must fall through to pick up from [target]
     // since this is the stable behavior
-    if kind.is_host() && !bcx.gctx.target_applies_to_host()? {
+    if kind.is_host() && !target_applies_to_host {
         return Ok(None);
     }
 
     // try target.'cfg(...)'.runner
-    let target_cfg = bcx.target_data.info(kind).cfg();
-    let mut cfgs = bcx
-        .gctx
-        .target_cfgs()?
+    let candidates = gctx.target_cfgs()?;
+    if !candidates.iter().any(|(_, config)| config.runner.is_some()) {
+        return Ok(None);
+    }
+    let target_cfg = target_cfg()?;
+    let mut cfgs = candidates
         .iter()
         .filter_map(|(key, cfg)| cfg.runner.as_ref().map(|runner| (key, runner)))
-        .filter(|(key, _runner)| CfgExpr::matches_key(key, target_cfg));
+        .filter(|(key, _runner)| CfgExpr::matches_key(key, &target_cfg));
     let matching_runner = cfgs.next();
     if let Some((key, runner)) = cfgs.next() {
         anyhow::bail!(
@@ -1122,7 +1163,7 @@ fn target_runner(
     }
     Ok(matching_runner.map(|(_k, runner)| {
         (
-            runner.val.path.clone().resolve_program(bcx.gctx),
+            runner.val.path.clone().resolve_program(gctx),
             runner.val.args.clone(),
         )
     }))

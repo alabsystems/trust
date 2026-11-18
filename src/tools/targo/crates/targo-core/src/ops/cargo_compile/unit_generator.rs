@@ -85,6 +85,24 @@ struct TargetSelection<'a, 'gctx> {
     intent: UserIntent,
 }
 
+fn root_explicit_kinds(
+    pkg: &Package,
+    requested: &[CompileKind],
+    explicit_host: CompileKind,
+) -> Vec<CompileKind> {
+    if let Some(kind) = pkg.manifest().forced_kind() {
+        vec![kind]
+    } else {
+        requested
+            .iter()
+            .map(|kind| match kind {
+                CompileKind::Host => pkg.manifest().default_kind().unwrap_or(explicit_host),
+                CompileKind::Target(target) => CompileKind::Target(*target),
+            })
+            .collect()
+    }
+}
+
 impl<'a, 'gctx> UnitGenerator<'a, 'gctx> {
     /// Helper for creating a list of `Unit` structures
     fn new_units(
@@ -111,20 +129,8 @@ impl<'a, 'gctx> UnitGenerator<'a, 'gctx> {
         // why this is done. However, if the package has its own
         // `package.target` key, then this gets used instead of
         // `$HOST`
-        let explicit_kinds = if let Some(k) = pkg.manifest().forced_kind() {
-            vec![k]
-        } else {
-            self.requested_kinds
-                .iter()
-                .map(|kind| match kind {
-                    CompileKind::Host => pkg
-                        .manifest()
-                        .default_kind()
-                        .unwrap_or(self.explicit_host_kind),
-                    CompileKind::Target(t) => CompileKind::Target(*t),
-                })
-                .collect()
-        };
+        let explicit_kinds =
+            root_explicit_kinds(pkg, self.requested_kinds, self.explicit_host_kind);
 
         explicit_kinds
             .into_iter()
@@ -536,6 +542,90 @@ pub enum NativeTestArgumentScope {
     Other,
 }
 
+/// Metadata restriction only; this does not authorize or predict execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeTestRunnerScope {
+    NoRunner,
+    ExistingBoundary,
+}
+
+pub fn native_test_runner_scope(
+    ws: &Workspace<'_>,
+    options: &super::CompileOptions,
+) -> CargoResult<NativeTestRunnerScope> {
+    let mut metadata = None;
+    native_test_runner_scope_with(ws, options, |kind| {
+        if metadata.is_none() {
+            metadata = Some(RustcTargetData::new(
+                ws,
+                &options.build_config.requested_kinds,
+            )?);
+        }
+        let Some(data) = metadata.as_mut() else {
+            anyhow::bail!("runner target metadata was not retained");
+        };
+        data.merge_compile_kind(kind)?;
+        Ok(data.cfg(kind).to_vec())
+    })
+}
+
+fn native_test_runner_scope_with(
+    ws: &Workspace<'_>,
+    options: &super::CompileOptions,
+    mut cfg: impl FnMut(CompileKind) -> CargoResult<Vec<cargo_platform::Cfg>>,
+) -> CargoResult<NativeTestRunnerScope> {
+    options.spec.to_package_id_specs(ws)?;
+    let Ok(packages) = options.spec.get_packages(ws) else {
+        return Ok(NativeTestRunnerScope::ExistingBoundary);
+    };
+    let selection = TargetSelection {
+        ws,
+        packages: &packages,
+        spec: &options.spec,
+        filter: &options.filter,
+        intent: options.build_config.intent,
+    };
+    let (proposals, _) = selection.create_proposals()?;
+    let host = env!("RUST_HOST_TARGET");
+    let explicit_host = CompileKind::Target(crate::compiler::CompileTarget::new(
+        host,
+        ws.gctx().cli_unstable().json_target_spec,
+    )?);
+    let applies = ws.gctx().target_applies_to_host()?;
+    let mut kinds = Vec::new();
+    for proposal in proposals {
+        if root_unit_mode(proposal.mode, proposal.target, &options.filter) != CompileMode::Test {
+            continue;
+        }
+        // Optional feature-dependent candidates restrict eligibility, never
+        // prove that a harness will execute or issue any CPU authority.
+        for kind in root_explicit_kinds(
+            proposal.pkg,
+            &options.build_config.requested_kinds,
+            explicit_host,
+        ) {
+            let kind = crate::compiler::execution_runner_kind(
+                kind.for_target(proposal.target),
+                host,
+                applies,
+            );
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+    }
+    for kind in kinds {
+        let configuration =
+            crate::compiler::build_context::target_configuration(ws.gctx(), kind, host)?;
+        if crate::compiler::configured_target_runner(ws.gctx(), kind, &configuration, || cfg(kind))?
+            .is_some()
+        {
+            return Ok(NativeTestRunnerScope::ExistingBoundary);
+        }
+    }
+    Ok(NativeTestRunnerScope::NoRunner)
+}
+
 pub fn native_test_argument_scope(
     ws: &Workspace<'_>,
     options: &super::CompileOptions,
@@ -870,5 +960,72 @@ fn to_compile_mode(intent: UserIntent) -> CompileMode {
         UserIntent::Check { test } => CompileMode::Check { test },
         UserIntent::Doc { .. } => CompileMode::Doc,
         UserIntent::Doctest => CompileMode::Doctest,
+    }
+}
+
+#[cfg(test)]
+mod native_runner_tests {
+    use super::*;
+    use crate::util::GlobalContext;
+
+    #[test]
+    fn runner_scope_shares_cfg_matching_and_runtime_host_selection() {
+        let host = env!("RUST_HOST_TARGET");
+        let cases = [
+            (
+                "[target.'cfg(all())']\nrunner='record-only'\n".to_owned(),
+                NativeTestRunnerScope::ExistingBoundary,
+            ),
+            (
+                "[target.'cfg(target_os = \"foreign\")']\nrunner='foreign-only'\n".to_owned(),
+                NativeTestRunnerScope::NoRunner,
+            ),
+            (
+                "target-applies-to-host=false\n[host]\nrunner='inactive-host'\n".to_owned(),
+                NativeTestRunnerScope::NoRunner,
+            ),
+            (
+                format!("target-applies-to-host=false\n[target.{host}]\nrunner='active-target'\n"),
+                NativeTestRunnerScope::ExistingBoundary,
+            ),
+        ];
+        for (config, expected) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let cwd = directory.path().join("project");
+            std::fs::create_dir_all(cwd.join(".cargo")).unwrap();
+            std::fs::create_dir(cwd.join("src")).unwrap();
+            std::fs::write(cwd.join("Cargo.toml"), "[package]\nname='runner_scope'\nversion='0.0.0'\nedition='2024'\n[workspace]\n[lib]\nproc-macro=true\n").unwrap();
+            std::fs::write(cwd.join("src/lib.rs"), "extern crate proc_macro;\n").unwrap();
+            std::fs::write(cwd.join(".cargo/config.toml"), &config).unwrap();
+            let mut gctx = GlobalContext::new(
+                cargo_util_terminal::Shell::new(),
+                cwd.clone(),
+                directory.path().join("home"),
+            );
+            gctx.set_search_stop_path(cwd.clone());
+            gctx.set_env(HashMap::default());
+            gctx.nightly_features_allowed = true;
+            let unstable = [
+                "host-config".to_owned(),
+                "target-applies-to-host".to_owned(),
+            ];
+            gctx.configure(0, false, None, false, false, true, &None, &unstable, &[])
+                .unwrap();
+            let ws = Workspace::new(&cwd.join("Cargo.toml"), &gctx).unwrap();
+            let mut options = super::super::CompileOptions::new(&gctx, UserIntent::Test).unwrap();
+            // The CLI fills the package selection after constructing options.
+            // Select this real fixture package before asking for its library.
+            options.spec = crate::ops::Packages::Packages(vec!["runner_scope".to_owned()]);
+            options.filter = CompileFilter::lib_only();
+            let result = native_test_runner_scope_with(&ws, &options, |_| {
+                assert!(
+                    config.contains("cfg("),
+                    "literal/no-cfg runner must not query a compiler"
+                );
+                Ok(vec!["target_os=\"native\"".parse().unwrap()])
+            })
+            .unwrap();
+            assert_eq!(result, expected, "{config}");
+        }
     }
 }

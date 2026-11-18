@@ -286,21 +286,32 @@ enum SourceSelection {
 }
 impl SourceSelection {
     fn source(&self) -> &[u8] {
-        match self { Self::Complete(value) => &value.source_root, Self::Staged(value) => &value.source_root }
+        match self {
+            Self::Complete(value) => &value.source_root,
+            Self::Staged(value) => &value.source_root,
+        }
     }
     fn output(&self) -> &[u8] {
-        match self { Self::Complete(value) => &value.output_root, Self::Staged(value) => &value.output_root }
+        match self {
+            Self::Complete(value) => &value.output_root,
+            Self::Staged(value) => &value.output_root,
+        }
     }
     fn environment(&self) -> &[(Vec<u8>, Vec<u8>)] {
-        match self { Self::Complete(value) => &value.environment, Self::Staged(value) => &value.environment }
+        match self {
+            Self::Complete(value) => &value.environment,
+            Self::Staged(value) => &value.environment,
+        }
     }
     fn matches_final(&self, complete: &IntentSelection) -> bool {
         match self {
             Self::Complete(value) => value == complete,
-            Self::Staged(value) => value.source_root == complete.source_root
-                && value.output_root == complete.output_root
-                && value.environment == complete.environment
-                && value.budget_ns == complete.budget_ns,
+            Self::Staged(value) => {
+                value.source_root == complete.source_root
+                    && value.output_root == complete.output_root
+                    && value.environment == complete.environment
+                    && value.budget_ns == complete.budget_ns
+            }
         }
     }
 }
@@ -317,6 +328,7 @@ pub(in crate::utils::metadata_scheduler::host_graph) struct SourceStage {
     failed: AtomicBool,
 }
 impl SourceStage {
+    #[cfg(test)]
     fn new(
         owners: Arc<OwnedInputs>,
         selection: trust_resource_controller::bootstrap_graph::offline_preparation::IntentSelection,
@@ -344,8 +356,12 @@ impl SourceStage {
             if self.programs_finalized.load(Ordering::Acquire)
                 && lock(&self.caller_cache, self.end)?.bound
                 && lock(&self.source_capture, self.end)?.is_none()
-            { Ok(()) } else {
-                Err(io::Error::other("configuration requires finalized programs, caller-cache custody and no pending source capture"))
+            {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "configuration requires finalized programs, caller-cache custody and no pending source capture",
+                ))
             }
         })();
         self.record(result)
@@ -356,11 +372,16 @@ impl SourceStage {
             if self.programs_finalized.load(Ordering::Acquire)
                 || !matches!(&self.selection, SourceSelection::Staged(_))
                 || !lock(&self.retained_roots, end)?.is_empty()
-            { return Err(io::Error::other("original staged root narrowing is one-use")); }
-            let narrower = HeldSourceReadSet::capture(self.source()?.directory()?, end.min(self.end))?;
+            {
+                return Err(io::Error::other("original staged root narrowing is one-use"));
+            }
+            let narrower =
+                HeldSourceReadSet::capture(self.source()?.directory()?, end.min(self.end))?;
             let mut selected = lock(&self.selected, end)?;
             let mut retained = lock(&self.retained_roots, end)?;
-            if !retained.is_empty() { return Err(io::Error::other("staged root already narrowed")); }
+            if !retained.is_empty() {
+                return Err(io::Error::other("staged root already narrowed"));
+            }
             retained.push(selected.take().ok_or_else(|| io::Error::other("original root absent"))?);
             *selected = Some(narrower); // retain BOTH actual descriptions before postchecks
             drop(retained);
@@ -530,7 +551,9 @@ impl OriginalPreparationSource {
     pub fn reserve_programs(&self) -> io::Result<ReservedPrograms> {
         self.record(self.graph.with_preparation_programs(&self.original, |bound, client, end| {
             if self.original.programs_finalized.load(Ordering::Acquire) {
-                return bound.reserved_offline_preparation_programs(end)?.cloned()
+                return bound
+                    .reserved_offline_preparation_programs(end)?
+                    .cloned()
                     .ok_or_else(|| io::Error::other("original staged reservation is absent"));
             }
             bound.reserve_offline_preparation_programs(client, end)
@@ -541,18 +564,24 @@ impl OriginalPreparationSource {
     /// The maintained parser must later resolve these EXACT bytes or refuse;
     /// an explicit canonical82/external prefix is not retargeted to this child.
     pub fn finalize_programs(
-        &self, targo: &std::ffi::OsStr, compiler: &std::ffi::OsStr,
+        &self,
+        targo: &std::ffi::OsStr,
+        compiler: &std::ffi::OsStr,
     ) -> io::Result<IntentSelection> {
         self.record(self.graph.with_preparation_programs(&self.original, |bound, client, end| {
-            let reserved = bound.reserved_offline_preparation_programs(end)?
-                .ok_or_else(|| io::Error::other("original program namespace is not acknowledged"))?;
+            let reserved = bound.reserved_offline_preparation_programs(end)?.ok_or_else(|| {
+                io::Error::other("original program namespace is not acknowledged")
+            })?;
             let selection = program_selection(reserved, targo, compiler)?;
             if self.original.programs_finalized.load(Ordering::Acquire) {
-                let intent = bound.offline_preparation_intent(end)?
-                    .ok_or_else(|| io::Error::other("original final program selectors are absent"))?;
+                let intent = bound.offline_preparation_intent(end)?.ok_or_else(|| {
+                    io::Error::other("original final program selectors are absent")
+                })?;
                 if intent.selection.configured_targo != selection.configured_targo
                     || intent.selection.configured_compiler != selection.configured_compiler
-                { return Err(io::Error::other("final program spelling is immutable")); }
+                {
+                    return Err(io::Error::other("final program spelling is immutable"));
+                }
                 return Ok(intent.selection.clone());
             }
             let intent = bound.finalize_offline_preparation_programs(client, selection, end)?;
@@ -583,11 +612,15 @@ impl OriginalPreparationSource {
     }
 }
 fn program_selection(
-    reserved: &ReservedPrograms, targo: &std::ffi::OsStr, compiler: &std::ffi::OsStr,
+    reserved: &ReservedPrograms,
+    targo: &std::ffi::OsStr,
+    compiler: &std::ffi::OsStr,
 ) -> io::Result<ProgramSelection> {
     if !matches!(targo.as_bytes(), b"targo" | b"cargo")
         || !matches!(compiler.as_bytes(), b"trustc" | b"rustc")
-    { return Err(io::Error::other("private program roles require exact lexical leaves")); }
+    {
+        return Err(io::Error::other("private program roles require exact lexical leaves"));
+    }
     let bin = PathBuf::from(std::ffi::OsStr::from_bytes(&reserved.namespace)).join("bin");
     let selected = ProgramSelection {
         key: reserved.query.key.clone(),
@@ -638,30 +671,42 @@ impl OriginalHostGraph {
             let pending = preparation_selected(&state, self.deadline)?;
             Ok((state.preparation_inputs.as_ref().cloned(), pending))
         })();
-        if result.is_err() { self.fail_preparation(); }
+        if result.is_err() {
+            self.fail_preparation();
+        }
         result
     }
     fn with_preparation_programs<T>(
-        &self, source: &Arc<SourceStage>,
-        actual: impl FnOnce(
-            &mut SourceBoundBootstrapGraph, &Client, Instant,
-        ) -> io::Result<T>,
+        &self,
+        source: &Arc<SourceStage>,
+        actual: impl FnOnce(&mut SourceBoundBootstrapGraph, &Client, Instant) -> io::Result<T>,
     ) -> io::Result<T> {
         let result = (|| {
             self.check()?;
             source.check_current()?;
             let mut state = lock(&self.state, source.end)?;
-            if state.failed || state.source_task_active || state.preparation_inputs.is_some()
+            if state.failed
+                || state.source_task_active
+                || state.preparation_inputs.is_some()
                 || state.preparation_source.as_ref().is_none_or(|same| !Arc::ptr_eq(same, source))
-                || state.dependency_owners.as_ref().is_none_or(|same| !Arc::ptr_eq(same, &source.owners))
-            { return Err(io::Error::other("private programs require their original before-Config stage")); }
+                || state
+                    .dependency_owners
+                    .as_ref()
+                    .is_none_or(|same| !Arc::ptr_eq(same, &source.owners))
+            {
+                return Err(io::Error::other(
+                    "private programs require their original before-Config stage",
+                ));
+            }
             let end = source.end.min(state.input_deadline).min(self.deadline);
             time(end)?;
             state.failed = true; // retain the SAME owner on error/unwind
             let (result, retained_end) = {
                 let State { client, phase, .. } = &mut *state;
                 let Some(Phase::SourceBound(bound)) = phase else {
-                    return Err(io::Error::other("private programs require accepted source/materialization"));
+                    return Err(io::Error::other(
+                        "private programs require accepted source/materialization",
+                    ));
                 };
                 let result = actual(bound, client, end);
                 (result, bound.original_deadline())
@@ -675,7 +720,9 @@ impl OriginalHostGraph {
             state.failed = false;
             Ok(value)
         })();
-        if result.is_err() { self.fail_preparation(); }
+        if result.is_err() {
+            self.fail_preparation();
+        }
         result
     }
 
@@ -699,7 +746,8 @@ impl OriginalHostGraph {
     }
 
     fn begin_preparation_source(
-        self: &Arc<Self>, staged: bool,
+        self: &Arc<Self>,
+        staged: bool,
     ) -> io::Result<OriginalPreparationSource> {
         let result = (|| {
             self.check()?;
@@ -711,22 +759,30 @@ impl OriginalHostGraph {
                     ));
                 };
                 if staged {
-                    SourceSelection::Staged(support.staged_offline_preparation_intent(self.deadline)?
-                        .ok_or_else(|| io::Error::other("original staged offline intent is absent"))?
-                        .selection.clone())
+                    SourceSelection::Staged(
+                        support
+                            .staged_offline_preparation_intent(self.deadline)?
+                            .ok_or_else(|| {
+                                io::Error::other("original staged offline intent is absent")
+                            })?
+                            .selection
+                            .clone(),
+                    )
                 } else {
-                    SourceSelection::Complete(support.offline_preparation_intent(self.deadline)?
-                        .ok_or_else(|| io::Error::other("original offline intent is absent"))?
-                        .selection.clone())
+                    SourceSelection::Complete(
+                        support
+                            .offline_preparation_intent(self.deadline)?
+                            .ok_or_else(|| io::Error::other("original offline intent is absent"))?
+                            .selection
+                            .clone(),
+                    )
                 }
             };
             self.prepare_dependency_entry()?;
-            let source = PathBuf::from(OsString::from(std::ffi::OsStr::from_bytes(
-                selection.source(),
-            )));
-            let output = PathBuf::from(OsString::from(std::ffi::OsStr::from_bytes(
-                selection.output(),
-            )));
+            let source =
+                PathBuf::from(OsString::from(std::ffi::OsStr::from_bytes(selection.source())));
+            let output =
+                PathBuf::from(OsString::from(std::ffi::OsStr::from_bytes(selection.output())));
             if std::env::current_dir()?.as_os_str() != source.as_os_str() {
                 return Err(io::Error::other("offline preparation left its original source cwd"));
             }
@@ -802,8 +858,9 @@ impl OriginalHostGraph {
                 // descriptions on the SAME accepted
                 // Source channel before returning any configuration issuer.
                 owners.check()?;
-                let descriptions = unsafe { owners.output.original_output(&owners.command, &output) }
-                    .map_err(io::Error::other)?;
+                let descriptions =
+                    unsafe { owners.output.original_output(&owners.command, &output) }
+                        .map_err(io::Error::other)?;
                 let physical = OutputAttachment {
                     key: self.key.clone(),
                     root: fd_identity(descriptions.directory())?,
@@ -812,17 +869,22 @@ impl OriginalHostGraph {
                 let (delivered, retained_end) = {
                     let State { source_offer, phase, .. } = &mut *state;
                     let Some(Phase::SourceBound(bound)) = phase else { unreachable!() };
-                    let delivered = source_offer.as_ref()
+                    let delivered = source_offer
+                        .as_ref()
                         .ok_or_else(|| io::Error::other("same original source offer is absent"))?
                         .with_descriptions(|source, _| {
                             // SAFETY: State already retains SAME OwnedInputs,
                             // protected SourceOffer and actual OutputLock.
                             // This callback bookends all original source FDs,
                             // including errors; no custody reply releases them.
-                            Ok(unsafe { bound.attach_original_preparation_output(
-                                physical, &source,
-                                &[descriptions.directory(), descriptions.lock()], end,
-                            ) })
+                            Ok(unsafe {
+                                bound.attach_original_preparation_output(
+                                    physical,
+                                    &source,
+                                    &[descriptions.directory(), descriptions.lock()],
+                                    end,
+                                )
+                            })
                         });
                     (delivered, bound.original_deadline())
                 };
@@ -894,12 +956,16 @@ impl OriginalHostGraph {
             source.configuration_ready()?;
             let selection = {
                 let Some(Phase::SourceBound(bound)) = &state.phase else { unreachable!() };
-                bound.offline_preparation_intent(source.end.min(state.input_deadline))?
+                bound
+                    .offline_preparation_intent(source.end.min(state.input_deadline))?
                     .ok_or_else(|| io::Error::other("original final program selectors are absent"))?
-                    .selection.clone()
+                    .selection
+                    .clone()
             };
             if !source.selection.matches_final(&selection) {
-                return Err(io::Error::other("final programs changed their original source policy"));
+                return Err(io::Error::other(
+                    "final programs changed their original source policy",
+                ));
             }
             state.failed = true;
             scheduler.producer_failed = true;
@@ -958,7 +1024,9 @@ impl OriginalHostGraph {
         let Some(original) = original else {
             if pending {
                 self.fail_preparation();
-                return Err(io::Error::other("preparation cannot read Config before its actual issuer"));
+                return Err(io::Error::other(
+                    "preparation cannot read Config before its actual issuer",
+                ));
             }
             return Ok(None);
         };
@@ -1131,8 +1199,12 @@ impl OriginalHostGraph {
 // Restriction from the SAME opaque phase, never a caller boolean/DTO-to-owner
 // conversion. Ordinary non-preparation graphs keep their existing parser path.
 fn preparation_selected(state: &State, end: Instant) -> io::Result<bool> {
-    if state.failed { return Err(io::Error::other("original configuration graph is quarantined")); }
-    if state.preparation_source.is_some() { return Ok(true); }
+    if state.failed {
+        return Err(io::Error::other("original configuration graph is quarantined"));
+    }
+    if state.preparation_source.is_some() {
+        return Ok(true);
+    }
     let end = end.min(state.input_deadline);
     match &state.phase {
         Some(Phase::Supported(bound)) => bound.offline_preparation_selected(end),
@@ -1191,7 +1263,9 @@ pub(crate) fn begin_original_configuration_parse() -> io::Result<Option<Preparat
     let Some(original) = original else {
         if pending {
             graph.fail_preparation();
-            return Err(io::Error::other("preparation cannot begin Config before final programs and issuer"));
+            return Err(io::Error::other(
+                "preparation cannot begin Config before final programs and issuer",
+            ));
         }
         return Ok(None);
     };

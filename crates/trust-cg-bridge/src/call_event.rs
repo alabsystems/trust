@@ -139,11 +139,15 @@ use crate::verify_output_trust_ir::{
 pub mod abi_extensions;
 mod aggregate_values;
 mod closed_branch;
+mod closure_cells;
 #[cfg(test)]
 #[path = "call_event/closure_original_tests.rs"]
 mod closure_original_tests;
 mod closure_values;
 pub mod compact_unwind;
+#[cfg(all(test, feature = "fmrel"))]
+#[path = "call_event/formula_replay_tests.rs"]
+mod formula_replay_tests;
 pub mod leaf_call_instance;
 pub mod leaf_memory;
 #[cfg(test)]
@@ -154,6 +158,7 @@ mod scalar_original_tests;
 mod signed_original_tests;
 #[path = "call_event/source_memory.rs"]
 mod source_memory;
+mod unit_values;
 // PKG-C5c-L0: the loop cut-point measurement (test-hooks builds only).
 #[cfg(feature = "test-hooks")]
 mod loop_cut;
@@ -1333,7 +1338,9 @@ fn analyze(
             cert.obligations.o4_return = ObligationGrade::unknown(reason);
             return None;
         }
-        if let Err(reason) = leaf_memory::replay_source_shape(func) {
+        if !packet.uses_formula_semantics()
+            && let Err(reason) = leaf_memory::replay_source_shape(func)
+        {
             cert.obligations.o4_return = ObligationGrade::unknown(reason);
             return None;
         }
@@ -1744,11 +1751,25 @@ fn analyze(
         observer_object.as_ref().map_err(Clone::clone).and_then(|object| object.function(&symbol));
     let mut exec = CerExec::new(window, &callee_places, &place.ret, x18_reserved);
     let memory_frontier = spec.memory.missing_integration();
+    let formula_replay = matches!(original_mode, OriginalMode::Replay(row)
+        if row.original_proof.as_ref().is_some_and(|packet| packet.uses_formula_semantics()));
+    let formula_scope = memory_frontier.is_none()
+        && ir_sites.is_empty()
+        && mach_sites.is_empty()
+        && matches!(place.ret, ReturnPlace::Scalar(ScalarPlace { width: 64, .. }))
+        && matches!(own_sig.1.as_slice(), [IrTy::I64] | [IrTy::U64]);
+    if formula_replay && !formula_scope {
+        ob.o4_return = ObligationGrade::unknown(
+            "retained canonical Formula replay requires a scalar i64/u64 function without memory or call debt",
+        );
+        return None;
+    }
     // Zero observed source memory is a genuine complete M0 -> M0 case, not a
     // reason to omit the full-memory theorem. The same sealed source census,
     // actual trace and entire original q64/ABI goal must still check. Retention
     // remains optional for the existing legacy scalar production scope only.
     let optional_scalar_original = retain_scalar_original
+        && !formula_replay
         && memory_frontier.is_none()
         && ir_sites.is_empty()
         && mach_sites.is_empty();
@@ -1941,7 +1962,7 @@ fn analyze(
 
     // Original-proof replay is a bounded leaf verifier. It never invokes the
     // legacy scalar solver/proof producer to replace unavailable evidence.
-    if matches!(original_mode, OriginalMode::Replay(_)) {
+    if matches!(original_mode, OriginalMode::Replay(_)) && !formula_replay {
         ob.o4_return = ObligationGrade::unknown(
             "the actual function is outside retained original leaf replay",
         );
@@ -1961,7 +1982,16 @@ fn analyze(
 
     // ---- O0 ---------------------------------------------------------------
     let residue = abi_guarantee_residue(&outcome, x18_reserved);
-    let abi = match discharge_abi_guarantee(&symbol, &residue, &[]) {
+    #[cfg(feature = "fmrel")]
+    let retained_abi = formula_replay.then_some(AbiDischarge::RetainedOriginal);
+    #[cfg(not(feature = "fmrel"))]
+    let retained_abi: Option<AbiDischarge> = None;
+    if formula_replay && retained_abi.is_none() {
+        ob.o4_return = ObligationGrade::unknown("canonical Formula replay feature unavailable");
+        return None;
+    }
+    let abi = match retained_abi.unwrap_or_else(|| discharge_abi_guarantee(&symbol, &residue, &[]))
+    {
         AbiDischarge::Verdict(OutputVerdict::Refuted { .. })
             if residue
                 .iter()
@@ -1981,6 +2011,10 @@ fn analyze(
             "{} residual conjunct(s) discharged by ay",
             residue.len()
         )),
+        #[cfg(feature = "fmrel")]
+        AbiDischarge::RetainedOriginal => ObligationGrade::unknown(
+            "actual ABI residue awaits the retained original-source kernel check",
+        ),
         AbiDischarge::Verdict(OutputVerdict::Refuted { detail }) => {
             ObligationGrade::refuted(detail.clone())
         }
@@ -2059,9 +2093,29 @@ fn analyze(
     let own_bool = own_sig.1 == [IrTy::Bool];
     for pi in &valid {
         match discharge_under(
-            &symbol, &spec, &exec, &outcome, pi, &decisions, &residue, &abi, &own_abi, own_bool,
+            &symbol,
+            &spec,
+            &exec,
+            &outcome,
+            pi,
+            &decisions,
+            &residue,
+            &abi,
+            &own_abi,
+            own_bool,
+            formula_scope,
+            match original_mode {
+                OriginalMode::Replay(row) if formula_replay => row.original_proof.as_ref(),
+                _ => None,
+            },
         ) {
             PairOutcome::Proven { o3, o4, evidence } => {
+                #[cfg(feature = "fmrel")]
+                if formula_replay {
+                    ob.o0_abi = ObligationGrade::proven(
+                        "actual ABI residue checked in the independently reconstructed original kernel conjunction",
+                    );
+                }
                 ob.o2_pairing = ObligationGrade::proven(format!(
                     "{} paired call site(s){}",
                     pi.len(),
@@ -2957,6 +3011,7 @@ struct SpecResult {
 #[derive(Clone)]
 struct SpecEnv {
     scalars: HashMap<ValueId, IrValue>,
+    units: unit_values::Units,
     /// Register aggregates (tuples, structs, arrays) as integer lanes (`aggregate_values`).
     aggs: HashMap<ValueId, aggregate_values::AggValue>,
     pairs: HashMap<ValueId, (IrValue, IrValue)>,
@@ -3069,6 +3124,7 @@ fn spec_entry<'a>(
         source_memory::ResultMemory::new(&format!("{}:fn{}", module.name, func.id.index()));
     let mut env = SpecEnv {
         scalars: HashMap::new(),
+        units: unit_values::Units::default(),
         aggs: HashMap::new(),
         pairs: HashMap::new(),
         closures: HashMap::new(),
@@ -3085,7 +3141,7 @@ fn spec_entry<'a>(
             continue;
         }
         match pp {
-            ParamPlace::Ignore => {}
+            ParamPlace::Ignore => env.units.incoming(*id, ty)?,
             ParamPlace::Scalar(s) => {
                 env.scalars.insert(
                     *id,
@@ -3173,8 +3229,33 @@ impl SpecCx<'_> {
         // `alloca` is refused here, as the catch-all refused it before; a load or
         // store through any other pointer goes to the memory model below.
         let mut slots = LocalSlots::default();
+        let mut closure_cells = closure_cells::ClosureCells::default();
         for (index, node) in body.iter().enumerate() {
             let key = (id.index(), index);
+            if unit_values::Units::claims(&node.inst) {
+                let [result] = node.results.as_slice() else {
+                    return Err("Unit instruction must bind exactly one result".into());
+                };
+                self.unit_type(*result)?;
+                if let Inst::Copy { operand, .. } = &node.inst {
+                    self.unit_type(*operand)?;
+                }
+                env.units.step(node)?;
+                continue;
+            }
+            if let Some(step) =
+                closure_cells.step(self.module, self.func, id.index(), &mut env, node)
+            {
+                step?;
+                // Logical cell evaluation supplies no actual allocation/frame
+                // proof. Retain the existing mandatory memory frontier even
+                // for a zero-byte environment; legacy scalar grading cannot
+                // turn this new source support into O4/O5 authority.
+                if matches!(node.inst, Inst::Alloca { .. }) {
+                    self.memory.address_computation = true;
+                }
+                continue;
+            }
             if let Some(step) =
                 slots.step(self.module, self.func, &self.blocks, id.index(), &mut env.scalars, node)
             {
@@ -3359,7 +3440,10 @@ impl SpecCx<'_> {
                                     );
                                 }
                                 match pp {
-                                    ParamPlace::Ignore => {}
+                                    ParamPlace::Ignore => {
+                                        self.unit_type(*a)?;
+                                        env.units.require(*a, expected)?;
+                                    }
                                     ParamPlace::Scalar(s) => {
                                         let v = lookup(&env.scalars, *a)?;
                                         if v.width != s.width {
@@ -3549,6 +3633,7 @@ impl SpecCx<'_> {
         }
         // Trust: aggregates bind only to parameters of their exact type (AGG-SSA-1).
         let (next, aggs) = aggregate_values::bind_edge(self, target, args, env)?;
+        let units = env.units.edge(&self.blocks[&target.index()].params, args)?;
         // PKG-C5c-L0: an edge into the cut block ENDS this segment as an
         // arrival: the path and the cut's shared values on this edge, no
         // return (reach false). Unreachable while `cut` is None (spec_entry).
@@ -3563,6 +3648,7 @@ impl SpecCx<'_> {
             target,
             SpecEnv {
                 scalars: next,
+                units,
                 aggs,
                 pairs: env.pairs.clone(),
                 closures: env.closures.clone(),
@@ -4507,7 +4593,18 @@ fn discharge_under(
     abi: &AbiDischarge,
     entry_abi: &abi_extensions::Plan,
     own_bool: bool,
+    formula_scope: bool,
+    retained: Option<&crate::original_conjunction_certificate::OriginalConjunctionCertificate>,
 ) -> PairOutcome {
+    #[cfg(not(feature = "fmrel"))]
+    let _ = formula_scope;
+    let replaying = retained.is_some();
+    if replaying && (own_bool || !pi.is_empty()) {
+        return PairOutcome::Unknown {
+            which: "O4".into(),
+            detail: "retained Formula replay does not admit Bool results or calls".into(),
+        };
+    }
     // Bind each IR site's result variable to its paired machine site's.
     let mut map: HashMap<String, Formula> = HashMap::new();
     for (key, (name, w)) in &spec.result_vars {
@@ -4531,7 +4628,7 @@ fn discharge_under(
     // about the bytes. A failed one makes the model Unknown, never Refuted.
     let mut model_equations = entry_abi.entry_equations();
     model_equations.extend(exec.abi_model_equations.clone());
-    for (index, (left, right)) in model_equations.iter().enumerate() {
+    for (index, (left, right)) in model_equations.iter().enumerate().filter(|_| !replaying) {
         if !matches!(discharge_equal_pre(left, right, None), Discharge::Proven) {
             return PairOutcome::Unknown {
                 which: "O4".into(),
@@ -4541,7 +4638,7 @@ fn discharge_under(
     }
 
     // (1) VACUITY FIREWALL — unchanged rule.
-    if !matches!(spec_reach, Formula::Bool(true)) {
+    if !replaying && !matches!(spec_reach, Formula::Bool(true)) {
         match discharge_valid(&Formula::Not(b(spec_reach.clone()))) {
             Discharge::Proven => {
                 return PairOutcome::Unknown {
@@ -4561,7 +4658,7 @@ fn discharge_under(
         }
     }
     // (2) spec-side modeling preconditions, implied by spec_reach.
-    for (i, c) in side.iter().enumerate() {
+    for (i, c) in side.iter().enumerate().filter(|_| !replaying) {
         match discharge_valid(&Formula::Or(vec![Formula::Not(b(spec_reach.clone())), c.clone()])) {
             Discharge::Proven => {}
             Discharge::CounterExample => {
@@ -4690,7 +4787,7 @@ fn discharge_under(
     // the hook replaced by `x / d`, each replacement kernel-admitted, is decided
     // on that rewrite (ay still refutes a wrong one); otherwise as before.
     let mut const_div_note = String::new();
-    for (name, which, m, s) in &items {
+    for (name, which, m, s) in items.iter().filter(|_| !replaying) {
         #[cfg(feature = "kernel-recheck")]
         let rewrite = crate::verify_output_instantiate::const_div_step4(name, m);
         #[cfg(not(feature = "kernel-recheck"))]
@@ -4756,7 +4853,7 @@ fn discharge_under(
     // a trap tail).
     let checks: Vec<(&str, Formula)> =
         spec.checks.iter().map(|(what, c)| (what.as_str(), substitute(c, &map))).collect();
-    for (what, c) in &checks {
+    for (what, c) in checks.iter().filter(|_| !replaying) {
         match discharge_valid(&Formula::Not(b(c.clone()))) {
             Discharge::Proven => {}
             Discharge::CounterExample => {
@@ -4832,6 +4929,36 @@ fn discharge_under(
     step5_record::push(symbol, &conj);
     let kernel_eligible =
         side.is_empty() && abi_lowerable && !matches!(abi, AbiDischarge::Verdict(_));
+    #[cfg(feature = "fmrel")]
+    let preconditions =
+        [(pred_to_int(spec_reach.clone(), 1), Formula::BitVec { value: 1, width: 1 })];
+    if let Some(packet) = retained {
+        if !kernel_eligible {
+            return PairOutcome::Unknown {
+                which: "O4".into(),
+                detail: "retained Formula replay has unsupported model or ABI preconditions".into(),
+            };
+        }
+        #[cfg(feature = "fmrel")]
+        return match packet.replay_formula(&conj, &preconditions) {
+            Ok(checked) => PairOutcome::Proven {
+                o3: "no call events; original typed conjunction replayed".into(),
+                o4: "complete original return, checks, model and ABI conjunction plus universal source-reach precondition replayed by the canonical kernel".into(),
+                evidence: Some(ProvenEvidence::KernelInstantiated {
+                    theorem: checked.label().into(), original: Some(Arc::new(checked)),
+                }),
+            },
+            Err(detail) => PairOutcome::Unknown { which: "O4".into(), detail },
+        };
+        #[cfg(not(feature = "fmrel"))]
+        {
+            let _ = packet;
+            return PairOutcome::Unknown {
+                which: "O4".into(),
+                detail: "canonical Formula replay unavailable".into(),
+            };
+        }
+    }
     let evidence = if kernel_eligible {
         // One retry with closed branches (ground-condition Ites) folded and two identities
         // applied, each fold's condition and each identity instance a kernel-checked side
@@ -4860,6 +4987,29 @@ fn discharge_under(
         }
     } else {
         Some(ProvenEvidence::AyValidated)
+    };
+    #[cfg(feature = "fmrel")]
+    let evidence = if kernel_eligible && !evidence.as_ref().is_some_and(ProvenEvidence::is_kernel) {
+        let mut signed = false;
+        for formula in conj.iter().flat_map(|(a, b)| [a, b]) {
+            formula.visit(&mut |node| signed |= matches!(node, Formula::BvSDiv(..)));
+        }
+        if signed && formula_scope && !own_bool && pi.is_empty() {
+            crate::original_conjunction_certificate::check_formula_with_preconditions(
+                &conj,
+                &preconditions,
+            )
+            .ok()
+            .map(|checked| ProvenEvidence::KernelInstantiated {
+                theorem: checked.label().into(),
+                original: Some(Arc::new(checked)),
+            })
+            .or(evidence)
+        } else {
+            evidence
+        }
+    } else {
+        evidence
     };
     // CONSTDIV-1: after a rewrite only kernel evidence of the ORIGINAL conjunction
     // stands; otherwise [VALIDATED], with O4 naming the rewrite and its theorems.

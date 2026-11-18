@@ -19,8 +19,9 @@ pub use action_sandbox::ActionSandbox;
 pub use environment_inputs::EnvironmentInputs;
 pub use platform_inputs::{PLATFORM_READ_DIRECTORIES, PLATFORM_READ_FILES, PlatformInputs};
 pub use process_builder::{
-    CaptureCompletionCause, CaptureOwnerObservation, CaptureStreamEnd, CapturedProcess, CpuTimes,
-    ExecStats, ProcessBuilder, Stdio, StreamingOutputLimits, StreamingProcessScope,
+    CaptureCompletionCause, CaptureOwnerObservation, CaptureStreamEnd, CapturedProcess,
+    ChildSupervision, CpuTimes, ExecStats, ProcessBuilder, Stdio, StreamingOutputLimits,
+    StreamingProcessScope,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use process_builder::{OwnedIsolatedChild, PreparedIsolatedChild};

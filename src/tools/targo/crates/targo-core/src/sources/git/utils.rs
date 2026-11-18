@@ -162,13 +162,22 @@ impl GitRemote {
     }
 }
 
+// Trust: a dependency's completion marker is cache metadata. A submodule
+// lives inside the dependency's source tree, so use its Git metadata directory.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CheckoutKind {
+    Dependency,
+    Submodule,
+}
+
 impl GitDatabase {
     /// Checkouts to a revision at `dest`ination from this database.
     #[tracing::instrument(skip(self, gctx))]
-    pub fn copy_to(
+    pub(super) fn copy_to(
         &self,
         rev: git2::Oid,
         dest: &Path,
+        kind: CheckoutKind,
         gctx: &GlobalContext,
         quiet: bool,
     ) -> CargoResult<GitCheckout<'_>> {
@@ -179,11 +188,11 @@ impl GitDatabase {
         let checkout = match git2::Repository::open(dest)
             .ok()
             .map(|repo| GitCheckout::new(self, rev, repo))
-            .filter(|co| co.is_fresh())
+            .filter(|co| co.is_fresh(kind))
         {
             Some(co) => co,
             None => {
-                let (checkout, guard) = GitCheckout::clone_into(dest, self, rev, gctx)?;
+                let (checkout, guard) = GitCheckout::clone_into(dest, self, rev, kind, gctx)?;
                 checkout.update_submodules(gctx, quiet)?;
                 guard.mark_ok()?;
                 checkout
@@ -305,6 +314,7 @@ impl<'a> GitCheckout<'a> {
         into: &Path,
         database: &'a GitDatabase,
         revision: git2::Oid,
+        kind: CheckoutKind,
         gctx: &GlobalContext,
     ) -> CargoResult<(GitCheckout<'a>, CheckoutGuard)> {
         let dirname = into.parent().unwrap();
@@ -355,16 +365,23 @@ impl<'a> GitCheckout<'a> {
         let repo = repo.unwrap();
 
         let checkout = GitCheckout::new(database, revision, repo);
-        let guard = checkout.reset(gctx)?;
+        let guard = checkout.reset(kind, gctx)?;
         Ok((checkout, guard))
     }
 
+    fn ready_marker(&self, kind: CheckoutKind) -> PathBuf {
+        match kind {
+            CheckoutKind::Dependency => self.path.join(CHECKOUT_READY_LOCK),
+            CheckoutKind::Submodule => self.repo.path().join(CHECKOUT_READY_LOCK),
+        }
+    }
+
     /// Checks if the `HEAD` of this checkout points to the expected revision.
-    fn is_fresh(&self) -> bool {
+    fn is_fresh(&self, kind: CheckoutKind) -> bool {
         match self.repo.revparse_single("HEAD") {
             Ok(ref head) if head.id() == self.revision => {
                 // See comments in reset() for why we check this
-                self.path.join(CHECKOUT_READY_LOCK).exists()
+                self.ready_marker(kind).exists()
             }
             _ => false,
         }
@@ -378,15 +395,15 @@ impl<'a> GitCheckout<'a> {
     /// because of a signal) Cargo needs to be sure to try to check out this
     /// repo again on the next go-round.
     ///
-    /// To enable this we have a dummy file in our checkout, [`.cargo-ok`],
-    /// which if present means that the repo has been successfully reset and is
-    /// ready to go. Hence if we start to do a reset, we make sure this file
+    /// The [`.cargo-ok`] cache marker indicates that the checkout was
+    /// successfully reset and is ready. Submodules keep the marker in their
+    /// Git metadata. Hence if we start to do a reset, we make sure this file
     /// *doesn't* exist. The caller of [`reset`] has an option to perform additional operations
     /// (e.g. submodule update) before marking the check-out as ready.
     ///
     /// [`.cargo-ok`]: CHECKOUT_READY_LOCK
-    fn reset(&self, gctx: &GlobalContext) -> CargoResult<CheckoutGuard> {
-        let guard = CheckoutGuard::guard(&self.path);
+    fn reset(&self, kind: CheckoutKind, gctx: &GlobalContext) -> CargoResult<CheckoutGuard> {
+        let guard = CheckoutGuard::guard(self.ready_marker(kind));
         info!("reset {} to {}", self.repo.path().display(), self.revision);
 
         // Ensure libgit2 won't mess with newlines when we vendor.
@@ -508,7 +525,13 @@ impl<'a> GitCheckout<'a> {
                 let url = fetch_url.unwrap_or_else(|| source_id.url().to_string());
                 format!("failed to fetch submodule `{name}` from {url}")
             })?;
-            db.copy_to(actual_rev, repo.path(), gctx, quiet)?;
+            db.copy_to(
+                actual_rev,
+                repo.path(),
+                CheckoutKind::Submodule,
+                gctx,
+                quiet,
+            )?;
             Ok(())
         }
     }
@@ -521,8 +544,7 @@ struct CheckoutGuard {
 }
 
 impl CheckoutGuard {
-    fn guard(path: &Path) -> Self {
-        let ok_file = path.join(CHECKOUT_READY_LOCK);
+    fn guard(ok_file: PathBuf) -> Self {
         let _ = paths::remove_file(&ok_file);
         Self { ok_file }
     }
@@ -1982,6 +2004,73 @@ fn is_short_hash_of(rev: &str, oid: Oid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submodule_ready_marker_preserves_tracked_source_and_clean_status() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("objects");
+        let repo = git2::Repository::init_bare(&db_path).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        let tracked_bytes = b"original tracked marker\n";
+        let marker_blob = repo.blob(tracked_bytes).unwrap();
+        let payload = repo.blob(b"source payload\n").unwrap();
+        let commits = [false, true].map(|tracked| {
+            let mut tree = repo.treebuilder(None).unwrap();
+            tree.insert("payload.txt", payload, 0o100644).unwrap();
+            if tracked {
+                tree.insert(CHECKOUT_READY_LOCK, marker_blob, 0o100644)
+                    .unwrap();
+            }
+            let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+            repo.commit(None, &signature, &signature, "source", &tree, &[])
+                .unwrap()
+        });
+        for revision in commits {
+            repo.reference(
+                &format!("refs/commit/{revision}"),
+                revision,
+                false,
+                "fixture pin",
+            )
+            .unwrap();
+        }
+        let database = GitDatabase {
+            remote: GitRemote::new(&db_path.as_path().into_url().unwrap()),
+            path: db_path,
+            repo,
+        };
+        let gctx = GlobalContext::default().unwrap();
+        let root = temp.path().join("dependency");
+        database
+            .copy_to(commits[0], &root, CheckoutKind::Dependency, &gctx, true)
+            .unwrap();
+        assert_eq!(std::fs::read(root.join(CHECKOUT_READY_LOCK)).unwrap(), b"");
+
+        for (name, revision, tracked) in [
+            ("untracked", commits[0], false),
+            ("tracked", commits[1], true),
+        ] {
+            let path = temp.path().join(name);
+            for _ in 0..2 {
+                let checkout = database
+                    .copy_to(revision, &path, CheckoutKind::Submodule, &gctx, true)
+                    .unwrap();
+                assert_eq!(checkout.repo.head().unwrap().target(), Some(revision));
+                assert!(checkout.is_fresh(CheckoutKind::Submodule));
+                let statuses = checkout
+                    .repo
+                    .statuses(Some(git2::StatusOptions::new().include_untracked(true)))
+                    .unwrap();
+                assert!(statuses.is_empty());
+                let marker = path.join(CHECKOUT_READY_LOCK);
+                if tracked {
+                    assert_eq!(std::fs::read(marker).unwrap(), tracked_bytes);
+                } else {
+                    assert!(!marker.exists());
+                }
+            }
+        }
+    }
 
     #[test]
     fn github_fast_path_full_hash_returns_needs_fetch() {

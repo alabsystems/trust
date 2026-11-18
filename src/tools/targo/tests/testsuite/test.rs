@@ -12,6 +12,58 @@ use cargo_util::paths::dylib_path_envvar;
 
 use crate::utils::cross_compile::can_run_on_host as cross_compile_can_run_on_host;
 
+// Trust: a native status owner may capture internally, but ordinary test
+// execution must still publish both inherited streams and the libtest result.
+#[cargo_test]
+fn captured_native_test_status_keeps_both_streams_and_the_harness_result() {
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("status-output"))
+        .file(
+            "src/main.rs",
+            r#"
+fn main() {}
+#[test]
+fn actual_test_body() {
+    println!("actual-status-stdout");
+    eprintln!("actual-status-stderr");
+}
+"#,
+        )
+        .build();
+    p.cargo("test -- --nocapture")
+        .with_stdout_contains("actual-status-stdout")
+        .with_stdout_contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        .with_stderr_contains("actual-status-stderr")
+        .run();
+}
+
+// Trust: failing owning completions must retain their output and their refusal.
+#[cargo_test]
+fn captured_native_failed_test_keeps_both_streams_and_the_failure() {
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("failed-status-output"))
+        .file(
+            "src/main.rs",
+            r#"
+fn main() {}
+#[test]
+fn actual_failed_test_body() {
+    println!("actual-failed-status-stdout");
+    eprintln!("actual-failed-status-stderr");
+    panic!("original-test-failure");
+}
+"#,
+        )
+        .build();
+    p.cargo("test -- --nocapture")
+        .with_status(101)
+        .with_stdout_contains("actual-failed-status-stdout")
+        .with_stdout_contains("test result: FAILED. 0 passed; 1 failed; 0 ignored;")
+        .with_stderr_contains("actual-failed-status-stderr")
+        .with_stderr_contains("original-test-failure")
+        .run();
+}
+
 #[cargo_test]
 fn cargo_test_simple() {
     let p = project()

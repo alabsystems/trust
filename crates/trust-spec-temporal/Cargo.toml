@@ -80,6 +80,10 @@ rustc-hash = { path = "../../first-party/ty/crates/tla-hash-fx" }
 num-bigint = { path = "../../first-party/ty/crates/tla-bignum/bigint" }
 num-integer = { path = "../../first-party/ty/crates/tla-bignum/integer" }
 num-traits = { path = "../../first-party/ty/crates/tla-bignum/traits" }
+xxhash-rust = { path = "../../first-party/ty/crates/tla-hash-xxh3" }
+# TY's serializer grows the stack for recursive tuple/sequence elements.
+# Workspace patches are not inherited through the tla-check path dependency.
+serde_stacker = { path = "../../first-party/ty/crates/tla-serde-stacker" }
 
 [dependencies]
 # `ty certify` lane (R5 non-P1 step 2): parse the self-contained `ty.cert/v1`

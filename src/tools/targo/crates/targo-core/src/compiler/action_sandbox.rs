@@ -15,8 +15,7 @@ pub(super) fn apply(
     }
     let environment = build
         .bcx
-        .action_environment
-        .as_ref()
+        .action_environment_for(unit)
         .ok_or_else(|| anyhow::anyhow!("confined action has no captured environment"))?;
     command.environment_snapshot(environment.clone());
     // Confined library actions have a file input, never an ambient stdin
@@ -67,7 +66,30 @@ pub(super) fn apply(
         let output = build.files().output_dir(&current);
         std::fs::create_dir_all(&output)?;
         sandbox.read_directory(&output)?;
-        pending.extend(build.unit_deps(&current).iter().map(|dep| dep.unit.clone()));
+        // Trust (DC-18c): a shared member's build-script run and proc macros
+        // stay per checkout. Their packages, sources and dependencies are
+        // not its inputs: only what its slot is named by is readable.
+        pending.extend(
+            build
+                .unit_deps(&current)
+                .iter()
+                .filter(|dep| !build.bcx.keyed_dependency(&current, &dep.unit))
+                .map(|dep| dep.unit.clone()),
+        );
+    }
+    for dep in build.unit_deps(unit) {
+        if !build.bcx.keyed_dependency(unit, &dep.unit) {
+            continue;
+        }
+        // Its own script's `OUT_DIR`, whose tree names the slot; a proc
+        // macro's library directory, whose library's bytes name it.
+        let readable = if dep.unit.mode.is_run_custom_build() {
+            super::custom_build::script_out_dir(build, &dep.unit)
+        } else {
+            build.files().output_dir(&dep.unit)
+        };
+        std::fs::create_dir_all(&readable)?;
+        sandbox.read_directory(&readable)?;
     }
     let output = build.files().output_dir(unit);
     sandbox.write_directory(&output)?;

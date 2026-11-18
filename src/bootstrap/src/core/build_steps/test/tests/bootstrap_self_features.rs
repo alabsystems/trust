@@ -153,6 +153,7 @@ fn bootstrap_self_test_build_allows_what_its_test_target_and_client_enable() {
     // stays refused.
     assert!(!allowed.contains("specialization"), "{features}");
     assert!(!allowed.contains("allocator_api"), "{features}");
+    assert!(!allowed.contains("allocator_ext"), "{features}");
 }
 
 #[test]

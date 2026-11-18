@@ -27,22 +27,42 @@
 # native manager counts its Cargo and compiler processes as writers of this
 # tree, so a concurrent x.py acquisition is refused or waits.
 #
-# Usage: scripts/build-tree-manager.sh [--targo PATH]
-#   --targo PATH   the Targo to build with (default: $TARGO, else `targo` on PATH)
+# Usage: scripts/build-tree-manager.sh [--targo PATH] [--seed-dylib-path DIR]...
+#   --targo PATH           the Targo to build with (default: $TARGO, else `targo` on PATH);
+#                          it compiles with the trustc beside it
+#   --seed-dylib-path DIR  a directory first on DYLD_LIBRARY_PATH for that Targo and its
+#                          compiler, as the mint's option of this name is for a seed whose
+#                          binaries load a library the system does not provide (repeatable)
 # On a shared machine run it under admission: scripts/build-slot -- scripts/build-tree-manager.sh
 #
 # The build is --frozen, like bootstrap.py's: it neither updates the lock file
-# nor fetches. If Cargo reports a missing package, fetch Bootstrap's locked
-# sources first:  targo fetch --locked --manifest-path src/bootstrap/Cargo.toml
+# nor fetches, so its Cargo home must hold the registry index entry and the
+# archive of every crate src/bootstrap/Cargo.lock names, optional ones included.
+# Cargo names the first one it lacks ("no matching package named ..."); fetch
+# Bootstrap's locked sources first:
+#   targo fetch --locked --manifest-path src/bootstrap/Cargo.toml
+# The daily runner gives this step the Cargo home and the seed Targo its dependency
+# preparation proved offline (scripts/daily_toolchain_stage.py, build_tree_manager).
 set -euo pipefail
 
 PROTOCOL="trust-build-tree-manager-v2"
 targo="${TARGO:-targo}"
+dylibs=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --targo)
       [ "$#" -ge 2 ] || { echo "build-tree-manager: --targo needs a path" >&2; exit 2; }
       targo="$2"; shift 2 ;;
+    --seed-dylib-path)
+      [ "$#" -ge 2 ] || { echo "build-tree-manager: --seed-dylib-path needs a directory" >&2; exit 2; }
+      case "$2" in
+        /*) [ -d "$2" ] || { echo "build-tree-manager: --seed-dylib-path is not a directory: $2" >&2; exit 2; } ;;
+        *) echo "build-tree-manager: --seed-dylib-path takes an absolute directory: $2" >&2; exit 2 ;;
+      esac
+      case "$2" in
+        *:*) echo "build-tree-manager: --seed-dylib-path cannot hold a colon: $2" >&2; exit 2 ;;
+      esac
+      dylibs="${dylibs:+$dylibs:}$2"; shift 2 ;;
     -h|--help)
       sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
       exit 0 ;;
@@ -73,10 +93,13 @@ echo "build-tree-manager: building this tree's Bootstrap with $version into $tar
 # Bootstrap's shim, and a CARGO_BUILD_TARGET puts the binary under a triple.
 # RUSTC_BOOTSTRAP=1 is what bootstrap.py also sets for this build: Bootstrap's
 # dependency graph enables a Trust std feature on a Trust compiler.
+# dyld searches DYLD_LIBRARY_PATH by leaf name before a load command's own path, and
+# a system shell drops the variable, so it is set here, on the Targo's own launch.
 cd "$root"
 env -u RUSTC -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u RUSTFLAGS \
     -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u CARGO_BUILD_TARGET \
     -u CARGO_BUILD_TARGET_DIR -u CARGO_BUILD_BUILD_DIR \
+    ${dylibs:+DYLD_LIBRARY_PATH="$dylibs"} \
     CARGO_TARGET_DIR="$target" CARGO_INCREMENTAL=0 RUSTC_BOOTSTRAP=1 \
     "$targo" --unverified build --frozen --manifest-path "$manifest" --bin bootstrap
 

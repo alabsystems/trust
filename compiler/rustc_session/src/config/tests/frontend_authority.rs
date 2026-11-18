@@ -205,7 +205,7 @@ fn every_classified_control_is_observed_at_both_boundaries() {
 ///   sat-perturb / instance-flip-mutate / instance-flip-probe /
 ///   clean-origin-mutate-emitter / ir-lower-mutate-finalization /
 ///   ir-lower-mutate-rhs-effects / ir-seam-reference / spawn-census-shadow /
-///   test-mutate-derived-assert-msg / ctfe-trivial-probe — adversarial and
+///   test-mutate-derived-assert-msg / ctfe-trivial-probe / path-free — adversarial and
 ///   measurement controls: each exists to
 ///   produce an observable outcome (a refusal, a warning, a probe line, a
 ///   report) or to perturb emitted MIR, and a frontend that dropped one would
@@ -274,6 +274,8 @@ fn every_trust_option_declares_its_deauthorized_frontend_disposition() {
         ("trust_no_adapter_yield", VerificationSelector),
         ("trust_no_r1", VerificationSelector),
         ("trust_option_flag_lanes", VerificationSelector),
+        // Trust (DC-18a): a refusal, observable and independent of verification.
+        ("trust_path_free", EvidenceControl),
         ("trust_policy", VerificationSelector),
         ("trust_proof_artifact_root", VerificationSelector),
         ("trust_clean_origin_mutate_emitter", EvidenceControl),
@@ -473,6 +475,7 @@ fn mutate_trust_control(opts: &mut UnstableOptions, field: &str) {
         "trust_no_adapter_yield" => opts.trust_no_adapter_yield = true,
         "trust_no_r1" => opts.trust_no_r1 = true,
         "trust_option_flag_lanes" => opts.trust_option_flag_lanes = false,
+        "trust_path_free" => opts.trust_path_free = true,
         // Trust: classified by fd10e2b6ee (STR_BYTE_POSITION) without an arm here, which made
         // the loop above panic on it; found when R8-SEAM's option was added behind it.
         "trust_no_str_byte_position" => opts.trust_no_str_byte_position = true,

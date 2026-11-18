@@ -22,7 +22,7 @@ ay-certify = ["ay-backend", "trust-router/ay-certify"]
 
 [package]
 name = "targo-trust"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]

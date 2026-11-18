@@ -435,7 +435,9 @@ def manifest_body(tree, shared, platforms):
         head = [
             'schema = "trust.vendor.lean-core-oleans.manifest.v2"', "", "[provenance]",
             f'lean_toolchain = "{toolchain}"',
-            f'origin = "elan-installed {toolchain} release toolchain, lib/lean"',
+            # The toolchain is admitted by its version readback, whether elan or
+            # LEAN_TOOLCHAIN_BIN supplied it, so the origin names no installer.
+            f'origin = "{toolchain} release toolchain, lib/lean"',
             f'root_module = "{roots[0]}"',
             'root_modules = [' + ', '.join(f'"{root}"' for root in roots) + ']',
             "# FOREIGN vendored artifacts (Lean 4 core Init .oleans) — the transitive",

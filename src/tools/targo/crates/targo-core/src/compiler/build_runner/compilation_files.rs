@@ -98,12 +98,24 @@ impl fmt::Debug for UnitHash {
 #[derive(Copy, Clone, Debug)]
 pub struct Metadata {
     unit_id: UnitHash,
+    /// Trust: shared storage alone includes flags omitted for reproducible metadata.
+    shared_storage_id: UnitHash,
     c_metadata: UnitHash,
     c_extra_filename: bool,
     pkg_dir: bool,
 }
 
 impl Metadata {
+    // Trust: keep ordinary short-hash fallbacks; only a shared storage variant
+    // replaces the existing directory identity.
+    fn shared_storage_hash(&self, ordinary: String) -> String {
+        if self.shared_storage_id == self.unit_id {
+            ordinary
+        } else {
+            self.shared_storage_id.to_string()
+        }
+    }
+
     /// A hash to identify a given [`Unit`] in the build graph
     pub fn unit_id(&self) -> UnitHash {
         self.unit_id
@@ -125,6 +137,24 @@ impl Metadata {
     }
 }
 
+/// Trust (DC-18b): a shared workspace member's store slot.
+#[derive(Clone, Debug)]
+pub(crate) struct MemberSlot {
+    /// `<store>/build/members/<package>/<name>`.
+    pub(crate) dir: PathBuf,
+    /// The relocated command digest the slot was named by; empty while the
+    /// slot is planned.
+    pub(crate) command: String,
+    /// Trust (DC-18c): the per-checkout inputs the slot was named by (build
+    /// script output, proc-macro bytes), where the member has any.
+    pub(crate) inputs: Option<std::sync::Arc<crate::compiler::shared_dependencies::MemberInputs>>,
+    /// Trust (DC-18c): the slot cannot be named until a build script or a
+    /// proc macro it is keyed on (its own or a member dependency's) has run
+    /// in this checkout; its directory is this process's, and its job is
+    /// refused.
+    pub(crate) waiting: bool,
+}
+
 /// Collection of information about the files emitted by the compiler, and the
 /// output directory structure.
 pub struct CompilationFiles<'a, 'gctx, L = Layout> {
@@ -144,6 +174,10 @@ pub struct CompilationFiles<'a, 'gctx, L = Layout> {
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
     shared_root: Option<PathBuf>,
     shared_units: crate::util::data_structures::HashSet<Unit>,
+    /// Trust (DC-18b): each shared member unit's store slot. Until
+    /// `BuildRunner::plan_member_slots` names it, a planning directory beside
+    /// the slots of its package.
+    member_slots: HashMap<Unit, MemberSlot>,
     // Trust: native candidate-only per-unit path DATA. Actual directory
     // originals, writer exclusion and publication remain parent obligations.
     private_units: HashMap<Unit, UnitOutputNamespace>,
@@ -458,7 +492,7 @@ impl<'a, 'gctx: 'a, L: Borrow<LayoutPaths>> CompilationFiles<'a, 'gctx, L> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
-        Ok(CompilationFiles {
+        let mut files = CompilationFiles {
             ws: bcx.ws,
             host,
             target,
@@ -468,8 +502,118 @@ impl<'a, 'gctx: 'a, L: Borrow<LayoutPaths>> CompilationFiles<'a, 'gctx, L> {
             outputs,
             shared_root: bcx.shared_dependency_root.clone(),
             shared_units: bcx.shared_dependency_units.clone(),
+            member_slots: HashMap::default(),
             private_units: HashMap::default(),
-        })
+        };
+        if let Some(store) = &files.shared_root {
+            let process = std::process::id();
+            for unit in &bcx.shared_member_units {
+                let dir = store
+                    .join("build")
+                    .join("members")
+                    .join(unit.pkg.package_id().name().as_str())
+                    .join(format!(
+                        ".plan-{process}-{}",
+                        crate::compiler::shared_dependencies::member_key(unit)
+                    ));
+                files.member_slots.insert(
+                    unit.clone(),
+                    MemberSlot {
+                        dir,
+                        command: String::new(),
+                        inputs: None,
+                        waiting: false,
+                    },
+                );
+            }
+        }
+        Ok(files)
+    }
+
+    /// Trust (DC-18b): a shared member's slot name: a digest of what it is
+    /// built from: its unit hash (package, target, features, profile, mode),
+    /// its sources digested without the checkout's path, the platform its
+    /// compiler sees, the compiler's content, its relocated `command` (which
+    /// holds its environment and every argument, the checkout's and the
+    /// slot's own paths read as tokens), and each dependency's slot, a
+    /// member's by this same name. Two checkouts at one commit name one slot;
+    /// a build that changes a member, anything it depends on, or how it is
+    /// compiled names another, and never writes over the first. Every member
+    /// dependency's slot is already named. Trust (DC-18c): and the `inputs`
+    /// digest of what it is keyed on in this checkout, where it has any (its
+    /// build scripts' output, the proc macros it loads), so a member whose
+    /// script printed other directives, or whose macro is other bytes, names
+    /// another slot.
+    pub(super) fn member_slot_name(
+        &self,
+        unit: &Unit,
+        bcx: &BuildContext<'a, 'gctx>,
+        identity: (&str, &str),
+        command: &str,
+        inputs: Option<&str>,
+    ) -> CargoResult<String> {
+        let source = bcx
+            .shared_eligibility
+            .source(unit)
+            .ok_or_else(|| anyhow::anyhow!("shared member has no source capture"))?;
+        let mut dependencies = Vec::new();
+        for dep in &bcx.unit_graph[unit] {
+            let name = dep.extern_crate_name.to_string();
+            if bcx.shared_member(&dep.unit) {
+                let slot = self
+                    .member_slots
+                    .get(&dep.unit)
+                    .filter(|slot| !slot.command.is_empty())
+                    .and_then(|slot| slot.dir.file_name()?.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("a member dependency's slot is not named"))?;
+                dependencies.push(format!("{name}:member:{slot}"));
+            } else {
+                let git = crate::compiler::shared_dependencies::git_source_identity(
+                    dep.unit.pkg.package_id().source_id(),
+                )
+                .unwrap_or_default();
+                dependencies.push(format!(
+                    "{name}:unit:{}:{git}",
+                    self.shared_storage_hash(&dep.unit)
+                ));
+            }
+        }
+        dependencies.sort();
+        let (platform, compiler) = identity;
+        let unit_hash = self.unit_hash(unit);
+        let mut hash = cargo_util::Sha256::new();
+        // A member keyed on nothing per checkout keeps its v2 name.
+        let keyed = inputs.map(|inputs| ["targo-member-inputs", inputs]);
+        for field in [
+            "targo-member-slot-v2",
+            unit_hash.as_str(),
+            source.digest(),
+            platform,
+            compiler,
+            command,
+        ]
+        .into_iter()
+        .chain(keyed.into_iter().flatten())
+        .chain(dependencies.iter().map(String::as_str))
+        {
+            hash.update(&(field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+        Ok(hash.finish_hex()[..32].to_string())
+    }
+
+    /// Trust (DC-18b): a shared member's slot, planned or named.
+    pub(crate) fn member_slot(&self, unit: &Unit) -> Option<&MemberSlot> {
+        self.member_slots.get(unit)
+    }
+
+    /// Trust (DC-18b): names a shared member's slot, and forgets the outputs
+    /// computed while it was planned.
+    pub(super) fn name_member_slot(&mut self, unit: &Unit, slot: MemberSlot) {
+        self.member_slots.insert(unit.clone(), slot);
+        if let Some(outputs) = self.outputs.get_mut(unit) {
+            *outputs = OnceCell::new();
+        }
     }
 
     // Select only before any cached output inventory is calculated. Parent
@@ -576,6 +720,9 @@ impl<'a, 'gctx: 'a, L: Borrow<LayoutPaths>> CompilationFiles<'a, 'gctx, L> {
                 .as_ref()
                 .expect("shared units have a store")
                 .join("build");
+            if let Some(slot) = self.member_slots.get(unit) {
+                return slot.dir.clone();
+            }
             let source = unit.pkg.package_id().source_id();
             let root = if source.is_git() {
                 let revision = crate::compiler::shared_dependencies::resolved_git_commit(source)
@@ -584,7 +731,9 @@ impl<'a, 'gctx: 'a, L: Borrow<LayoutPaths>> CompilationFiles<'a, 'gctx, L> {
             } else {
                 root
             };
-            root.join(self.pkg_dir(unit))
+            // Trust: complete omitted flags distinguish storage without entering
+            // symbol metadata or artifact basenames. Dependency variants propagate.
+            root.join(self.pkg_dir_with_hash(unit, self.shared_storage_hash(unit)))
         })
     }
 
@@ -606,19 +755,21 @@ impl<'a, 'gctx: 'a, L: Borrow<LayoutPaths>> CompilationFiles<'a, 'gctx, L> {
     /// Note that some units may share the same directory, so care should be
     /// taken in those cases!
     fn pkg_dir(&self, unit: &Unit) -> String {
-        let separator = match self.ws.gctx().cli_unstable().build_dir_new_layout {
-            true => "/",
-            false => "-",
-        };
+        self.pkg_dir_with_hash(unit, self.unit_hash(unit))
+    }
+
+    // Trust: ordinary and shared variants use the same existing layout rules.
+    fn pkg_dir_with_hash(&self, unit: &Unit, hash: String) -> String {
         let name = unit.pkg.package_id().name();
-        let hash = self.unit_hash(unit);
-        // This function can be somewhat hot, so try to not cause unnecessary allocations here.
-        // Sadly, format! does not currently pre-allocate the correct size.
-        let mut pkg = String::with_capacity(name.len() + separator.len() + hash.len());
-        pkg.push_str(&name);
-        pkg.push_str(&separator);
-        pkg.push_str(&hash);
-        pkg
+        package_directory(
+            name.as_str(),
+            &hash,
+            self.ws.gctx().cli_unstable().build_dir_new_layout,
+        )
+    }
+
+    fn shared_storage_hash(&self, unit: &Unit) -> String {
+        self.metas[unit].shared_storage_hash(self.unit_hash(unit))
     }
 
     /// The directory hash to use for a given unit
@@ -789,8 +940,10 @@ impl<'a, 'gctx: 'a, L: Borrow<LayoutPaths>> CompilationFiles<'a, 'gctx, L> {
             .build_script_execution(&dir)
     }
 
-    /// Returns the "`OUT_DIR`" directory for running a build script.
-    /// `/path/to/target/{debug,release}/build/PKG-HASH/out`
+    /// Returns the "`OUT_DIR`" directory for running a build script in the
+    /// old build-directory layout:
+    /// `/path/to/target/{debug,release}/build/PKG-HASH/out`. Trust:
+    /// `custom_build::script_out_dir` names a run's `OUT_DIR` in either layout.
     pub fn build_script_out_dir(&self, unit: &Unit) -> PathBuf {
         self.build_script_run_dir(unit).join("out")
     }
@@ -1297,13 +1450,67 @@ fn compute_metadata(
 
     let c_metadata = UnitHash(Hasher::finish(&c_metadata_hasher));
     let unit_id = UnitHash(Hasher::finish(&unit_id_hasher));
+    // Trust: a store exists only in the eligible unverified lane. Private and
+    // verified units retain their original (including session-invariant) IDs.
+    let shared_storage_id = if bcx.shared_dependency_root.is_some() {
+        let dependencies = bcx.unit_graph[unit]
+            .iter()
+            .zip(&deps_metadata)
+            .map(|(dependency, metadata)| (dependency.extern_crate_name.as_str(), *metadata))
+            .collect::<Vec<_>>();
+        shared_storage_id(unit_id, extra_args, flags, &dependencies)
+    } else {
+        unit_id
+    };
 
     Ok(Metadata {
         unit_id,
+        shared_storage_id,
         c_metadata,
         c_extra_filename,
         pkg_dir,
     })
+}
+
+/// Trust: partition only shared storage on complete flag vectors omitted from
+/// reproducible unit metadata, including their transitive dependency variants.
+/// Ordinary unaffected slots retain their existing identity.
+fn shared_storage_id(
+    unit_id: UnitHash,
+    extra_args: &[String],
+    flags: &[String],
+    dependencies: &[(&str, Metadata)],
+) -> UnitHash {
+    if !has_remap_path_prefix(extra_args)
+        && !has_remap_path_prefix(flags)
+        && dependencies
+            .iter()
+            .all(|(_, dependency)| dependency.shared_storage_id == dependency.unit_id)
+    {
+        return unit_id;
+    }
+    let mut hasher = StableHasher::new();
+    "targo-shared-storage-flags-v1".hash(&mut hasher);
+    unit_id.hash(&mut hasher);
+    extra_args.hash(&mut hasher);
+    flags.hash(&mut hasher);
+    let mut dependencies = dependencies
+        .iter()
+        .map(|(name, dependency)| (*name, dependency.shared_storage_id))
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    dependencies.hash(&mut hasher);
+    UnitHash(Hasher::finish(&hasher))
+}
+
+// Trust: preserve both existing directory separators, including ordinary short hashes.
+fn package_directory(name: &str, hash: &str, new_layout: bool) -> String {
+    let separator = if new_layout { "/" } else { "-" };
+    let mut pkg = String::with_capacity(name.len() + separator.len() + hash.len());
+    pkg.push_str(name);
+    pkg.push_str(separator);
+    pkg.push_str(hash);
+    pkg
 }
 
 /// Hashes a unit's compiler flags into its `unit_id`: `extra_args`, then
@@ -1596,7 +1803,7 @@ mod native_unit_output_tests {
 mod trust_unit_id_tests {
     use std::hash::{Hash, Hasher};
 
-    use super::hash_unit_id_flags;
+    use super::{Metadata, UnitHash, hash_unit_id_flags, package_directory, shared_storage_id};
     use crate::compiler::trust_unit_id::{SessionInvariantLane, without_per_run_transport};
     use crate::util::StableHasher;
 
@@ -1667,6 +1874,118 @@ LLVM version: 22.1.2";
         let mut hasher = StableHasher::new();
         hash_unit_id_flags(&mut hasher, extra_args, flags, lane);
         Hasher::finish(&hasher)
+    }
+
+    // Trust: remapping keeps reproducible compiler metadata while the complete
+    // omitted vectors distinguish their concurrently retained shared products.
+    #[test]
+    fn remapped_flags_partition_storage_without_changing_unit_metadata() {
+        let yes = vec![
+            "--remap-path-prefix=/checkout=/src".to_owned(),
+            "-Cdebug-assertions=yes".to_owned(),
+        ];
+        let no = vec![
+            "--remap-path-prefix=/checkout=/src".to_owned(),
+            "-Cdebug-assertions=no".to_owned(),
+        ];
+        for extra in [false, true] {
+            let (extra_yes, flags_yes, extra_no, flags_no) = if extra {
+                (yes.as_slice(), &[][..], no.as_slice(), &[][..])
+            } else {
+                (&[][..], yes.as_slice(), &[][..], no.as_slice())
+            };
+            let original = UnitHash(key(extra_yes, flags_yes, None));
+            assert_eq!(original, UnitHash(key(extra_no, flags_no, None)));
+            assert_ne!(
+                shared_storage_id(original, extra_yes, flags_yes, &[]),
+                shared_storage_id(original, extra_no, flags_no, &[])
+            );
+        }
+        let flags = vec!["-Cdebuginfo=0".to_owned()];
+        let original = UnitHash(key(&[], &flags, None));
+        assert_eq!(shared_storage_id(original, &[], &flags, &[]), original);
+    }
+
+    // Trust: a parent with unchanged own flags must not reuse another child's
+    // shared slot. Carry this distinction through another level, without changing
+    // the original unit identities or depending on graph traversal order.
+    #[test]
+    fn shared_storage_variants_propagate_through_unchanged_parents() {
+        let metadata = |unit_id, shared_storage_id| Metadata {
+            unit_id,
+            shared_storage_id,
+            c_metadata: unit_id,
+            c_extra_filename: true,
+            pkg_dir: true,
+        };
+        let leaf = UnitHash(1);
+        let normal = metadata(leaf, leaf);
+        let a = metadata(leaf, UnitHash(2));
+        let b = metadata(leaf, UnitHash(3));
+        let parent = UnitHash(4);
+        assert_eq!(
+            shared_storage_id(parent, &[], &[], &[("leaf", normal)]),
+            parent
+        );
+        let parent_a = shared_storage_id(parent, &[], &[], &[("leaf", a)]);
+        let parent_b = shared_storage_id(parent, &[], &[], &[("leaf", b)]);
+        assert_ne!(parent_a, parent_b);
+        let grandparent = UnitHash(5);
+        assert_ne!(
+            shared_storage_id(
+                grandparent,
+                &[],
+                &[],
+                &[("parent", metadata(parent, parent_a))]
+            ),
+            shared_storage_id(
+                grandparent,
+                &[],
+                &[],
+                &[("parent", metadata(parent, parent_b))]
+            )
+        );
+        assert_eq!(
+            shared_storage_id(parent, &[], &[], &[("left", a), ("right", b)]),
+            shared_storage_id(parent, &[], &[], &[("right", b), ("left", a)])
+        );
+        assert_ne!(
+            shared_storage_id(parent, &[], &[], &[("left", a), ("right", b)]),
+            shared_storage_id(parent, &[], &[], &[("left", b), ("right", a)])
+        );
+    }
+
+    #[test]
+    fn shared_storage_preserves_ordinary_short_hashes_and_both_layouts() {
+        let ordinary = Metadata {
+            unit_id: UnitHash(1),
+            shared_storage_id: UnitHash(1),
+            c_metadata: UnitHash(1),
+            c_extra_filename: false,
+            pkg_dir: false,
+        };
+        let variant = Metadata {
+            shared_storage_id: UnitHash(2),
+            ..ordinary
+        };
+        for (new_layout, separator) in [(false, "-"), (true, "/")] {
+            assert_eq!(
+                package_directory(
+                    "package",
+                    &ordinary.shared_storage_hash("short".into()),
+                    new_layout
+                ),
+                format!("package{separator}short")
+            );
+            assert_eq!(
+                package_directory(
+                    "package",
+                    &variant.shared_storage_hash("short".into()),
+                    new_layout
+                ),
+                format!("package{separator}{}", UnitHash(2))
+            );
+        }
     }
 
     #[test]

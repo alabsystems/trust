@@ -1656,7 +1656,7 @@ pub fn idle(
     plan.require_supported(ws.gctx(), no_run, build_config.unit_graph, no_fail_fast)
         .map_err(super::plan_outcome::cannot_judge)?;
     // The harness policy is checked on every other route (`graph::request`).
-    HarnessPolicy::load(ws, Some(plan)).map_err(super::plan_outcome::cannot_judge)?;
+    HarnessPolicy::load(ws, Some(plan), None).map_err(super::plan_outcome::cannot_judge)?;
     let path = plan.path.display();
     if build_config.unit_graph {
         ws.gctx().shell().warn(format!(

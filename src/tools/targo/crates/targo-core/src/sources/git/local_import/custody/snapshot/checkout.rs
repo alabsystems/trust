@@ -8,7 +8,7 @@ use crate::workspace::SourceId;
 
 const MAX_DEPTH: usize = 64;
 
-pub(super) fn validate_checkout_name(name: &OsStr, repository_root: bool) -> CargoResult<()> {
+pub(super) fn validate_checkout_name(name: &OsStr, checkout_root: bool) -> CargoResult<()> {
     ensure!(
         Path::new(name).components().count() == 1
             && matches!(
@@ -16,8 +16,8 @@ pub(super) fn validate_checkout_name(name: &OsStr, repository_root: bool) -> Car
                 Some(std::path::Component::Normal(_))
             )
             && name != ".git"
-            && (name != ".cargo-ok" || !repository_root),
-        "unsupported selected checkout name: {name:?} (repository root: {repository_root})"
+            && (name != ".cargo-ok" || !checkout_root),
+        "unsupported selected checkout name: {name:?} (Cargo checkout root: {checkout_root})"
     );
     Ok(())
 }
@@ -275,6 +275,40 @@ fn original_reference(
     Ok(bytes)
 }
 
+fn observe_legacy_marker(actual: &mut Checkout, directory: &Directory) -> CargoResult<()> {
+    let name = OsStr::new(".cargo-ok");
+    let open = || -> CargoResult<File> {
+        Ok(File::from(rustix::fs::openat(
+            &directory.file,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?))
+    };
+    let mut file = open()?;
+    let before = file.metadata()?;
+    ensure!(
+        before.is_file()
+            && before.nlink() == 1
+            && before.len() == 0
+            && before.uid() == actual.source.root.before.uid()
+            && matches!(before.mode() & 0o7777, 0o600 | 0o640 | 0o644),
+        "unsupported legacy submodule completion marker"
+    );
+    trust_resource_provenance::require_no_acl_grants(&file)?;
+    ensure!(
+        file.read(&mut [0])? == 0
+            && stamp(&before, &file.metadata()?)
+            && stamp(&before, &open()?.metadata()?),
+        "legacy submodule completion marker changed"
+    );
+    actual
+        .source
+        .files
+        .push((directory.path.join(name), before));
+    actual.check_current()
+}
+
 struct Context<'a> {
     databases: &'a BTreeMap<String, Database>,
     destination: &'a Path,
@@ -324,7 +358,7 @@ fn copy_repository_inner(
         .get(&ident)
         .context("selected checkout lost guarded source ODB")?;
     ensure!(
-        database.source.canonical_url() == source.id.canonical_url(),
+        database.representative.canonical_url() == source.id.canonical_url(),
         "checkout ODB source collision"
     );
     let revision = locked_oid(source.id)?;
@@ -398,14 +432,19 @@ fn copy_repository_inner(
         transfer.budget,
     )?;
     actual.check_current()?;
-    // Cargo's optimization marker is generated only after real tree validation;
-    // it is DATA and cannot create source/SDK/execution or native readiness.
-    transfer.output.generated(
-        &prefix.join(".cargo-ok"),
-        b"",
-        transfer.stats,
-        transfer.budget,
-    )
+    // Trust: Cargo's completion marker belongs only to the outer checkout.
+    // Generating it in submodules makes their Git worktrees dirty. Git-declared
+    // files there remain ordinary source DATA, joined to their selected tree.
+    // The marker grants no source, SDK, execution or native readiness authority.
+    if depth == 0 {
+        transfer.output.generated(
+            &prefix.join(".cargo-ok"),
+            b"",
+            transfer.stats,
+            transfer.budget,
+        )?;
+    }
+    Ok(())
 }
 
 fn copy_tree(
@@ -452,7 +491,7 @@ fn copy_tree(
     let mut expected = std::collections::BTreeSet::new();
     for entry in tree {
         let name = OsString::from_vec(entry.name_bytes().to_vec());
-        validate_checkout_name(&name, relative.as_os_str().is_empty())
+        validate_checkout_name(&name, depth == 0 && relative.as_os_str().is_empty())
             .with_context(|| format!("selected checkout tree at {}", directory.path.display()))?;
         ensure!(
             expected.insert(name.clone()),
@@ -600,7 +639,17 @@ fn copy_tree(
         .collect::<std::collections::BTreeSet<_>>();
     if relative.as_os_str().is_empty() {
         names.remove(OsStr::new(".git"));
-        names.remove(OsStr::new(".cargo-ok"));
+        if depth == 0 {
+            names.remove(OsStr::new(".cargo-ok"));
+        } else if !expected.contains(OsStr::new(".cargo-ok"))
+            && names.contains(OsStr::new(".cargo-ok"))
+        {
+            // Trust: ordinary Cargo also created empty markers in submodule
+            // donors. Observe that narrow metadata form, but never publish it
+            // into a child worktree or treat it as selected source authority.
+            observe_legacy_marker(actual, &directory)?;
+            names.remove(OsStr::new(".cargo-ok"));
+        }
     }
     ensure!(
         names == expected,
@@ -695,8 +744,11 @@ fn forecast_repository_inner(
     tree.walk(git2::TreeWalkMode::PreOrder, |parent, entry| {
         let result = (|| -> CargoResult<()> {
             if !missing {
-                validate_checkout_name(OsStr::from_bytes(entry.name_bytes()), parent.is_empty())
-                    .with_context(|| format!("selected checkout forecast at {parent}"))?;
+                validate_checkout_name(
+                    OsStr::from_bytes(entry.name_bytes()),
+                    depth == 0 && parent.is_empty(),
+                )
+                .with_context(|| format!("selected checkout forecast at {parent}"))?;
             }
             ensure!(
                 Path::new(parent).components().count() < MAX_DEPTH,

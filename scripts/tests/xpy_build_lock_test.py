@@ -423,6 +423,69 @@ class XpyBuildLockOwnershipTests(unittest.TestCase):
         self.assertIn("native build-tree manager v2 is unavailable", child.stderr)
         self.assertEqual(self.tree(root), before)
 
+    def test_construction_fails_as_cargo_does_when_its_offline_home_lacks_a_locked_crate(self):
+        # 2026-11-16: the daily runner ran this step with a Cargo home that held Bootstrap's
+        # archives and too few registry index entries, and --frozen fetches nothing. The
+        # script adds nothing to Cargo's refusal: its exit, no manager path, nothing built.
+        root, path, record = self.construction_fixture("construct-offline", "v2")
+        offline = Path(path.split(":", 1)[0]) / "targo"
+        offline.write_text('#!/bin/sh\n'
+                           'if [ "$1 $2" = "--unverified --version" ]; then echo "targo 0.0.0-fixture"; exit 0; fi\n'
+                           'echo "error: no matching package named \\`chrono\\` found" >&2\nexit 101\n')
+        refused = self.construct(root, path)
+        self.assertEqual(refused.returncode, 101, refused.stdout + refused.stderr)
+        self.assertIn("no matching package named `chrono` found", refused.stderr)
+        self.assertEqual(refused.stdout, "")
+        self.assertFalse((root / CONSTRUCTED).exists())
+
+    def test_construction_puts_each_seed_dylib_path_first_for_the_targo_it_runs(self):
+        # macOS drops dyld's variables at the launch of a system-protected program, /bin/sh
+        # included, so the Targo that reports what it was given is this interpreter, through
+        # a link beside the fixture.
+        root, path, record = self.construction_fixture("construct-dylibs", "v2")
+        if any(character.isspace() for character in str(root)):
+            self.skipTest("a script's interpreter line cannot name a path with white space")
+        python = root.parent / "construct-dylibs-python"
+        python.symlink_to(Path(sys.executable).resolve())
+        probe = subprocess.run(["/usr/bin/env", "DYLD_LIBRARY_PATH=/probe", str(python), "-I", "-c",
+                                "import os; print(os.environ.get('DYLD_LIBRARY_PATH'))"],
+                               env=self.env, capture_output=True, text=True, timeout=30)
+        if probe.stdout.strip() != "/probe":
+            self.skipTest("this interpreter is launched without dyld's variables, so it cannot report them")
+        targo = Path(path.split(":", 1)[0]) / "targo"
+        targo.write_text(f"#!{python} -I\n" + f"""import os, sys
+if sys.argv[1:] == ["--unverified", "--version"]:
+    print("targo 0.0.0-fixture")
+    raise SystemExit(0)
+os.makedirs({str(record)!r}, exist_ok=True)
+open({str(record / "dyld")!r}, "w").write(os.environ.get("DYLD_LIBRARY_PATH", "<unset>"))
+out = os.path.join(os.environ["CARGO_TARGET_DIR"], "debug", "bootstrap")
+os.makedirs(os.path.dirname(out), exist_ok=True)
+os.symlink({str(self.native_bootstrap)!r}, out)
+""")
+        first, second = root.parent / "dylibs one", root.parent / "dylibs-two"
+        first.mkdir()
+        second.mkdir()
+        built = self.construct(root, path, "--targo", str(targo),
+                               "--seed-dylib-path", str(first), "--seed-dylib-path", str(second))
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertEqual((record / "dyld").read_text(), f"{first}:{second}")
+        # Without a provider the variable is not set at all, not set empty.
+        (root / CONSTRUCTED).unlink()
+        plain = self.construct(root, path, "--targo", str(targo))
+        self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
+        self.assertEqual((record / "dyld").read_text(), "<unset>")
+        colon = root.parent / "dylibs:three"  # dyld would read it as two directories
+        colon.mkdir()
+        for words, why in ((["--seed-dylib-path", "relative"], "takes an absolute directory"),
+                           (["--seed-dylib-path", str(root.parent / "absent")], "is not a directory"),
+                           (["--seed-dylib-path", str(colon)], "cannot hold a colon"),
+                           (["--seed-dylib-path"], "needs a directory")):
+            with self.subTest(words=words):
+                refused = self.construct(root, path, *words)
+                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                self.assertIn(why, refused.stderr)
+
     def python_pair(self):
         old = new = None
         for name in (sys.executable, "/usr/bin/python3", "python3.9", "python3.10",

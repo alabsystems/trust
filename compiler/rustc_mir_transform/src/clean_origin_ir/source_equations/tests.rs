@@ -14,6 +14,64 @@ struct Fixture {
     report: TvMintReport,
 }
 
+#[test]
+fn claim_free_stripping_removes_instruction_channels_without_changing_computation() {
+    use trust_ir::proof::ProofContext;
+    use trust_ir::{Inst, ProofAnnotation, ProofId, Ty};
+
+    for has_foreign_ids in [false, true] {
+        let mut builder = trust_ir_build::ModuleBuilder::new("instruction-proof-stripping");
+        let signature = builder.add_func_type(vec![Ty::U64], vec![Ty::U64]);
+        let mut function = builder.function("callee", signature);
+        let entry = function.create_block();
+        let argument = function.add_block_param(entry, Ty::U64);
+        function.switch_to_block(entry);
+        function.ret(vec![argument]);
+        function.build();
+        let mut function = builder.function("caller", signature);
+        let entry = function.create_block();
+        let argument = function.add_block_param(entry, Ty::U64);
+        function.switch_to_block(entry);
+        let result = function.call(FuncId::new(0), vec![argument]);
+        function.ret(vec![result]);
+        function.build();
+        let mut module = builder.build().expect("typed two-function computational fixture");
+        let call = module.functions[1].blocks[0]
+            .body
+            .iter_mut()
+            .find(|node| matches!(node.inst, Inst::Call { .. }))
+            .unwrap();
+        call.proofs.push(ProofAnnotation::Pure);
+        call.proof_context = Some(if has_foreign_ids {
+            ProofContext { assumes: vec![ProofId::new(0)], establishes: vec![ProofId::new(0)] }
+        } else {
+            ProofContext::default()
+        });
+        let computation = |subject: &Module| {
+            subject
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.body)
+                .map(|node| (node.inst.clone(), node.results.clone()))
+                .collect::<Vec<_>>()
+        };
+        let before = computation(&module);
+        // These synthetic annotations are DATA, never replay evidence. The
+        // actual collector still validates and rechecks before stripping.
+        strip_for_general(&mut module).expect("stripped computational module validates");
+        assert_eq!(computation(&module), before);
+        assert!(module.functions.iter().all(|function| {
+            function.body_gate == Some(BodyGate::Ungated)
+                && function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.body)
+                    .all(|node| node.proofs.is_empty() && node.proof_context.is_none())
+        }));
+    }
+}
+
 fn compile(source: &str, names: &[&str]) -> Fixture {
     let mut environment = Environment::with_prelude();
     environment.init_io_ops().expect("initialize the actual Clean prelude");

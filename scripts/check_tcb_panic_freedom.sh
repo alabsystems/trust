@@ -58,6 +58,8 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # Copyright 2026 Andrew Yates | License: Apache 2.0
 set -euo pipefail
+# Frame lengths and UTF-8 scalar widths below are byte counts on every awk.
+export LC_ALL=C
 
 REPO_ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$REPO_ROOT"
@@ -100,6 +102,33 @@ BEGIN { st = 0; bdepth = 0; rhash = 0; in_test = 0; depth = 0; pend = 0
         gdepth = 0; nmods = 0; pathattr = ""
         CFG_TEST = "#\\[cfg\\(test\\)\\]|#\\[cfg\\(all\\([^)]*test[^)]*\\)\\)\\]" }
 # st: 0 = code, 1 = block comment, 2 = string, 3 = raw string
+function continuation(s, p) { return substr(s, p, 1) ~ /^[\200-\277]$/ }
+function char_close(s, at,   p, a, b, width) {
+  p = at + 1; a = substr(s, p, 1); b = substr(s, p + 1, 1); width = 0
+  if (a !~ /[\200-\377]/) width = 1
+  else if (a ~ /[\302-\337]/ && continuation(s, p + 1)) width = 2
+  else if (((a == "\340" && b ~ /[\240-\277]/) ||
+            (a ~ /[\341-\354\356-\357]/ && continuation(s, p + 1)) ||
+            (a == "\355" && b ~ /[\200-\237]/)) &&
+           continuation(s, p + 2)) width = 3
+  else if (((a == "\360" && b ~ /[\220-\277]/) ||
+            (a ~ /[\361-\363]/ && continuation(s, p + 1)) ||
+            (a == "\364" && b ~ /[\200-\217]/)) &&
+           continuation(s, p + 2) && continuation(s, p + 3)) width = 4
+  if (width && substr(s, p + width, 1) == "'") return p + width
+  return 0
+}
+function rewrite_self_expect(s,   out, at, consumed) {
+  out = ""
+  while (match(s, /(^|[^A-Za-z0-9_$#\200-\377])self\.(r#)?expect\(/)) {
+    at = RSTART
+    consumed = RLENGTH
+    if (substr(s, at, 1) != "s") { at++; consumed-- } # preserve the boundary
+    out = out substr(s, 1, at - 1) "self.<inherent-expect>("
+    s = substr(s, at + consumed)
+  }
+  return out s
+}
 function erase(s,   out, i, n, c, d, h, j) {
   out = ""; i = 1; n = length(s)
   while (i <= n) {
@@ -139,11 +168,12 @@ function erase(s,   out, i, n, c, d, h, j) {
     }
     if (c == "'") {
       if (d == "'\\") {                  # escaped char literal: run to its close
-        j = i + 2
+        j = i + 3                       # the escaped value may itself be a quote
         while (j <= n && substr(s, j, 1) != "'") j++
         out = out "''"; i = j + 1; continue
       }
-      if (substr(s, i + 2, 1) == "'") { out = out "''"; i += 3; continue }
+      j = char_close(s, i)
+      if (j) { out = out "''"; i = j + 1; continue }
       out = out c; i++; continue         # otherwise a lifetime
     }
     out = out c; i++
@@ -229,7 +259,8 @@ function note_decls(raw, line, is_test,   m, o, c) {
     if (line ~ /;/) { pend = 0; next }
     next
   }
-  print FILENAME ":" FNR ":" line
+  if (INHERENT) line = rewrite_self_expect(line)
+  print length(FILENAME) ":" FILENAME ":" FNR ":" line
 }
 AWK
 
@@ -250,7 +281,9 @@ tcb_files() {
   fi
 }
 
-# One lexing pass over the whole TCB, cached as `<path>:<line>:<code>` lines.
+# One lexing pass over the whole TCB. RAW length-prefixes each path so a colon
+# in a filename cannot be confused with a metadata delimiter; STREAM drops the
+# length prefix and retains the displayed `<path>:<line>:<code>` format.
 # Every count below is a grep over this stream, so adding a breakdown is free —
 # and `--list` is that same grep, printed instead of counted.
 STREAM="$(mktemp "${TMPDIR:-/tmp}/tcb-panic-stream.XXXXXX")"
@@ -274,20 +307,13 @@ trap 'rm -f "$STREAM" "$RAW" "$DECLS" "$FILES" "$ALL_FILES" "$TEST_ONLY"' EXIT
 # The rewrite below is deliberately visible in `--list` rather than silent, so a
 # reader sees WHY a call was not counted instead of wondering where it went.
 #
-# IT IS RECEIVER-SCOPED (`self.expect(`), NOT FILE-SCOPED, ON PURPOSE. A
-# file-scoped exclusion would hide a genuine `Option::expect` sitting in the same
-# parser file, which is exactly the hole this gate exists to catch. The cost is
-# that a call to the inherent method through some OTHER binding is still counted
-# — an over-count, which is the safe direction, and there are zero such calls
-# today (all 32 are `self.`).
-#
-# MUTATION-PROVED 2026-09-21, four plants against a 250 base, each restored:
-#   Option::expect in a file with no inherent method      250 -> 251  (counted)
-#   a `self.`-receiver expect in that same file           251 -> 252  (counted)
-#   the inherent method reached through a binding         250 -> 251  (counted)
-#   a REAL Option::expect inside spec_parse.rs            251 -> 252  (counted)
-# So the exclusion fires only where method resolution says it must, and the
-# counter still detects every real panic site including in the excluded files.
+# The existing parser heuristic masks only an unambiguous literal `self` token
+# in a file with an inherent declaration. Identifier suffixes (other_self,
+# myself, Unicode names) and macro receivers stay counted. A call to a local
+# method through another binding is therefore conservatively counted too.
+# This is a file-qualified lexical heuristic, not Rust type or method resolution.
+# scripts/tests/check_tcb_panic_freedom_test.sh checks literal-self calls mixed
+# with Option receivers and macro receivers, including multiple calls per line.
 inherent_expect_file() {
   grep -qE '^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?fn expect\(&(mut )?self' "$1"
 }
@@ -414,7 +440,7 @@ build_stream() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     if inherent_expect_file "$f"; then
-      awk -v DECLS="$DECLS" "$LEX_AWK" "$f" | sed 's/self\.expect(/self.<inherent-expect>(/g' >> "$RAW"
+      awk -v DECLS="$DECLS" -v INHERENT=1 "$LEX_AWK" "$f" >> "$RAW"
     else
       awk -v DECLS="$DECLS" "$LEX_AWK" "$f" >> "$RAW"
     fi
@@ -427,7 +453,12 @@ build_stream() {
       while ((getline l < SKIP) > 0) skip[l] = 1
       while ((getline l < FILES) > 0) candidate[l] = 1
     }
-    { p = $0; sub(/:.*/, "", p); if ((p in candidate) && !(p in skip)) print }
+    {
+      start = index($0, ":") + 1
+      size = substr($0, 1, start - 2) + 0
+      p = substr($0, start, size)
+      if ((p in candidate) && !(p in skip)) print substr($0, start)
+    }
   ' "$RAW" > "$STREAM"
 }
 
@@ -438,19 +469,21 @@ print_test_only() {
   [ -s "$TEST_ONLY" ] || return 0
   echo "Not counted, every resolved \`mod\` declaration has test-only ancestry (construct lines in the file):"
   while IFS= read -r f; do
-    n=$(awk -v f="$f" 'index($0, f ":") == 1' "$RAW" | grep -cE "$RE_ANY" || true)
+    n=$(awk -v f="$f" 'index($0, length(f) ":" f ":") == 1' "$RAW" | grep -cE "$RE_ANY" || true)
     printf "  %-66s %s\n" "$f" "$n"
   done < "$TEST_ONLY"
 }
 
 # The panicking-construct patterns. `.unwrap()` is the exact zero-arg method;
-# `.expect(` is the method form (avoids matching e.g. `expect(` free fns);
-# the macro forms are guarded by a non-identifier left boundary so we do not
+# `.expect(` is the method form (avoids matching e.g. `expect(` free fns).
+# The optional raw-identifier prefix names the same compact method spelling;
+# accepting it adds no Rust type or method-resolution judgment.
+# The macro forms are guarded by a non-identifier left boundary so we do not
 # match `my_unreachable!` or words inside identifiers. The `<path>:` prefix on
 # every stream line is itself a non-identifier boundary, so a construct at
 # column 0 still matches.
-RE_UNWRAP='\.unwrap\(\)'
-RE_EXPECT='\.expect\('
+RE_UNWRAP='\.(r#)?unwrap\(\)'
+RE_EXPECT='\.(r#)?expect\('
 RE_PANIC='(^|[^A-Za-z0-9_])panic!'
 RE_UNREACHABLE='(^|[^A-Za-z0-9_])unreachable!'
 RE_UNIMPLEMENTED='(^|[^A-Za-z0-9_])unimplemented!'

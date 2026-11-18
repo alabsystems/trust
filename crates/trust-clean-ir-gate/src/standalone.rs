@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use clean_kernel::{BinderInfo, Expr, Name};
-use trust_certify::lean_source_batch::AcceptedLeanSourceContext;
+use trust_certify::lean_source_batch::{AcceptedLeanSourceContext, AcceptedSourceContextCustody};
 use trust_clean_carrier::CarrierSignature;
 use trust_clean_origin::emit::{
     StandaloneScalarPlan, StandaloneScalarShape, plan_clean_origin_body_for_name,
@@ -193,6 +193,7 @@ impl StandaloneLeanIdentity {
 /// ```
 #[derive(Debug)]
 pub struct StandaloneTrustIrFaithful {
+    context_custody: AcceptedSourceContextCustody,
     faithful: Faithful,
     identity: StandaloneLeanIdentity,
     subject_digest: ProofDigest,
@@ -203,6 +204,7 @@ pub struct StandaloneTrustIrFaithful {
 /// Exact post-relocation function identity, still an in-memory bounded verdict.
 #[derive(Debug)]
 pub struct PublishedStandaloneTrustIrFaithful {
+    context_custody: AcceptedSourceContextCustody,
     // Exact custody retained at the existing kernel mint, never reconstructed from a receipt.
     signature: FuncTy,
     function: Function,
@@ -226,6 +228,12 @@ impl StandaloneTrustIrFaithful {
             return Err(GateRefusal::new(
                 "standalone-source-identity",
                 "accepted source/module closure, declaration, or kernel payload changed",
+            ));
+        }
+        if !self.context_custody.same_context(context.custody()) {
+            return Err(GateRefusal::new(
+                "standalone-source-context",
+                "kernel permission belongs to a different accepted source context",
             ));
         }
         if self.faithful.declaration() != declaration
@@ -279,6 +287,7 @@ impl StandaloneTrustIrFaithful {
             return Err(GateRefusal::new("published-carrier", "published carrier changed"));
         }
         Ok(PublishedStandaloneTrustIrFaithful {
+            context_custody: self.context_custody.clone(),
             signature: signature.clone(),
             function: published.clone(),
             identity: self.identity.clone(),
@@ -316,7 +325,9 @@ impl PublishedStandaloneTrustIrFaithful {
         &self,
         context: &AcceptedLeanSourceContext<'_>,
     ) -> Result<(), GateRefusal> {
-        if capture_identity(context, &self.identity.declaration)? != self.identity {
+        if capture_identity(context, &self.identity.declaration)? != self.identity
+            || !self.context_custody.same_context(context.custody())
+        {
             return Err(GateRefusal::new(
                 "standalone-codegen-context",
                 "standalone publication belongs to a different accepted source/kernel context",
@@ -548,6 +559,7 @@ fn finish_standalone(
         ));
     }
     Ok(StandaloneTrustIrFaithful {
+        context_custody: context.custody().clone(),
         faithful,
         subject_digest: subject_digest(shape, &identity, signature, function)?,
         identity,

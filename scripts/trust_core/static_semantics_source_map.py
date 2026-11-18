@@ -122,6 +122,7 @@ DESCRIPTIVE = ("definition", "dynamic-behavior", "elaboration", "layout", "codeg
 ACKNOWLEDGING = ("run-time-requirement", "const-evaluation", "lint-level", "link-time", "external-tool", "no-rejection", "consequence")
 DISPOSITION_KINDS = DESCRIPTIVE + ACKNOWLEDGING + ("restated",)
 NOTE_KINDS = ("divergence", "model-incomplete", "model-formulation", "not-static-semantics", "test-infrastructure", "unverified")
+NOTE_ID = re.compile(r"FN-[A-Z0-9]+(?:-[A-Z0-9]+)*-[1-9][0-9]*")
 RANK1_CORPORA = ("fls", "reference", "rfcs", "std")
 SEARCH_CORPORA = ("fls", "reference", "rfcs", "std", "a-mir-formality", "decisions")
 VERDICTS = ("documents", "contrary", "open", "silent", "unrelated")
@@ -142,7 +143,7 @@ TABLES = {kind: (keys.split()[0], set(keys.split())) for kind, keys in {
     "grammar_side_condition_dismissal": "id kind reason reference",
     "outside_st_static_candidate": "id kind reason fls reference std restates",
     "twin": "id note fls reference std",
-    "formality_test_note": "ref quote kind reason",
+    "formality_test_note": "id ref quote kind reason",
     "pin_exception": "source default_branch default_branch_state state_committer_date successor successor_committer_date "
                      "merged_into_default_branch_by merged_at commits_after_state snapshot decision historical_at",
     "snapshot": "file kind url retrieved sha256",
@@ -1366,17 +1367,26 @@ class Checker:
             if key not in twin_of:
                 self.add("DISPOSE", f"{key[0]} {key[1]} is dispositioned {self.kind_of[key]} and is in no twin group")
 
-        self.note_kinds, seen = collections.Counter(), set()
-        for ref, note in self.t["formality_test_note"].items():
-            at = self.cite("CITE", f"formality_test_note {ref}", note, kinds={"a-mir-formality"})
+        self.note_kinds, seen = collections.Counter(), {}
+        for nid, note in self.t["formality_test_note"].items():
+            where = f"formality_test_note {nid}"
+            if not NOTE_ID.fullmatch(nid):
+                self.add("TABLE", f"{where}: expected a stable FN-<FILE-STEM>-<N> id")
+            at = self.cite("CITE", where, note, kinds={"a-mir-formality"})
             key = (at[1], at[2]) if at else None
             self.note_kinds[note.get("kind")] += 1
-            seen.add(key)
+            if at:
+                if at[2] != at[3]:
+                    self.add("CITE", f"{where}: cite one source line, got {note['ref']}")
+                if key in seen:
+                    self.add("DISPOSE", f"{where}: {key[0]}:{key[1]} is already cited by {seen[key]}")
+                else:
+                    seen[key] = nid
             if note.get("kind") not in NOTE_KINDS or not note.get("reason") or key not in self.notes:
-                self.add("DISPOSE", f"formality_test_note {ref}: a kind of {NOTE_KINDS} with a reason, on a line the note predicate selects")
+                self.add("DISPOSE", f"{where}: a kind of {NOTE_KINDS} with a reason, on a line the note predicate selects")
             if (note.get("kind") == "divergence") != bool(self.formality_evidence.get(key)):
-                self.add("DISPOSE", f"formality_test_note {ref}: a divergence is exactly a note cited as formality-rustc evidence")
-        for key in sorted(set(self.notes) - seen):
+                self.add("DISPOSE", f"{where}: a divergence is exactly a note cited as formality-rustc evidence")
+        for key in sorted(set(self.notes) - seen.keys()):
             self.add("DISPOSE", f"a-mir-formality note {key[0]}:{key[1]} {self.notes[key]!r} has no formality_test_note")
         for key, rids in self.formality_evidence.items():
             if key[0].startswith("tests/") and key not in self.notes:

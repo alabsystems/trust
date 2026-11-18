@@ -17,6 +17,8 @@ mod data;
 pub use data::HeldRootFile;
 mod directory;
 mod publication;
+mod execution;
+pub use execution::HeldProducedExecution;
 pub use directory::HeldRootDirectory;
 pub use publication::PublicationExclusions;
 

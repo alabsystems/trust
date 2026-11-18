@@ -37,3 +37,9 @@
 # repo's local git config, set up by ./scripts/bootstrap.sh).
 [net]
 git-fetch-with-cli = true
+
+[env]
+# The native_wp_body target imports trust-wp's bounded recursive controls.
+# Match that workspace's debug-test stack default; nested Cargo configuration
+# is not inherited here. Preserve an explicit caller's runtime stack setting.
+RUST_MIN_STACK = { value = "16777216", force = false }

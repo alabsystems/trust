@@ -1,7 +1,7 @@
 """Resolve syn type JSON to translator types under the monomorphization config."""
 
 from common import *
-from items import to_ty
+from items import to_ty, type_param_decls
 
 INT_NAMES = {'Int', 'u8', 'u16', 'u32', 'u64', 'u128', 'i8', 'i16', 'i32', 'i64', 'i128', 'usize', 'isize'}
 
@@ -21,7 +21,7 @@ def resolve(prog, j, generics, self_owner=None):
     if k != 'path':
         raise Refusal('type-syntax', k)
     if v.get('qself'):
-        raise Refusal('qualified-self-type', str(v)[:80])
+        return qualified_assoc_type(prog, v, generics, self_owner)
     segs = v['segments']
     ids = [s['ident'] for s in segs]
     last = segs[-1]
@@ -32,6 +32,7 @@ def resolve(prog, j, generics, self_owner=None):
         head, tail = ids[:-1], ids[-1]
         # associated types: M::Provenance, Self::Provenance, M::T ...
         if len(ids) == 2 and (ids[0] in generics or ids[0] == 'Self') and tail in cfg['assoc_type']:
+            configured_assoc_type(prog, ids[0], tail, generics, self_owner)
             return to_ty(cfg['assoc_type'][tail])
         if ids in (['libspecr', 'Name'],):
             return NAME
@@ -48,7 +49,7 @@ def resolve(prog, j, generics, self_owner=None):
             a = args()
             return ('result', a[1], a[0])
         if ids[:-1] in (['crate', 'lang'], ['crate', 'mem'], ['lang'], ['mem']) and tail in prog.adts:
-            return adt(tail)
+            return adt_ref(prog, tail, last, generics, self_owner)
         raise Refusal('type-path', '::'.join(ids))
 
     n = ids[0]
@@ -99,18 +100,102 @@ def resolve(prog, j, generics, self_owner=None):
         return b[2]
     if n in prog.aliases:
         params, body, _ = prog.aliases[n]
-        a = args()
         sub = dict(generics)
-        for i, p in enumerate(params):
-            if i < len(a):
-                sub[p] = ('param', p, a[i])
-            else:
-                # defaulted alias parameter; aliases with defaults are Result/NdResult (handled above)
-                raise Refusal('alias-default-parameter', f'{n}<{p}>')
+        for p, t in zip(params, fill_type_args(prog, f'type alias {n}', params, args(), generics, self_owner)):
+            sub[p[0]] = ('param', p[0], t)
         return resolve(prog, body, sub, self_owner)
     if n in prog.adts:
-        return adt(n)
+        return adt_ref(prog, n, last, generics, self_owner)
     raise Refusal('unknown-type', n)
+
+
+def fill_type_args(prog, what, params, given, generics, self_owner):
+    """`given` (resolved) followed by the declared default of every parameter it leaves out, each
+    default resolved with the earlier parameters bound to their arguments (Rust's rule:
+    `struct S<A, B = A>` makes `S<X>` mean `S<X, X>`). A missing argument with no default and a
+    surplus argument are refused."""
+    if len(given) > len(params):
+        raise Refusal('type-argument-count', f'{what} takes {len(params)}, given {len(given)}')
+    filled = list(given)
+    sub = dict(generics)
+    for i, (p, default) in enumerate(params):
+        if i >= len(filled):
+            if default is None:
+                raise Refusal('missing-type-argument', f'{what}: <{p}> has no default')
+            filled.append(resolve(prog, default, sub, self_owner))
+        sub[p] = ('param', p, filled[i])
+    return filled
+
+
+def adt_ref(prog, n, seg, generics, self_owner):
+    """A reference to the spec ADT `n` with the type arguments of the path segment `seg`.
+
+    The translator emits one monomorphic `MR_<n>`: the ADT at its configured instance, each
+    parameter bound by the monomorphization (`items.Program.bind_generic`). A reference whose
+    arguments, with declared defaults filled, are another instance would be emitted as that one,
+    so it is refused (`BasicMemory<T, Path, TreeBorrowsAllocationExtra>` against
+    `BasicMemory<x86_64, (), ()>`)."""
+    a = prog.adts[n]
+    raw = getattr(a, 'raw', None)
+    gj = (raw.get('generics') if raw else None) or {}
+    for p in gj.get('params', []):
+        pk, _ = one_key(p)
+        if pk != 'type':
+            raise Refusal('adt-non-type-parameter', f'{n}: {pk}')
+    params = type_param_decls(gj)
+    given = [resolve(prog, x, generics, self_owner) for x in path_generic_args(seg)]
+    inst = prog.generic_params(gj) if raw else {}
+    want = []
+    for p, _ in params:
+        b = inst[p]
+        if b[0] == 'refused':
+            raise Refusal('adt-instance-not-configured', f'{n}<{p}>: bounds {b[2]} are not monomorphized')
+        want.append(b[2])
+    # the defaults are resolved in the ADT's own scope: its parameters, not the referencing item's
+    filled = fill_type_args(prog, n, params, given, inst, n)
+    if filled != want:
+        raise Refusal('adt-instance-not-configured',
+                      f'{n}<{", ".join(show_ty(t) for t in filled)}> is not the configured '
+                      f'{n}<{", ".join(show_ty(t) for t in want)}>')
+    return adt(n)
+
+
+def qualified_assoc_type(prog, v, generics, self_owner):
+    """`<G as Trait>::X`, an associated type named through its trait: the configured impl's type,
+    under configured_assoc_type's rule for `G::X`, and only when `Trait` is a trait `G` is bound to
+    there. Every other qualified-self type is refused."""
+    q, segs = v['qself'], v['segments']
+    qk, qv = one_key(q['ty'])
+    simple = (qk == 'path' and not qv.get('qself') and len(qv['segments']) == 1
+              and not qv['segments'][0].get('arguments') and q.get('position') == 1 and len(segs) == 2
+              and not any(sg.get('arguments') for sg in segs))
+    cfg = prog.config['monomorphization']
+    if simple:
+        head, trait, name = qv['segments'][0]['ident'], segs[0]['ident'], segs[1]['ident']
+        if (head in generics or head == 'Self') and name in cfg['assoc_type']:
+            configured_assoc_type(prog, head, name, generics, self_owner, trait=trait)
+            return to_ty(cfg['assoc_type'][name])
+    raise Refusal('qualified-self-type', str(v)[:80])
+
+
+def configured_assoc_type(prog, head, name, generics, self_owner, trait=None):
+    """`monomorphization.assoc_type` holds the associated types of the configured impl of each
+    bound trait (`impl Memory for BasicMemory<T>`). `M::X` reads it only when `M` is bound to that
+    trait, and `Self::X` only inside an impl whose owner is that trait's configured owner; any other
+    `Self::X` (`Self::Provenance` in `impl TreeBorrowsMemory<T>`) or `M::X` names another impl's
+    type and is refused."""
+    cfg = prog.config['monomorphization']
+    if head == 'Self':
+        traits = [t for t, ty in sorted(cfg['bound'].items())
+                  if self_owner is not None and to_ty(ty) == adt(self_owner)]
+    else:
+        b = generics[head]
+        traits = [b[1]] if b[0] == 'bound' else []
+    traits = [t for t in traits if name in prog.trait_assoc_types(t) and trait in (None, t)]
+    if len(traits) != 1:
+        where = f'impl for {self_owner}' if head == 'Self' else f'{head}: {generics[head][0]}'
+        named = f'<{head} as {trait}>::{name}' if trait else f'{head}::{name}'
+        raise Refusal('associated-type-outside-configured-impl', f'{named} ({where})')
 
 
 def resolve_fn_bound(prog, bounds, generics, self_owner):

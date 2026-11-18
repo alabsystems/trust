@@ -30,14 +30,16 @@ pub mod cache_probe;
 mod resources;
 #[cfg(feature = "machine-admission")]
 pub mod status;
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+pub use resources::ExecutionStartPipe;
 #[cfg(feature = "machine-admission")]
 pub use resources::{Adoption, AdoptionError, AdoptionObservation, AdoptionOutcome, Publication};
 pub use resources::{Coordinator, Reservation};
 #[cfg(feature = "machine-admission")]
 pub use resources::{
     EarlyFixedClaim, FIXED_HANDOFF_ENV, FixedClaim, FixedCommandAdmission, FixedCommandSignal,
-    FixedCpuRequest, InheritedFixedClaim, PreparedFixedCommand, RunningFixedCommand,
-    RunningFixedGroup, WorkerEpoch, WorkerEpochAdmission,
+    FixedCpuRequest, InheritedFixedClaim, MemberDirectory, PreparedFixedCommand,
+    RunningFixedCommand, RunningFixedGroup, WorkerEpoch, WorkerEpochAdmission,
 };
 #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
 pub use resources::{PreparedNestedFixedCommand, RunningNestedFixedCommand};

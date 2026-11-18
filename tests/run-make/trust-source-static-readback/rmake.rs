@@ -396,6 +396,30 @@ fn complete(coverage: &Value) {
     assert_eq!(readback["capture_status"], "complete");
     assert!(array(&readback["errors"]).is_empty());
     assert_eq!(readback["refused_bodies"], 0);
+    let nested = source_body(coverage, "nested_backing_address", &["NESTED_BACKING"]);
+    let nested_nodes: Vec<_> = array(&nested["graph"]["nodes"]).iter()
+        .filter(|node| node["kind"] == "nested_static").collect();
+    assert_eq!(nested_nodes.len(), 1);
+    let node = nested_nodes[0];
+    assert!(node["definition"]["def_path"].as_str().unwrap().contains("nested#0"));
+    identity(&node["definition"]);
+    assert_eq!(node["declared_mutable"], true);
+    assert!(node["rust_type"].is_null());
+    assert!(node["freeze"].is_null());
+    assert_eq!(node["initializer"]["mutable"], true);
+    assert_eq!(node["initializer"]["layout"]["size_bytes"], 8);
+    assert_eq!(node["initializer"]["bytes"], serde_json::json!([17,0,0,0,0,0,0,0]));
+    let immutable = source_body(coverage, "nested_immutable_address", &["NESTED_IMMUTABLE"]);
+    let immutable_nodes: Vec<_> = array(&immutable["graph"]["nodes"]).iter()
+        .filter(|node| node["kind"] == "nested_static").collect();
+    assert_eq!(immutable_nodes.len(), 1);
+    let immutable_node = immutable_nodes[0];
+    assert_eq!(immutable_node["declared_mutable"], false);
+    assert!(immutable_node["rust_type"].is_null());
+    assert!(immutable_node["freeze"].is_null());
+    assert_eq!(immutable_node["initializer"]["mutable"], false);
+    assert_eq!(immutable_node["initializer"]["bytes"], serde_json::json!([29,0,0,0,0,0,0,0]));
+    assert_ne!(identity(&node["definition"]), identity(&immutable_node["definition"]));
     let helper = source_body(coverage, "infer_literal_type", &["FIRST", "SECOND"]);
     source_body(coverage, "first_address", &["FIRST"]);
     source_body(coverage, "first_address_again", &["FIRST"]);

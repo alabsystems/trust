@@ -1,4 +1,5 @@
-//! Fresh normal compiler capture of the actual RSS-ceiling budget helper.
+//! Archived normal compiler capture of the actual RSS-ceiling budget helper.
+//! Current untrusted envelopes are derived without changing the captured bytes.
 //!
 //! Source d1505e831fd7faa7e3de3fba51c9c418dacac3dd; compiler and same-directory
 //! trust frontend/daemon from 5751de080bb3f83056200c7433d135790204c5f0, compiler
@@ -41,7 +42,7 @@ fn capture() -> (TrustContractBundle, Vec<TrustObligation>, NativeVerificationBu
     }
     let public: TrustContractBundle = serde_json::from_str(PUBLIC).unwrap();
     let all: Vec<TrustObligation> = serde_json::from_str(REQUESTED).unwrap();
-    let native: NativeVerificationBundle = serde_json::from_str(NATIVE).unwrap();
+    let native = derived_current_native_input(NATIVE);
     native.validate().unwrap();
     assert_eq!(public.obligations.len(), 7);
     assert_eq!(all.len(), 7);

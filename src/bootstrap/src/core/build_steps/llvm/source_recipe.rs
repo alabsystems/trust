@@ -275,13 +275,16 @@ impl OwnSourceGeneration {
         }
         namespace.recheck()
     }
+    /// Begins a miss of `stamp` under every guard a mutation of the output takes. Returns
+    /// whether the CMake build of this generation, configured at this root, was kept
+    /// ([`begin_cmake_miss`]); otherwise the root was begun afresh.
     pub(super) fn begin(
         &self,
         stamp: &BuildStamp,
         prepared: &cmake::Prepared,
         generation: CmakeGeneration,
         additional_inputs: &[PathBuf],
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         use crate::utils::trust_repo_cache::cleanup_input_namespaces;
         if generation == CmakeGeneration::Known
             && (self.observed.is_none()

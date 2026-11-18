@@ -44,6 +44,7 @@ const CPU_MAGIC: &[u8; 8] = b"TCPULEA1";
 const CPU_BUNDLE_MAGIC: &[u8; 8] = b"TCPUBND2";
 const MAX_CPU_FILES: usize = 128;
 const FIXED_CLAIM_MAGIC: &[u8; 8] = b"TFIXCLM1";
+const FIXED_OUTPUT_MAGIC: &[u8; 8] = b"TFIXOUT2";
 // Complete original fixed claim: 65536 slots, worktree, admission and packet.
 // Each actual SCM message stays within the existing 128-rights transport bound.
 const MAX_FIXED_FILES: usize = 65_539;
@@ -56,6 +57,7 @@ enum Role {
     CpuLease,
     CpuBundle,
     FixedClaim,
+    FixedOutput,
 }
 
 impl Role {
@@ -64,6 +66,7 @@ impl Role {
             Self::CpuBundle => "cpu2",
             Self::NamedFifo => "fifo1",
             Self::FixedClaim => "fixed1",
+            Self::FixedOutput => "fixed2",
             _ => "v1",
         }
     }
@@ -74,13 +77,14 @@ impl Role {
             Self::CpuLease => CPU_MAGIC,
             Self::CpuBundle => CPU_BUNDLE_MAGIC,
             Self::FixedClaim => FIXED_CLAIM_MAGIC,
+            Self::FixedOutput => FIXED_OUTPUT_MAGIC,
         }
     }
     fn environment(self) -> &'static str {
         match self {
             Self::Jobserver | Self::NamedFifo => ENV,
             Self::CpuLease | Self::CpuBundle => super::CPU_HANDOFF_ENV,
-            Self::FixedClaim => super::FIXED_CLAIM_HANDOFF_ENV,
+            Self::FixedClaim | Self::FixedOutput => super::FIXED_CLAIM_HANDOFF_ENV,
         }
     }
 }
@@ -375,6 +379,8 @@ impl Advertisement {
                 pair[0] < 1 || pair[0] as usize > MAX_CPU_FILES || pair[1] != 0
             } else if matches!(role, Role::FixedClaim) {
                 pair[0] < 2 || pair[0] as usize > MAX_FIXED_FILES || pair[1] != 0
+            } else if matches!(role, Role::FixedOutput) {
+                pair[0] < 4 || pair[0] as usize > MAX_FIXED_FILES + 2 || pair[1] != 0
             } else {
                 pair[0] <= 2 || pair[1] <= 2 || pair[0] == pair[1]
             }
@@ -390,6 +396,8 @@ impl Advertisement {
 struct Directory {
     path: PathBuf,
     file: std::fs::File,
+    /// The marker, held open and locked while the folder lives.
+    marker: Option<std::fs::File>,
 }
 
 // Trust (RL-64): removing an endpoint's folder cannot depend on a destructor.
@@ -440,6 +448,17 @@ const EXIT_LOCK_ATTEMPTS: usize = 50;
 // owner's kernel reports them. A sweep removes a folder only when the marker
 // holds the sweeper's own three values. A process that cannot read its
 // kernel's identity makes no marker and sweeps nothing.
+//
+// Two kernels can report one identity (virtual machines resumed from one
+// snapshot) and an NFS client gives every client of an export the same device
+// and inode numbers, so the record alone can take another client's live owner
+// for this kernel's. The owner therefore also holds an exclusive flock on the
+// marker, a regular file, for as long as the folder lives, and a sweep leaves a
+// folder whose marker refuses it a shared lock. Linux's NFS client takes flock
+// on a regular file as a lock of the server's (unless mounted
+// `local_lock=flock` or `all`), which every client sees. A file system that
+// refuses the request itself leaves the folder's lock and the record to
+// decide, as before.
 //
 // Processes built at different times meet over this lock, so it names its
 // system call: std's `File::try_lock` is flock today by a choice std may change.
@@ -498,7 +517,7 @@ pub fn remove_endpoint_directories() {
             // SAFETY: an entry is listed only while its `Directory` holds this
             // descriptor open (see `LiveDirectory::descriptor`), and a
             // `Directory` that was leaked or parked never closes it.
-            remove_owned(unsafe { BorrowedFd::borrow_raw(entry.descriptor) }, &entry.path);
+            remove_owned(unsafe { BorrowedFd::borrow_raw(entry.descriptor) }, &entry.path, None);
         }
     }
 }
@@ -509,9 +528,11 @@ extern "C" fn remove_endpoint_directories_at_exit() {
 }
 
 /// Remove the socket, the marker and then the folder, the first two named
-/// through the folder's own descriptor. Running it again for a folder that is
-/// already gone does nothing.
-fn remove_owned(directory: BorrowedFd<'_>, path: &std::path::Path) {
+/// through the folder's own descriptor. `marker`, the owner's open marker, is
+/// closed straight before the marker's unlink: an NFS client would rename a
+/// marker still open instead of removing it. Running it again for a folder
+/// that is already gone does nothing.
+fn remove_owned(directory: BorrowedFd<'_>, path: &std::path::Path, marker: Option<std::fs::File>) {
     // SAFETY: remove only the socket entry in the directory we own, even
     // when its advertised pathname was replaced or redirected by a peer.
     unsafe {
@@ -530,6 +551,7 @@ fn remove_owned(directory: BorrowedFd<'_>, path: &std::path::Path) {
     // process killed after the socket's unlink and before this one leaves a
     // folder a later sweep still recognises; one killed after this call leaves
     // an empty folder nothing recognises, a window of one system call.
+    drop(marker);
     // SAFETY: as for the socket: only the entry in the directory we own.
     unsafe {
         libc::unlinkat(directory.as_raw_fd(), LIVE_MARKER.as_ptr(), 0);
@@ -538,7 +560,20 @@ fn remove_owned(directory: BorrowedFd<'_>, path: &std::path::Path) {
         // rmdir does not follow a final symlink and cannot delete a
         // nonempty substituted directory. The removals above never
         // traverse this mutable pathname.
-        let _ = std::fs::remove_dir(path);
+        if let Err(error) = std::fs::remove_dir(path)
+            && error.raw_os_error() == Some(libc::ENOTEMPTY)
+        {
+            // Trust (RL-65): an entry this remover did not make keeps the
+            // folder. On an NFS client the socket's unlink is such an entry
+            // while the socket is still bound, as it is when an owner's exit
+            // handler runs: the client renames it to `.nfs…` and removes that
+            // only once the socket is closed. The lock is still held through
+            // `directory`, so the marker made again here names it, and a
+            // later sweep removes the folder once that entry has gone, where
+            // without the marker nothing would ever recognise it.
+            // Made for a later sweep, so not held: its lock goes here.
+            drop(mark_live(&file));
+        }
     }
 }
 
@@ -621,13 +656,15 @@ fn liveness_record(kernel: &[u8], device: u64, inode: u64) -> Vec<u8> {
 }
 
 /// Take the liveness lock on a new folder and, once this filesystem is shown
-/// to enforce it, make the marker that says where the lock lives. When any
-/// step fails, or this kernel's identity cannot be read, there is no marker:
-/// the endpoint works as it did before and its folder is never swept.
-fn mark_live(directory: &std::fs::File) {
-    let Some(kernel) = kernel_identity() else { return };
+/// to enforce it, make the marker that says where the lock lives, and lock the
+/// marker too. The marker's descriptor is returned: its lock lasts while it is
+/// open. When any step fails, or this kernel's identity cannot be read, there
+/// is no marker: the endpoint works as it did before and its folder is never
+/// swept.
+fn mark_live(directory: &std::fs::File) -> Option<std::fs::File> {
+    let kernel = kernel_identity()?;
     if !matches!(try_liveness_lock(directory.as_fd()), Ok(true)) {
-        return;
+        return None;
     }
     // The proof: a second description of the same folder must be refused, as
     // a sweeper's will be. A filesystem that has no flock, or grants it twice,
@@ -642,31 +679,37 @@ fn mark_live(directory: &std::fs::File) {
         )
     };
     if second < 0 {
-        return;
+        return None;
     }
     // SAFETY: the successful openat above returned this descriptor's one owner.
     let second = unsafe { OwnedFd::from_raw_fd(second) };
     if !matches!(try_liveness_lock(second.as_fd()), Ok(false)) {
-        return;
+        return None;
     }
     drop(second);
-    let Ok(folder) = directory.metadata() else { return };
+    let folder = directory.metadata().ok()?;
     let record = liveness_record(&kernel, folder.dev(), folder.ino());
     // SAFETY: the marker is made in the directory we own, by a NUL-terminated
     // name.
+    // Read and write: an NFS client refuses an exclusive flock through a
+    // descriptor that cannot write.
     let marker = unsafe {
         libc::openat(
             directory.as_raw_fd(),
             LIVE_MARKER.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600,
         )
     };
     if marker < 0 {
-        return;
+        return None;
     }
     // SAFETY: the successful openat above returned this descriptor's one owner.
     let mut marker = unsafe { std::fs::File::from_raw_fd(marker) };
+    // Before the record: a sweeper that finds the record finds the lock. A
+    // file system that refuses it leaves the folder's lock and the record to
+    // decide.
+    let _ = try_liveness_lock(marker.as_fd());
     // A marker that does not hold the whole record equals no sweeper's, so
     // one seen before this write, or left by an owner killed before it, only
     // keeps its folder.
@@ -675,7 +718,9 @@ fn mark_live(directory: &std::fs::File) {
         unsafe {
             libc::unlinkat(directory.as_raw_fd(), LIVE_MARKER.as_ptr(), 0);
         }
+        return None;
     }
+    Some(marker)
 }
 
 /// `tjs-` and sixteen lowercase hexadecimal digits, as `new_scoped_resources`
@@ -686,9 +731,13 @@ fn is_folder_name(name: &[u8]) -> bool {
         && name[4..].iter().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Whether the folder's marker is this user's regular file and holds exactly
-/// `record`.
-fn marker_holds(directory: BorrowedFd<'_>, user: libc::uid_t, record: &[u8]) -> bool {
+/// The folder's marker, opened to read, when it is this user's regular file
+/// and holds exactly `record`.
+fn marker_holding(
+    directory: BorrowedFd<'_>,
+    user: libc::uid_t,
+    record: &[u8],
+) -> Option<std::fs::File> {
     // SAFETY: the descriptor is open and the name is NUL-terminated. A final
     // symlink is not followed, and a FIFO put there is not waited on.
     let marker = unsafe {
@@ -699,18 +748,29 @@ fn marker_holds(directory: BorrowedFd<'_>, user: libc::uid_t, record: &[u8]) -> 
         )
     };
     if marker < 0 {
-        return false;
+        return None;
     }
     // SAFETY: the successful openat above returned this descriptor's one owner.
     let mut marker = unsafe { std::fs::File::from_raw_fd(marker) };
-    let Ok(metadata) = marker.metadata() else { return false };
+    let metadata = marker.metadata().ok()?;
     if !metadata.is_file() || metadata.uid() != user {
-        return false;
+        return None;
     }
     // One read, with room for one byte more than any record: a marker that is
     // shorter, longer or still being written is not this record.
     let mut bytes = [0_u8; MARKER_BYTES + 1];
-    matches!(marker.read(&mut bytes), Ok(count) if bytes[..count] == *record)
+    matches!(marker.read(&mut bytes), Ok(count) if bytes[..count] == *record).then_some(marker)
+}
+
+/// A shared flock on `file`, without waiting: `Ok(false)` when an exclusive
+/// lock of another description refuses it.
+fn try_shared_lock(file: BorrowedFd<'_>) -> io::Result<bool> {
+    // SAFETY: flock uses only the number of this borrowed, open descriptor.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(error) }
 }
 
 /// The folder at `path`, opened and locked, when it is one this user's
@@ -725,12 +785,24 @@ fn stale_folder(path: &std::path::Path, user: libc::uid_t, kernel: &[u8]) -> Opt
     // The marker must say that this kernel keeps the lock on this very
     // folder: only then does the lock below ask the owner's lock table.
     let record = liveness_record(kernel, metadata.dev(), metadata.ino());
-    if !marker_holds(directory.as_fd(), user, &record) {
-        return None;
-    }
+    let marker = marker_holding(directory.as_fd(), user, &record)?;
     // Last, and only for a marked folder: a folder still being made has no
     // marker yet, so this lock never meets its owner's first attempt.
-    matches!(try_liveness_lock(directory.as_fd()), Ok(true)).then_some(directory)
+    if !matches!(try_liveness_lock(directory.as_fd()), Ok(true)) {
+        return None;
+    }
+    // Then the marker's own lock, which an owner under another kernel holds
+    // where the folder's lock is that kernel's alone. Shared, through the
+    // descriptor the record was read from: an NFS client grants a shared lock
+    // through a descriptor that only reads, and a read open, unlike a write
+    // one, does not break the read delegation the server may have given
+    // another client for the marker. A file system that refuses the request
+    // itself leaves the decision to the locks and the record above. A lock
+    // granted here goes when `marker` closes, before any removal.
+    if matches!(try_shared_lock(marker.as_fd()), Ok(false)) {
+        return None;
+    }
+    Some(directory)
 }
 
 /// Remove the marked folders in `parent` whose owners are gone. Every failure
@@ -763,7 +835,7 @@ fn sweep_stale_folders(parent: &std::path::Path, rotation: usize) {
     for name in names.iter().cycle().skip(first).take(names.len().min(SWEEP_FOLDERS)) {
         let path = parent.join(name);
         if let Some(directory) = stale_folder(&path, user, &kernel) {
-            remove_owned(directory.as_fd(), &path);
+            remove_owned(directory.as_fd(), &path, None);
         }
     }
 }
@@ -783,7 +855,7 @@ impl Directory {
             let _ = std::fs::remove_dir(&path);
             naming("open the job-server folder", &path)(error)
         })?;
-        mark_live(&file);
+        let marker = mark_live(&file);
         EXIT_HANDLER.call_once(|| {
             // SAFETY: the handler is a function of this image, which exit(3)
             // may call once. Without it, removal is left to `Drop` alone.
@@ -798,7 +870,7 @@ impl Directory {
             descriptor: file.as_raw_fd(),
             path: path.clone(),
         });
-        Ok(Self { path, file })
+        Ok(Self { path, file, marker })
     }
 }
 
@@ -809,7 +881,7 @@ impl Drop for Directory {
         // closed descriptor listed for the exit handler to use.
         let descriptor = self.file.as_raw_fd();
         live_directories().retain(|live| live.descriptor != descriptor);
-        remove_owned(self.file.as_fd(), &self.path);
+        remove_owned(self.file.as_fd(), &self.path, self.marker.take());
     }
 }
 
@@ -996,6 +1068,23 @@ impl FixedClaimHandoff {
         )?)))
     }
 
+    /// Distinct output-member generation. V1 still accepts regular fence
+    /// files only; the domain receiver must authenticate this directory/lock
+    /// pair against its Root-issued record before accepting membership.
+    pub fn new_with_output_member(packet: OwnedFd, originals: Vec<OwnedFd>) -> io::Result<Self> {
+        let mut handles = Vec::with_capacity(originals.len() + 1);
+        handles.push(packet);
+        handles.extend(originals);
+        validate_fixed_output_files(&handles)?;
+        let count = handles.len() as libc::c_int;
+        Ok(Self(Arc::new(Endpoint::new_resources(
+            Arc::new(handles),
+            [count, 0],
+            &std::env::temp_dir(),
+            Role::FixedOutput,
+        )?)))
+    }
+
     /// Routing data only. Keep this actual endpoint through descendant waits.
     pub fn advertisement(&self) -> &OsStr {
         &self.0.advertisement
@@ -1006,10 +1095,40 @@ impl FixedClaimHandoff {
 /// advertised local FD number. The domain reader must check the complete
 /// packet/file identities, original locks, fingerprint, budget and pool.
 pub fn recover_fixed_claim(advertisement: &OsStr) -> io::Result<(OwnedFd, Vec<OwnedFd>)> {
-    let ad = Advertisement::parse_role(advertisement, Role::FixedClaim)?;
-    let mut handles = recover_handles(ad, Role::FixedClaim)?.into_iter();
+    let role = if advertisement.as_bytes().split(|byte| *byte == b':').next()
+        == Some(b"fixed2".as_slice())
+    {
+        Role::FixedOutput
+    } else {
+        Role::FixedClaim
+    };
+    let ad = Advertisement::parse_role(advertisement, role)?;
+    let mut handles = recover_handles(ad, role)?.into_iter();
     let packet = handles.next().ok_or_else(|| refused("fixed handoff has no packet"))?;
     Ok((packet, handles.collect()))
+}
+
+fn validate_fixed_output_files(handles: &[OwnedFd]) -> io::Result<()> {
+    if !(4..=MAX_FIXED_FILES + 2).contains(&handles.len()) {
+        return Err(refused("fixed output-member population is invalid"));
+    }
+    validate_fixed_files(&handles[..handles.len() - 2])?;
+    validate_fence_file(&handles[handles.len() - 1])?;
+    let directory = &handles[handles.len() - 2];
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: actual owned descriptor and complete writable native stat.
+    if unsafe { libc::fstat(directory.as_raw_fd(), metadata.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful fstat initialized the metadata; geteuid observes only.
+    let (metadata, uid) = unsafe { (metadata.assume_init(), libc::geteuid()) };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || metadata.st_uid != uid
+        || metadata.st_mode & 0o077 != 0
+    {
+        return Err(refused("fixed output member is not an owned private directory"));
+    }
+    Ok(())
 }
 
 fn validate_fixed_files(handles: &[OwnedFd]) -> io::Result<()> {
@@ -1296,7 +1415,7 @@ fn serve_scoped_role(
     ensure_chain(&chain)?;
     root.ensure_unchanged()?;
     ensure_chain(&member_chain)?;
-    if matches!(role, Role::FixedClaim) {
+    if matches!(role, Role::FixedClaim | Role::FixedOutput) {
         for chunk in pipe.chunks(FIXED_FILES_PER_MESSAGE) {
             send_handles(&stream, chunk, deadline)?;
         }
@@ -1328,13 +1447,28 @@ pub(super) fn recover(advertisement: &OsStr, cargo_flags: &OsStr) -> io::Result<
     recover_role(advertisement, Role::Jobserver)
 }
 
+/// Obtain original scheduler descriptions solely from the authenticated ancestor.
+/// Unlike startup recovery, this never imports, reads or closes ambient slots.
+/// The returned rights come from the same checked owner/ancestry handshake.
+#[cfg(any(feature = "client", test))]
+pub(super) fn retain_originals(
+    advertisement: &OsStr,
+    cargo_flags: &OsStr,
+) -> io::Result<Arc<[OwnedFd; 2]>> {
+    let advertisement = Advertisement::parse(advertisement)?;
+    if cargo_flags != OsStr::new(&flags(advertisement.pair)) {
+        return Err(refused("jobserver handoff does not bind the advertised pool"));
+    }
+    recover_role(advertisement, Role::Jobserver)
+}
+
 fn recover_role(advertisement: Advertisement, role: Role) -> io::Result<Arc<[OwnedFd; 2]>> {
     let handles = recover_handles(advertisement, role)?;
     Ok(Arc::new(handles.try_into().map_err(|_| refused("handoff did not return a pair"))?))
 }
 
 fn recover_handles(advertisement: Advertisement, role: Role) -> io::Result<Vec<OwnedFd>> {
-    let count = if matches!(role, Role::CpuBundle | Role::FixedClaim) {
+    let count = if matches!(role, Role::CpuBundle | Role::FixedClaim | Role::FixedOutput) {
         advertisement.pair[0] as usize
     } else {
         2
@@ -1368,13 +1502,16 @@ fn receive_role_response(
     count: usize,
     challenge: &[u8; 32],
 ) -> io::Result<Vec<OwnedFd>> {
-    let pipe = if matches!(role, Role::FixedClaim) {
+    let pipe = if matches!(role, Role::FixedClaim | Role::FixedOutput) {
         let mut all = Vec::with_capacity(count);
         while all.len() < count {
             let expected = (count - all.len()).min(FIXED_FILES_PER_MESSAGE);
             all.extend(receive_handles(stream, deadline, role, expected)?);
         }
-        validate_fixed_files(&all)?;
+        match role {
+            Role::FixedOutput => validate_fixed_output_files(&all)?,
+            _ => validate_fixed_files(&all)?,
+        }
         all
     } else {
         receive_handles(stream, deadline, role, count)?

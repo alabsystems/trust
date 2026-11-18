@@ -272,6 +272,97 @@ class AdvertisementTests(unittest.TestCase):
                 done = self.lookup(git_dir=self.store / ".git")
                 self.assertEqual((done.returncode, done.stdout), (2, ""))
 
+    def test_a_head_row_naming_an_advertised_branch_tip_is_dropped_like_ls_remote_refs(self):
+        # Agh's `repo refs` lists the HEAD pseudoref; `git ls-remote --refs` omits it.
+        self.entries = [{"ref": "HEAD", "oid": self.commit}, *self.entries]
+        done = self.lookup(git_dir=self.store / ".git")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, self.commit + "\trefs/heads/main\n")
+        self.assertEqual(done.advertisement_refs, (("refs/heads/main", self.commit),))
+
+    def test_a_head_row_that_is_duplicated_malformed_or_names_no_branch_tip_refuses(self):
+        other = self.object("blob", b"not a branch tip\n")
+        good = {"ref": "refs/heads/main", "oid": self.commit}
+        malformed, tipless = "ambiguous or invalid remote HEAD", "remote HEAD names no advertised branch tip"
+        # Each row names the check that must refuse it: a later check refusing
+        # the same row must not stand in for a deleted earlier one.
+        rows = [([{"ref": "HEAD", "oid": self.commit}, {"ref": "HEAD", "oid": self.commit}, good], malformed),
+                ([{"ref": "HEAD", "oid": "0" * 40}, good], malformed),
+                ([{"ref": "HEAD", "oid": self.commit.upper()}, good], malformed),
+                ([{"ref": "HEAD", "oid": self.commit[:-1]}, good], malformed),
+                ([{"ref": "HEAD", "oid": None}, good], malformed),
+                ([{"ref": "HEAD", "oid": other}, good], tipless),
+                ([{"ref": "HEAD", "oid": self.commit}, {"ref": "refs/pins/" + self.commit, "oid": self.commit}], tipless),
+                ([{"ref": "HEAD", "oid": self.commit}, {"ref": "refs/tags/v1", "oid": self.commit}], tipless),
+                ([{"ref": "HEAD", "oid": self.commit}, good, {"ref": "FETCH_HEAD", "oid": self.commit}],
+                 "invalid remote ref")]
+        for entries, reason in rows:
+            with self.subTest(entries=entries):
+                self.entries = entries
+                done = self.lookup(git_dir=self.store / ".git")
+                self.assertEqual((done.returncode, done.stdout), (2, ""))
+                self.assertEqual(done.stderr, "invalid Agh refs collection: " + reason)
+
+    def test_a_peeled_field_reads_as_the_ls_remote_peeled_row(self):
+        # Agh reports an annotated tag as one row with `peeled`; ls-remote as two rows.
+        tag = self.object("tag", (f"object {self.commit}\ntype commit\ntag v1\n"
+                                  "tagger Test <t@example.invalid> 1 +0000\n\nv1\n").encode())
+        self.entries = [*self.entries, {"ref": "refs/tags/v1", "oid": tag, "peeled": self.commit}]
+        done = self.lookup(git_dir=self.store / ".git")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, self.commit + "\trefs/heads/main\n")
+        self.assertEqual(done.advertisement_refs, (("refs/heads/main", self.commit),
+                                                   ("refs/tags/v1", tag), ("refs/tags/v1^{}", self.commit)))
+
+    def test_structured_peeled_claim_never_replaces_original_tag_bytes(self):
+        other = self.object("blob", b"not a commit")
+        tag = self.object("tag", (f"object {self.commit}\ntype commit\ntag release\n"
+            "tagger Test <t@example.invalid> 1 +0000\n\nrelease\n").encode())
+        self.entries.append({"ref": "refs/tags/release", "oid": tag, "peeled": other})
+        done = rt.destination_refs("https://github.com/" + self.repository + ".git",
+            git_dir=self.store / ".git", cwd=self.store)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        rows = dict((line.split("\t")[1], line.split("\t")[0]) for line in done.stdout.splitlines())
+        self.assertEqual(rows["refs/tags/release"], self.commit)
+        self.assertNotIn(other, rows.values())
+
+    def test_a_peeled_field_cannot_supply_a_durable_ref_or_duplicate_a_peeled_row(self):
+        tag = self.object("tag", (f"object {self.commit}\ntype commit\ntag v1\n"
+                                  "tagger Test <t@example.invalid> 1 +0000\n\nv1\n").encode())
+        good = {"ref": "refs/heads/main", "oid": self.commit}
+        durable, entry, row = ("peeled objects cannot supply durable remote refs",
+                               "invalid peeled native ref entry", "ambiguous or invalid remote ref")
+        rows = [([good, {"ref": "refs/heads/tagged", "oid": tag, "peeled": self.commit}], durable),
+                ([good, {"ref": "refs/pins/" + self.commit, "oid": tag, "peeled": self.commit}], durable),
+                ([good, {"ref": "refs/tags/v1", "oid": tag, "peeled": self.commit},
+                  {"ref": "refs/tags/v1^{}", "oid": self.commit}], row),
+                ([good, {"ref": "refs/tags/v1^{}", "oid": tag, "peeled": self.commit}], entry),
+                ([good, {"ref": 1, "oid": tag, "peeled": self.commit}], entry),
+                ([good, {"ref": "refs/tags/v1", "oid": tag, "peeled": None}], row),
+                ([good, {"ref": "refs/tags/v1", "oid": tag, "peeled": "0" * 40}], row),
+                ([{"ref": "HEAD", "oid": self.commit, "peeled": self.commit}, good], "invalid remote ref")]
+        for entries, reason in rows:
+            with self.subTest(entries=entries):
+                self.entries = entries
+                done = self.lookup(git_dir=self.store / ".git")
+                self.assertEqual((done.returncode, done.stdout), (2, ""))
+                self.assertEqual(done.stderr, "invalid Agh refs collection: " + reason)
+
+    def test_a_peeled_row_outside_branches_and_pins_is_advertised_as_its_two_rows_were(self):
+        # Only refs/heads and refs/pins supply durable refs; elsewhere a peeled
+        # row stays advertisement data, exactly as separate `^{}` rows did.
+        tag = self.object("tag", (f"object {self.commit}\ntype commit\ntag x\n"
+                                  "tagger Test <t@example.invalid> 1 +0000\n\nx\n").encode())
+        for peeled in ([{"ref": "refs/preserve/x", "oid": tag, "peeled": self.commit}],
+                       [{"ref": "refs/preserve/x", "oid": tag}, {"ref": "refs/preserve/x^{}", "oid": self.commit}]):
+            with self.subTest(peeled=peeled):
+                self.entries = [{"ref": "refs/heads/main", "oid": self.commit}, *peeled]
+                done = self.lookup(git_dir=self.store / ".git")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout, self.commit + "\trefs/heads/main\n")
+                self.assertEqual(done.advertisement_refs, (("refs/heads/main", self.commit),
+                                                           ("refs/preserve/x", tag), ("refs/preserve/x^{}", self.commit)))
+
     def test_duplicate_json_fields_are_ambiguous_even_if_last_value_is_valid(self):
         text = '[{"ref":"refs/heads/main","oid":"bad","oid":' + json.dumps(self.commit) + '}]'
         with patch.object(rt, "_agh", return_value=subprocess.CompletedProcess([], 0, text, "")):

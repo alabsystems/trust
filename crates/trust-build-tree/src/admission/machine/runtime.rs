@@ -54,7 +54,7 @@ impl FixedClaim {
 }
 
 impl RuntimeFixedClaim {
-    fn new(claim: FixedClaim, pool: Pool) -> io::Result<Self> {
+    fn new(mut claim: FixedClaim, pool: Pool) -> io::Result<Self> {
         claim.check_current()?;
         if claim.reservation.exclusive {
             return Err(invalid("exclusive fixed claims cannot lend live capacity"));
@@ -78,6 +78,9 @@ impl RuntimeFixedClaim {
             server.client().release_raw()?;
         }
         let escrow = IdleTokenEscrow::new(&server, claim.budget.get() as usize - 1)?;
+        // Explicit conversion hands the SAME actual claim to this runtime
+        // owner. It is no longer an unlaunched fixed-command preparation.
+        claim.release_prelaunch_admission();
         Ok(Self {
             original_ceiling: claim.budget,
             claim: Some(claim),

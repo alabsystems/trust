@@ -850,6 +850,13 @@ impl Session {
                 self.config.set_dry_run(DryRun::SelfCheck);
                 let builder = Builder::new(self);
                 builder.execute_cli();
+                // Trust: --no-deps startup metadata cannot establish that the
+                // separate std resolver's inputs exist. Check the actual
+                // selected library graph before building a compiler or tools.
+                builder.check_selected_sources().unwrap_or_else(|error| {
+                    eprintln!("Trust source readiness refused: {error}");
+                    helpers::exit_process(2);
+                });
             }
 
             // Actual run.

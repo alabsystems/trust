@@ -2,6 +2,7 @@
 """Exercise orchestration with real temporary Git histories and fake pipeline owners."""
 import ast
 import contextlib
+import copy
 import importlib.util
 from contextlib import nullcontext
 import hashlib
@@ -15,6 +16,7 @@ import re
 import runpy
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,7 @@ import threading
 import time
 import types
 import unittest
+import zlib
 from unittest import mock
 
 
@@ -48,6 +51,12 @@ def executable(path, text="#!/bin/sh\nexit 0\n"):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     path.chmod(0o755)
+
+
+def stand_in_agh(version, answer="echo 'agh @VERSION@'; exit 0"):
+    """An Agh that answers `version` and nothing else: no test's command reaches a real one."""
+    return ("#!/bin/sh\nif [ \"$1\" = version ]; then " + answer.replace("@VERSION@", version) + "; fi\n"
+            "echo 'fixture agh: only version is answered' >&2\nexit 97\n")
 
 
 def toolchain(path):
@@ -212,16 +221,20 @@ class Owners:
     """Injection stays in tests; the CLI has no success/skip/stub override."""
     def __init__(self):
         self.calls = []
+        self.progress = {}  # step name -> the progress bound the runner gave it
         self.fail = None
         self.timeouts = {}
         self.consumer_exits = {}
         self.interrupt = None
         self.consumer_hook = None
         self.consumer_outputs = {}
+        self.consumer_terminal_results = {}
         # What the manager scripts/build-tree-manager.sh builds answers to `--protocol`.
         self.manager_answer = "trust-build-tree-manager-v2"
 
-    def __call__(self, argv, cwd, env, log, timeout=None, *, cleanup_owner=None, cancel_event=None):
+    def __call__(self, argv, cwd, env, log, timeout=None, *, cleanup_owner=None, cancel_event=None, progress=None):
+        if progress is not None:
+            self.progress[log.stem.split("-", 1)[1]] = progress
         if Path(argv[0]).name == "git":
             return stage.command(argv, cwd, env, log, cleanup_owner=cleanup_owner, cancel_event=cancel_event)
         if cancel_event is not None and cancel_event.is_set():
@@ -259,6 +272,10 @@ class Owners:
             (cwd / "bootstrap.toml").write_text("[build]\n")
         elif name == "pinned-bootstrap":
             bootstrap_sysroot(cwd / "build" / HOST / "stage2", cwd)
+        elif name == "locked-dependency-ceiling":
+            index = argv.index("_prewarm-dependencies")
+            self.assertion_ceiling = ["--ceiling-only" in argv, "--ceiling-seconds" in argv]
+            stage.atomic_json(Path(argv[index + 4]), {"seconds": 4321, "items": 1})
         elif name == "locked-dependency-prewarm":
             index = argv.index("_prewarm-dependencies")
             work, receipt = Path(argv[index + 2]), Path(argv[index + 4])
@@ -343,7 +360,12 @@ class Owners:
         log.write_text(log.read_text() + output + "\n")
         if "_owned-command" in argv:
             result_file = Path(argv[argv.index("_owned-command") + 2])
-            stage.atomic_json(result_file, {"exit_code": 0, "timed_out": False, "interrupted": False})
+            terminal = self.consumer_terminal_results.get(
+                name, {"exit_code": 0, "signal": None, "timed_out": False, "interrupted": False})
+            if isinstance(terminal, str):
+                result_file.write_text(terminal)
+            else:
+                stage.atomic_json(result_file, terminal)
         return log.read_text()
 
 
@@ -365,7 +387,9 @@ class TrainOwners(Owners):
         self.refusals = {}
         self.after = {}
 
-    def __call__(self, argv, cwd, env, log, timeout=None, *, cleanup_owner=None, cancel_event=None):
+    def __call__(self, argv, cwd, env, log, timeout=None, *, cleanup_owner=None, cancel_event=None, progress=None):
+        if progress is not None:
+            self.progress[log.stem.split("-", 1)[1]] = progress
         result = self.step(argv, cwd, env, log, timeout, cleanup_owner=cleanup_owner, cancel_event=cancel_event)
         if Path(argv[0]).name != "git" and (hook := self.after.pop(log.stem.split("-", 1)[1], None)):
             hook()
@@ -756,6 +780,8 @@ class PrewarmBoundaryTests(unittest.TestCase):
             "if sys.argv[1:] == ['-Z','unstable-options','config','get','http.proxy','--format','json']: print(json.dumps({'http':{'proxy':os.environ['CARGO_HTTP_PROXY']}})); sys.exit(0)\n" +
             "if sys.argv[1:] == ['-Z','unstable-options','config','get','build.target-dir','--format','json']: print(json.dumps({'build':{'target-dir':os.environ['CARGO_TARGET_DIR']}})); sys.exit(0)\n" +
             "assert sys.argv[1:3] == ['fetch','--locked']\n" +
+            "import time\n" +
+            f"if pathlib.Path({str(self.root / 'slow-fetch')!r}).exists(): time.sleep(0.25)\n" +
             "home=pathlib.Path(os.environ['CARGO_HOME']); archive=home/'registry/cache/archive'; extracted=home/'registry/src/extracted'\n" +
             "if '--offline' not in sys.argv:\n" +
             "    archive.parent.mkdir(parents=True,exist_ok=True); archive.write_text('locked')\n" +
@@ -830,19 +856,73 @@ class PrewarmBoundaryTests(unittest.TestCase):
         self.loader.start()
         self.addCleanup(self.loader.stop)
 
-    def cache_input(self, source, destination):
+    def cache_input(self, source, destination, *, trees=None, run=None):
+        """mint_seed_support.cargo_home_inputs's contract: the selected trees, each copy one item."""
         destination.mkdir()
         if source is not None:
-            for relative in self.mint["CARGO_HOME_INPUT_TREES"]:
+            for relative in trees or self.mint["CARGO_HOME_INPUT_TREES"]:
                 if getattr(self, "omit_handoff_archive", False) and relative == "registry/cache":
                     continue
                 if (source / relative).exists():
                     (destination / relative).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(source / relative, destination / relative)
+                    def copy(relative=relative):
+                        blocked = getattr(self, "blocked_copy", None)
+                        if blocked and blocked[0] == relative and blocked[1].wait(5):
+                            return  # released by the test after its preparation ended
+                        shutil.copytree(source / relative, destination / relative)
+                    label = f"the copy of cargo home input {relative} into {destination}"
+                    run(label, copy, destination / relative) if run else copy()
             self.assertFalse((destination / "registry/src").exists())
-        return {"source": "explicit fixture"}
+        return {"source": "explicit fixture", "trees": list(trees or self.mint["CARGO_HOME_INPUT_TREES"])}
 
-    def prepare(self, cargo_input=None):
+    def registry_input(self):
+        """An input Cargo home with registry trees and no Git databases."""
+        given = self.root / "registry-input"
+        for relative in ("registry/index/fixture/.cache/pr/ob/probe", "registry/cache/fixture/probe-0.1.0.crate"):
+            (given / relative).parent.mkdir(parents=True, exist_ok=True)
+            (given / relative).write_text("fixture")
+        return given
+
+    def cargo_like_git(self, packages):
+        """Make the stand-in driver take Git dependencies as Cargo does: an exact depth-one fetch
+        into its own database through the `git` on its PATH (the preparation's local-only shim),
+        and a checkout whose objects are hard links to the database's, as Cargo's local clone
+        makes them. Offline, a commit its database lacks fails. ``packages``: (url, oid, db name)."""
+        real_git = shutil.which("git")
+        fetch = self.driver.with_name("targo-fetch")
+        self.driver.rename(fetch)
+        executable(self.driver, "#!/bin/sh\n" + "'''exec' " + shlex.quote(sys.executable) + ' "$0" "$@" # ' + "'''\n" +
+            "import os, pathlib, subprocess, sys\n" +
+            f"git = {real_git!r}\npackages = {packages!r}\n" +
+            "home = pathlib.Path(os.environ.get('CARGO_HOME', '/nonexistent'))\n" +
+            "if sys.argv[1:3] == ['fetch', '--locked']:\n" +
+            "    offline = '--offline' in sys.argv\n" +
+            "    for url, oid, name in packages:\n" +
+            "        db = home / 'git/db' / name\n" +
+            "        held = db.is_dir() and subprocess.run([git, '--git-dir', str(db), 'cat-file', '-e', oid + '^{commit}'],\n" +
+            "                                              capture_output=True).returncode == 0\n" +
+            "        if not held:\n" +
+            "            if offline:\n" +
+            "                sys.exit(f'fixture cargo: {oid} is not in {db} and the fetch is offline')\n" +
+            "            db.mkdir(parents=True, exist_ok=True)\n" +
+            "            subprocess.run([git, 'init', '--bare', '-q', str(db)], check=True)\n" +
+            "            subprocess.run(['git', 'fetch', '--no-tags', '--force', '--update-head-ok', '--recurse-submodules=no',\n" +
+            "                            '--depth=1', url, '+' + oid + ':refs/commit/' + oid], cwd=db,\n" +
+            "                           env={**os.environ, 'GIT_DIR': str(db)}, check=True)\n" +
+            "        checkout = home / 'git/checkouts' / name / oid[:7]\n" +
+            "        if not offline and not checkout.exists():\n" +
+            "            subprocess.run([git, 'init', '-q', str(checkout)], check=True)\n" +
+            "            for body in sorted((db / 'objects').rglob('*')):\n" +
+            "                target = checkout / '.git/objects' / body.relative_to(db / 'objects')\n" +
+            "                if body.is_file() and not target.exists():\n" +
+            "                    target.parent.mkdir(parents=True, exist_ok=True)\n" +
+            "                    os.link(body, target)\n" +
+            "            if (db / 'shallow').exists():\n" +
+            "                (checkout / '.git/shallow').write_bytes((db / 'shallow').read_bytes())\n" +
+            "            subprocess.run([git, '-C', str(checkout), 'checkout', '-q', '--detach', oid], check=True)\n" +
+            f"os.execv({str(fetch)!r}, [{str(fetch)!r}, *sys.argv[1:]])\n")
+
+    def prepare(self, cargo_input=None, **options):
         receipt = self.work / "receipt.json"
         # The fake driver tests cache handoff and environment closure. Darwin
         # uses the explicit diagnostic test executor, as in the closure suite;
@@ -853,13 +933,22 @@ class PrewarmBoundaryTests(unittest.TestCase):
             if sys.platform == "darwin" else nullcontext()
         )
         with executor:
-            stage.prewarm_dependencies(self.source, self.work, HOST, receipt, [], cargo_input, self.policy_engine)
+            stage.prewarm_dependencies(self.source, self.work, HOST, receipt, [], cargo_input, self.policy_engine,
+                                       **options)
         return stage.read_json(receipt)
+
+    def test_prewarm_enforces_checkout_cache_selection_before_fetch(self):
+        donor = self.root / "checkout cache"
+        donor.mkdir()
+        declaration = f"https://github.com/fixture/unselected#{'1' * 40}={donor}"
+        with self.assertRaisesRegex(RuntimeError, "checkout caches do not match selected dependency sources"):
+            self.prepare(checkout_cache_specs=[declaration])
+        self.assertFalse(self.trace.exists())
+        self.assertFalse((self.work / "receipt.json").exists())
 
     def locked_git_dependency(self):
         """A locked Git dependency whose commit a filled Cargo input home's git/db holds, and a
-        stand-in fetch that leaves a Git checkout of each database, made as Cargo makes them:
-        a local clone, which hardlinks the database's objects. Returns the input home."""
+        stand-in driver that takes it as Cargo does (cargo_like_git). Returns the input home."""
         real_git = shutil.which("git")
         origin = self.root / "git-probe"
         subprocess.run([real_git, "init", "-q", str(origin)], check=True)
@@ -882,27 +971,12 @@ class PrewarmBoundaryTests(unittest.TestCase):
         db = given / "git/db/probe-fixture"
         db.parent.mkdir(parents=True)
         subprocess.run([real_git, "init", "--bare", "-q", str(db)], check=True)
-        subprocess.run([real_git, "-c", "protocol.file.allow=always", "--git-dir", str(db), "fetch", "--no-tags",
-                        str(origin), f"+{oid}:refs/commit/{oid}"], check=True, capture_output=True)
-        # The owned cache holds the commit, so no run asks Agh for it.
-        self.recreator["_agh_source_fetch"] = lambda *_a, **_k: self.fail("the owned Cargo cache holds the commit")
-        fetch = self.driver.with_name("targo-fetch")
-        self.driver.rename(fetch)
-        executable(self.driver, "#!/bin/sh\n" + "'''exec' " + shlex.quote(sys.executable) + ' "$0" "$@" # ' + "'''\n" +
-            "import os, pathlib, subprocess, sys\n" +
-            f"git = {real_git!r}\n" +
-            "home = pathlib.Path(os.environ.get('CARGO_HOME', '/nonexistent'))\n" +
-            "if sys.argv[1:3] == ['fetch', '--locked'] and '--offline' not in sys.argv and (home / 'git/db').is_dir():\n" +
-            "    for db in sorted((home / 'git/db').iterdir()):\n" +
-            "        refs = subprocess.run([git, '--git-dir', str(db), 'for-each-ref', '--format=%(objectname)', 'refs/commit'],\n" +
-            "                              capture_output=True, text=True, check=True).stdout.split()\n" +
-            "        for oid in refs:\n" +
-            "            checkout = home / 'git/checkouts' / db.name / oid[:7]\n" +
-            "            if not checkout.exists():\n" +
-            "                subprocess.run([git, '-c', 'protocol.file.allow=always', 'clone', '-q', '--local',\n" +
-            "                                '--no-checkout', str(db), str(checkout)], check=True)\n" +
-            "                subprocess.run([git, '-C', str(checkout), 'checkout', '-q', '--detach', oid], check=True)\n" +
-            f"os.execv({str(fetch)!r}, [{str(fetch)!r}, *sys.argv[1:]])\n")
+        subprocess.run([real_git, "-c", "protocol.file.allow=always", "-c", "maintenance.auto=false", "--git-dir",
+                        str(db), "fetch", "--no-tags", str(origin), f"+{oid}:refs/commit/{oid}"],
+                       check=True, capture_output=True)
+        # The input home holds the commit, so no run asks Agh for it.
+        self.recreator["_agh_source_fetch"] = lambda *_a, **_k: self.fail("the input home's database holds the commit")
+        self.cargo_like_git([(url, oid, "probe-fixture")])
         return given
 
     def linked_db_objects(self):
@@ -919,9 +993,11 @@ class PrewarmBoundaryTests(unittest.TestCase):
         self.assertTrue(self.linked_db_objects(), "the stand-in fetch hardlinks the database, as Cargo does")
         initial = stage.fingerprint(self.work / "initial-cache.json")
         second = self.prepare(given)
-        for report in (first, second):
-            self.assertEqual([(row["method"], row["cache_db"]) for row in report["transport"]["acquisitions"]],
-                             [("exact-owned-cargo-cache", str(cache / "git/db/probe-fixture"))])
+        # The first run lends the input home's database; the second finds the commit in the
+        # database Cargo made in its own home on the first.
+        self.assertEqual([row["method"] for row in first["transport"]["acquisitions"]], ["exact-local-object-cache"])
+        self.assertEqual([(row["method"], row["cache_db"]) for row in second["transport"]["acquisitions"]],
+                         [("exact-owned-cargo-cache", str(cache / "git/db/probe-fixture"))])
         # The same cache, reused: not filled again from the input home.
         self.assertEqual(stage.fingerprint(self.work / "initial-cache.json"), initial)
         self.assertNotEqual(first["cargo_home"], second["cargo_home"])
@@ -951,7 +1027,7 @@ class PrewarmBoundaryTests(unittest.TestCase):
                 "GIT_CONFIG_COUNT": "9", "GITHUB_TOKEN": "secret-fixture", "HTTPS_PROXY": "http://ambient"}):
             report = self.prepare()
         calls = [json.loads(line) for line in self.trace.read_text().splitlines()]
-        self.assertEqual(len(calls), 15)
+        self.assertEqual(len(calls), 10)
         self.assertEqual(report["driver_sha256"], stage.file_hash(self.driver))
         for call in calls:
             self.assertEqual(call["argv"][0], str(self.driver))
@@ -976,8 +1052,75 @@ class PrewarmBoundaryTests(unittest.TestCase):
             self.assertEqual(environment["CARGO_UNSTABLE_HOST_CONFIG"], "false")
             self.assertEqual(environment["CARGO_TARGET_DIR"], str(self.work / "unused-target"))
             self.assertEqual(environment["CARGO_BUILD_TARGET_DIR"], environment["CARGO_TARGET_DIR"])
-        self.assertEqual([row["offline"] for row in report["completed_fetches"]], [False]*5+[True]*5)
+        self.assertEqual([row["offline"] for row in report["input_acquisition"]["completed_fetches"]], [False]*5)
+        self.assertEqual([row["offline"] for row in report["completed_fetches"]], [True]*5)
         self.assertEqual([row["offline"] for row in report["handoff_offline_replay"]["completed_fetches"]], [True]*5)
+        stage.validate_dependency_preparation({"report": str(self.work / "receipt.json"),
+                                               "cargo_home": report["cargo_home"]})
+
+    def test_older_source_helper_and_its_resumed_receipt_keep_the_three_actual_passes(self):
+        self.closure.pop("acquire_dependency_inputs")
+        report = self.prepare()
+        self.assertNotIn("input_acquisition", report)
+        self.assertEqual(len(self.trace.read_text().splitlines()), 15)
+        self.assertEqual(report["ceiling"]["fetch_passes"], 3)
+        self.assertEqual([row["offline"] for row in report["completed_fetches"]], [False]*5+[True]*5)
+        stage.validate_dependency_preparation({"report": str(self.work / "receipt.json"),
+                                               "cargo_home": report["cargo_home"]})
+
+    def assert_handoff_change_refused(self, change):
+        original = self.cache_input
+        def altered(source, destination, **options):
+            result = original(source, destination, **options)
+            if source == self.work / "cargo-home":
+                if change == "roots":
+                    recipe = self.source / self.closure["_RECIPE_INPUTS"][-1]
+                    recipe.write_text(recipe.read_text().replace('path: "tool"', 'path: "new-tool"'))
+                    (self.source / "new-tool").mkdir()
+                    (self.source / "new-tool/Cargo.toml").write_text("[workspace]\nmembers=[]\n")
+                    (self.source / "new-tool/Cargo.lock").write_text("version=4\n")
+                elif change == "config":
+                    (destination / "config.toml").write_text("[net]\nretry=1\n")
+                else:
+                    self.driver.write_text(self.driver.read_text() + "\n# changed after acquisition\n")
+            return result
+        self.mint["cargo_home_inputs"] = altered
+        with self.assertRaisesRegex(RuntimeError, "changed during handoff|same ordered manifest/policy"):
+            self.prepare()
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_changed_roots_between_acquisition_and_replay_never_ready(self):
+        self.assert_handoff_change_refused("roots")
+
+    def test_changed_config_between_acquisition_and_replay_never_ready(self):
+        self.assert_handoff_change_refused("config")
+
+    def test_changed_driver_between_acquisition_and_replay_never_ready(self):
+        self.assert_handoff_change_refused("driver")
+
+    def test_different_resolver_environment_in_the_replay_never_ready(self):
+        original = self.closure["dependency_closure"]
+        def changed(root, driver, env, **options):
+            return original(root, driver, {**env, "CARGO_HTTP_TIMEOUT": "123"}, **options)
+        self.closure["dependency_closure"] = changed
+        with self.assertRaisesRegex(stage.Refused, "same ordered manifest/policy"):
+            self.prepare()
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_acquisition_or_incomplete_replay_cannot_authorize_a_preparation(self):
+        report = self.prepare()
+        with self.assertRaisesRegex(stage.Refused, "offline fetch readiness"):
+            stage.validate_preparation_fetches(report["input_acquisition"])
+        for selected in ("completed_fetches", "manifests", "manifest_policy_sha256"):
+            changed = copy.deepcopy(report)
+            replay = changed["handoff_offline_replay"]
+            replay[selected] = replay[selected][:-1]
+            with self.subTest(selected=selected), self.assertRaises(stage.Refused):
+                stage.validate_preparation_fetches(changed)
+        changed = copy.deepcopy(report)
+        changed["input_acquisition"]["manifests"].reverse()
+        with self.assertRaisesRegex(stage.Refused, "same ordered manifest/policy"):
+            stage.validate_preparation_fetches(changed)
 
     def test_extracted_sources_cannot_mask_a_missing_safe_handoff_archive(self):
         self.omit_handoff_archive = True
@@ -1015,6 +1158,33 @@ class PrewarmBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(stage.Refused, "Cargo config.*authority"):
             self.prepare()
         self.assertFalse(self.trace.exists())
+
+    def test_cargo_env_is_judged_by_name_by_the_shared_policy(self):
+        # Trust's own .cargo/config.toml (72166f7901) sets [env] RUST_MIN_STACK; the train's
+        # fetch-only lane refused every [env] wholesale and stopped every tick at this step
+        # (2026-11-17T22:12Z, cut cd8e74698194). Publication's policy judges [env] by name:
+        # a loader, Git, proxy or compiler name refuses before any fetch or Cargo home, beside
+        # main's own entry, and main's table prepares with its hash in the receipt.
+        config = self.source / ".cargo/config.toml"
+        config.parent.mkdir()
+        for name in ("GIT_SSH_COMMAND", "DYLD_INSERT_LIBRARIES", "CARGO_HTTP_PROXY", "RUSTFLAGS"):
+            with self.subTest(name=name):
+                config.write_text(f'[env]\nRUST_MIN_STACK = "16777216"\n{name} = "x"\n')
+                with self.assertRaisesRegex(stage.Refused,
+                        f"Cargo config contains unsupported execution/source/lock authority: .*\\[env\\] {name}"):
+                    self.prepare()
+                self.assertFalse(self.trace.exists())
+                self.assertFalse((self.work / "cargo-home").exists())
+        config.write_text('[net]\ngit-fetch-with-cli = true\n\n'
+                          "[env]\n"
+                          "# The native_wp_body target imports trust-wp's bounded recursive controls.\n"
+                          "# Match that workspace's debug-test stack default; nested Cargo configuration\n"
+                          "# is not inherited here. Preserve an explicit caller's runtime stack setting.\n"
+                          'RUST_MIN_STACK = { value = "16777216", force = false }\n')
+        report = self.prepare()
+        self.assertEqual(len(self.trace.read_text().splitlines()), 10)
+        self.assertEqual(len(report["handoff_offline_replay"]["completed_fetches"]), 5)
+        self.assertEqual(report["source_inputs_sha256"][str(config)], stage.file_hash(config))
 
     def test_real_publication_policy_refuses_unbound_sources_and_lock_redirection_before_fetch(self):
         config = self.source / ".cargo/config.toml"
@@ -1060,6 +1230,94 @@ class PrewarmBoundaryTests(unittest.TestCase):
             self.prepare()
         self.assertFalse(self.trace.exists())
 
+    def fake_time(self, step, *, input_bytes, moving, still=None):
+        """A clock that advances ``step`` seconds at each reading, from the real monotonic now,
+        and a measure of what an item's watched paths hold: ``input_bytes`` for the input home's
+        trees, nothing new under ``still``, and ``moving`` more bytes at each other reading."""
+        state = {"start": time.monotonic(), "moved": 0}
+        state["now"] = state["start"]
+        given = self.root / "registry-input"
+
+        def clock():
+            state["now"] += step
+            return state["now"]
+
+        def measure(paths):
+            if paths and all(given in Path(path).parents for path in paths):
+                return input_bytes
+            if paths == (still,):
+                return 0
+            state["moved"] += moving
+            return state["moved"]
+        return state, clock, measure
+
+    def expected_ceiling(self, items, input_bytes):
+        floor = stage.PREWARM_FLOOR_BYTES_PER_SECOND
+        return stage.PREWARM_ITEM_SECONDS * items + -(-2 * input_bytes // floor)
+
+    def test_prewarm_that_keeps_moving_outlives_the_former_total(self):
+        # RL-55. One total bounded the whole preparation (900 s, then 3600 s); m86's ended at
+        # offline fetch 32 of 55 on 2026-11-14 while every fetch was still moving. Each item is
+        # now bounded by its progress, and the whole by a ceiling computed from its inputs.
+        self.assertFalse(hasattr(stage, "DEPENDENCY_PREWARM_SECONDS"))
+        given = self.registry_input()
+        state, clock, measure = self.fake_time(120, input_bytes=256 << 30, moving=1 << 20)
+        (self.root / "slow-fetch").write_text("")
+        with mock.patch.dict(self.closure, {"PROGRESS_POLL_SECONDS": 0.02}):
+            report = self.prepare(given, clock=clock, measure=measure, poll=0.01)
+        # 2 input copies, no locked Git commit, 2 fetches of 5 manifests, 3 handoff copies.
+        self.assertEqual((report["ceiling"]["items"], report["ceiling"]["input_bytes"]), (15, 256 << 30))
+        self.assertEqual(report["ceiling"]["seconds"], self.expected_ceiling(15, 256 << 30))
+        elapsed = state["now"] - state["start"]
+        self.assertGreater(elapsed, 3600, "the preparation ran past the former total")
+        self.assertLess(elapsed, report["ceiling"]["seconds"])
+        self.assertEqual(len(report["input_acquisition"]["completed_fetches"]) + len(report["completed_fetches"]), 10)
+
+    def test_prewarm_that_stalls_ends_naming_the_item(self):
+        # RL-55. An item that stops moving is ended after the recreator's stall window, long
+        # before the ceiling, and the refusal names it; nothing after it runs.
+        given = self.registry_input()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.blocked_copy = ("registry/cache", release)
+        target = self.work / "cargo-home/registry/cache"
+        _state, clock, measure = self.fake_time(300, input_bytes=256 << 30, moving=1 << 20, still=target)
+        with self.assertRaisesRegex(stage.Refused,
+                f"dependency preparation ended the copy of cargo home input registry/cache into "
+                f"{re.escape(str(self.work / 'cargo-home'))}: the copy of cargo home input registry/cache .* "
+                "showed too little progress: 0 bytes observed"):
+            self.prepare(given, clock=clock, measure=measure, poll=0.01)
+        release.set()
+        self.assertFalse(self.trace.exists())
+        self.assertFalse((self.work / "receipt.json").exists())
+
+    def test_prewarm_below_its_floor_rate_ends_at_its_computed_ceiling(self):
+        # RL-55. An item that keeps moving above the stall floor, but whose preparation moves
+        # slower than the ceiling's floor rate, is ended at the ceiling the preparation printed
+        # at its start; a supervisor given another number refuses before anything runs.
+        given = self.registry_input()
+        input_bytes = 4 << 20
+        state, clock, measure = self.fake_time(60, input_bytes=input_bytes, moving=64 << 10)
+        planned = self.prepare(given, ceiling_only=True, clock=clock, measure=measure)
+        seconds = self.expected_ceiling(15, input_bytes)
+        self.assertEqual((planned["seconds"], planned["items"]), (seconds, 15))
+        (self.work / "receipt.json").unlink()
+        self.assertFalse((self.work / "cargo-home").exists())
+        with self.assertRaisesRegex(stage.Refused, f"ceiling is {seconds} s, not the {seconds + 1} s"):
+            self.prepare(given, ceiling_seconds=seconds + 1, clock=clock, measure=measure)
+        self.assertFalse((self.work / "cargo-home").exists())
+        (self.root / "slow-fetch").write_text("")
+        begun = state["now"]
+        printed = io.StringIO()
+        with mock.patch.dict(self.closure, {"PROGRESS_POLL_SECONDS": 0.02}), \
+                contextlib.redirect_stderr(printed), \
+                self.assertRaisesRegex(RuntimeError, f"ceiling of {seconds} s, printed at its start") as ended:
+            self.prepare(given, ceiling_seconds=seconds, clock=clock, measure=measure, poll=0.01)
+        self.assertIn(f"dependency preparation ceiling: {seconds} s for 15 items", printed.getvalue())
+        self.assertNotIn("too little progress", str(ended.exception))
+        self.assertGreaterEqual(state["now"] - begun, seconds)
+        self.assertFalse((self.work / "receipt.json").exists())
+
 
 class DependencyLocalGitBudgetTests(unittest.TestCase):
     def transport(self):
@@ -1068,30 +1326,88 @@ class DependencyLocalGitBudgetTests(unittest.TestCase):
         exec(compile(path.read_bytes(), str(path), "exec"), api)
         return api
 
+    def owner(self, **extra):
+        recreator = stage.runpy.run_path(str(SCRIPT.parents[1] / "scripts/recreate_bootstrap.py"))
+        names = ("_SubmoduleProgress", "_SubmoduleStalled", "_submodule_progress_bytes", "SUBMODULE_STALL_WINDOW_SECONDS")
+        return {**{name: recreator[name] for name in names},
+                "_provenance_git_environment": lambda: {},
+                "_controlled_git_command": lambda args: ["fixed-git", *args], **extra}
+
     def test_local_acquisition_uses_finite_source_ceiling(self):
+        # RL-55: a local transfer or gc is one item, bounded by its progress, not by a constant
+        # (600 s and 120 s until 2026-11-17); the preparation's ceiling, printed at its start,
+        # ends a running item and refuses the next before it starts, naming both.
         api = self.transport()
-        calls = []
+        calls, now = [], [100.0]
         fetch = ["-c", "protocol.file.allow=always", "-c", "fetch.fsckObjects=true", "-C",
                  "/owned/stage", "fetch", "--no-tags", "--depth=1", "/owned/cache",
                  "+" + "a" * 40 + ":refs/agh/trust-daily-dependencies/" + "a" * 40]
-        owner = {"_dependency_deadline": 1000,
-                 "_provenance_git_environment": lambda: {},
-                 "_controlled_git_command": lambda args: ["fixed-git", *args],
-                 "_run_submodule_update_process": lambda *args, **kwargs:
-                     calls.append((args, kwargs)) or subprocess.CompletedProcess(args, 0)}
-        with mock.patch.dict(api, {"time": types.SimpleNamespace(monotonic=lambda: 100)}):
-            api["local_git"](owner, fetch, bounded=True, acquisition=True)
-            self.assertEqual(calls[-1][1]["timeout_seconds"], 600)
-            api["local_git"](owner, ["gc", "--auto"], bounded=True)
-            self.assertEqual(calls[-1][1]["timeout_seconds"], 120)
-            owner["_dependency_deadline"] = 145
-            api["local_git"](owner, fetch, bounded=True, acquisition=True)
-            self.assertEqual(calls[-1][1]["timeout_seconds"], 45)
-            owner["_dependency_deadline"] = 100
-            count = len(calls)
-            with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
-                api["local_git"](owner, fetch, bounded=True, acquisition=True)
-            self.assertEqual(len(calls), count)
+        owner = self.owner(_dependency_deadline=1000.0, _dependency_clock=lambda: now[0], _dependency_ceiling=900,
+                           _run_submodule_update_process=lambda *args, **kwargs:
+                               calls.append((args, kwargs)) or subprocess.CompletedProcess(args, 0))
+        label = "the local transfer of probe"
+        api["local_git"](owner, fetch, bounded=True, acquisition=True, label=label, paths=(Path("/owned/stage"),))
+        self.assertIsNone(calls[-1][1]["timeout_seconds"])
+        progress = calls[-1][1]["progress"]
+        self.assertEqual((progress.label, progress.paths), (label, (Path("/owned/stage"),)))
+        api["local_git"](owner, ["gc", "--auto"], bounded=True)
+        self.assertIsNone(calls[-1][1]["timeout_seconds"])
+        self.assertIsNotNone(calls[-1][1]["progress"])
+        progress.begin()
+        now[0] = 1000.0
+        with self.assertRaisesRegex(owner["_SubmoduleStalled"],
+                                    f"{label} was still running 900 s after it started when the preparation "
+                                    "reached its ceiling of 900 s, printed at its start"):
+            progress.check(["fixed-git"])
+        count = len(calls)
+        with self.assertRaisesRegex(RuntimeError, "deadline exhausted: it reached its ceiling of 900 s, "
+                                    f"printed at its start, before {label}"):
+            api["local_git"](owner, fetch, bounded=True, acquisition=True, label=label)
+        self.assertEqual(len(calls), count)
+
+    def test_fetch_item_never_walks_what_cargo_has_finished(self):
+        # Each `targo fetch` item watched its whole Cargo home and walked all of it at its start
+        # and at each sample, ty's checkout included (475,787 entries, 11.5 s on m86 at load 40):
+        # the proof's offline fetches took 12.9 s each, 27009's 2.4 s (review, 2026-11-17). A
+        # checkout or unpacked crate holding the .cargo-ok Cargo writes last is never walked;
+        # growth anywhere else in the home still counts.
+        temp = tempfile.TemporaryDirectory(prefix="dependency-fetch-measure-")
+        self.addCleanup(temp.cleanup)
+        home = Path(temp.name).resolve() / "cargo-home"
+        finished = home / "git/checkouts/probe-0123456789abcdef/abcdef0"
+        unpacked = home / "registry/src/index.crates.io-1949cf8c6b5b557f/probe-0.1.0"
+        running = home / "git/checkouts/other-0123456789abcdef/1234567"
+        for directory, done in ((finished, ".cargo-ok"), (unpacked, '{"v":1}'), (running, None)):
+            (directory / "src").mkdir(parents=True)
+            (directory / "src/lib.rs").write_text("// checked out\n")
+            if done is not None:
+                (directory / ".cargo-ok").write_text("" if done == ".cargo-ok" else done)
+        for relative in ("registry/cache/index.crates.io-1949cf8c6b5b557f/probe-0.1.0.crate",
+                         "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/pr/ob/probe",
+                         "git/db/probe-0123456789abcdef/objects/pack/pack-0.pack"):
+            (home / relative).parent.mkdir(parents=True)
+            (home / relative).write_bytes(b"\0" * 64)
+        recreator = stage.runpy.run_path(str(SCRIPT.parents[1] / "scripts/recreate_bootstrap.py"))
+        now = [0.0]
+        bound = stage.PrewarmBound(recreator, self.transport(), {"seconds": 5000}, clock=lambda: now[0])
+        watch = bound.item("locked fetch 1/1 Cargo.toml", (home,))
+        scanned, scandir = [], os.scandir
+
+        def spy(path):
+            scanned.append(Path(path))
+            return scandir(path)
+        with mock.patch.object(stage.os, "scandir", side_effect=spy):
+            watch.begin()
+            self.assertEqual(stage.cargo_home_progress_bytes((home,)), 3 * 64 + len("// checked out\n"))
+            (running / "src/grown.rs").write_bytes(b"\1" * 4096)
+            (finished / "src/never-counted.rs").write_bytes(b"\1" * 8192)
+            now[0] = 30.0
+            watch.check(["targo", "fetch", "--locked", "--offline"])
+        self.assertEqual(watch.received, 4096)
+        for done in (finished, unpacked):
+            self.assertFalse([path for path in scanned if path == done or done in path.parents], done)
+        for walked in (running / "src", home / "registry/cache", home / "registry/index", home / "git/db"):
+            self.assertIn(walked, scanned)
 
     def test_acquisition_requires_owned_process_tree(self):
         api = self.transport()
@@ -1106,10 +1422,8 @@ class DependencyLocalGitBudgetTests(unittest.TestCase):
         fetch = ["-c", "protocol.file.allow=always", "--git-dir", "/owned/cache", "fetch",
                  "--no-tags", "--depth=1", "--force", "--update-head-ok", "--recurse-submodules=no", "/owned/stage",
                  "+" + "a" * 40 + ":refs/commit/" + "a" * 40]
-        owner = {"_dependency_deadline": time.monotonic() + 900,
-                 "_provenance_git_environment": lambda: {},
-                 "_controlled_git_command": lambda args: ["fixed-git", *args],
-                 "_run_submodule_update_process": mock.Mock(side_effect=subprocess.TimeoutExpired("fixed-git", 600))}
+        owner = self.owner(_dependency_deadline=time.monotonic() + 900,
+                           _run_submodule_update_process=mock.Mock(side_effect=subprocess.TimeoutExpired("fixed-git", 600)))
         with self.assertRaises(subprocess.TimeoutExpired):
             api["local_git"](owner, fetch, bounded=True, acquisition=True)
         owner["_run_submodule_update_process"] = mock.Mock(return_value=subprocess.CompletedProcess([], 2))
@@ -1122,6 +1436,8 @@ class DependencyFetchBoundaryTests(unittest.TestCase):
     setUp = PrewarmBoundaryTests.setUp
     cache_input = PrewarmBoundaryTests.cache_input
     prepare = PrewarmBoundaryTests.prepare
+    registry_input = PrewarmBoundaryTests.registry_input
+    cargo_like_git = PrewarmBoundaryTests.cargo_like_git
 
     def transport(self):
         path = SCRIPT.with_name("daily_dependency_git.py")
@@ -1147,26 +1463,189 @@ class DependencyFetchBoundaryTests(unittest.TestCase):
         git(root, "commit", "-qm", "fixture")
         return root, git(root, "rev-parse", "HEAD")
 
-    def profile(self, sources):
+    def profile(self, sources, *, dropped=(), **options):
+        """prepare_profile with a stand-in Agh that fetches from ``sources`` and then loses
+        the objects named in ``dropped``; it records what each request asked of Agh."""
         api = self.transport()
         cache = self.work / "cargo-home"
         cache.mkdir(exist_ok=True)
         owner = dict(self.recreator)
         calls = []
         self.acquisition_calls = calls
+        self.acquisition_options = []
         def acquire(url, stage, oid, ref, **kwargs):
             calls.append((url, oid))
+            self.acquisition_options.append({key: value for key, value in kwargs.items() if key != "execute"})
             self.acquisition_store = stage.parent
             origin = sources[(url, oid)]
-            subprocess.run(["git", "-c", "protocol.file.allow=always", "-c", "fetch.unpackLimit=1000000", "-C", str(stage),
+            # No detached auto-maintenance: it rewrites the stage's .git while the
+            # recreator's custody walk reads it ("staged child Git custody contains
+            # aliases/special files"), which failed these tests at random under load.
+            subprocess.run(["git", "-c", "protocol.file.allow=always", "-c", "fetch.unpackLimit=1000000",
+                            "-c", "maintenance.auto=false", "-C", str(stage),
                             "fetch", "--no-tags", str(origin), "+" + oid + ":" + ref],
                            check=True, capture_output=True)
+            for name in dropped:
+                (stage / ".git/objects" / name[:2] / name[2:]).unlink()
             return {"program": {"fixture": "local only"}, "repository": url,
                     "source": oid, "private_ref": ref, "commit": oid}
         owner["_agh_source_fetch"] = acquire
         policy, document = api["prepare_profile"](self.source, self.work, cache,
-                            self.closure, owner, {"HOME": str(self.work), "CARGO_HOME": str(cache)})
+                            self.closure, owner, {"HOME": str(self.work), "CARGO_HOME": str(cache)},
+                            deadline=time.monotonic() + 900, **options)
         return api, policy, document, calls
+
+    def history(self, name):
+        """A repository whose locked (current) commit no longer has bodies its ancestor had.
+        Returns it, the current commit and every object only its ancestor reaches."""
+        origin, _first = self.repository(name, extra={"src/old.rs": "// a body only the ancestor has\n"})
+        (origin / "src/old.rs").unlink()
+        (origin / "src/lib.rs").write_text("// the body the locked commit has\n")
+        git(origin, "add", "-A")
+        git(origin, "commit", "-qm", "current")
+        current = git(origin, "rev-parse", "HEAD")
+        every = {line.split()[0] for line in git(origin, "rev-list", "--objects", current).splitlines()}
+        closure = {line.split()[0] for line in git(origin, "rev-list", "--objects", "--no-walk", current).splitlines()}
+        return origin, current, every - closure
+
+    def bare_copy(self, origin, store, *refs):
+        """A bare repository at ``store`` holding ``refs`` of ``origin`` as loose objects."""
+        store.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "--bare", "-q", str(store)], check=True)
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "-c", "fetch.unpackLimit=1000000",
+                        "-c", "maintenance.auto=false", "--git-dir", str(store), "fetch", "--no-tags",
+                        str(origin), *refs], check=True, capture_output=True)
+        return store
+
+    def agh_profile(self, sources, **options):
+        """prepare_profile with the recreator's own _agh_source_fetch, which builds the Agh
+        command and binds a stand-in `agh` on PATH by identity. ``acquire``, prepare_profile's
+        executor hook, receives each command it built, keeps it, and fetches the requested
+        commit from ``sources`` in Agh's place. Returns the policy document and the commands."""
+        api = self.transport()
+        cache = self.work / "cargo-home"
+        cache.mkdir(exist_ok=True)
+        agh = self.root / "agh-bin/agh"
+        executable(agh, "#!/bin/sh\necho 'the stand-in agh is never run' >&2\nexit 97\n")
+        commands = []
+
+        def acquire(command, _environment):
+            commands.append(list(command))
+            repository, destination = command[3], Path(command[4])
+            oid, ref = command[command.index("--ref") + 1], command[command.index("--into") + 1]
+            origin = sources[("https://github.com/" + repository + ".git", oid)]
+            subprocess.run(["git", "-c", "protocol.file.allow=always", "-c", "fetch.unpackLimit=1000000",
+                            "-c", "maintenance.auto=false", "-C", str(destination),
+                            "fetch", "--no-tags", str(origin), "+" + oid + ":" + ref],
+                           check=True, capture_output=True)
+        with mock.patch.dict(os.environ, {"PATH": f"{agh.parent}{os.pathsep}{os.environ['PATH']}"}):
+            _policy, document = api["prepare_profile"](
+                self.source, self.work, cache, self.closure, dict(self.recreator),
+                {"HOME": str(self.work), "CARGO_HOME": str(cache)}, deadline=time.monotonic() + 900,
+                acquire=acquire, **options)
+        return document, agh, commands
+
+    def test_lock_commit_is_acquired_as_its_checkout_closure(self):
+        # RL-54. A tick took a locked commit as the whole history before it (Agh, or a copy of
+        # filled Cargo databases): 18-22 GB of trust-ir for one commit on m86, 2026-11-14.
+        # A declared repository that holds the commit lends exactly its checkout closure, by a
+        # depth-one local transfer through a relay; Agh is not asked.
+        origin, current, ancestor_only = self.history("probe")
+        url = "https://github.com/Owner/probe.git"
+        lock = self.source / "Cargo.lock"
+        self.declare("https://github.com/Owner/probe", current)
+        # A second URL whose declared repository is stale (it lacks the locked commit), as the
+        # train's clean cache lacked 7722f8495bc4: that commit goes to Agh's checkout closure,
+        # with the declared repository as its checkout cache.
+        other, older = self.repository("other")
+        stale = self.bare_copy(other, self.root / "stale-other", f"+{older}:refs/heads/main")
+        (other / "src/lib.rs").write_text("// newer than the stale cache\n")
+        git(other, "commit", "-qam", "newer")
+        newer = git(other, "rev-parse", "HEAD")
+        other_url = "https://github.com/Owner/other.git"
+        # A third URL with no declared repository: Agh's checkout closure, with no cache. Its
+        # unfiltered whole-history fetch (native_exact) is what the closure replaces.
+        third, pinned = self.repository("third")
+        third_url = "https://github.com/Owner/third.git"
+        for name, oid in (("other", newer), ("third", pinned)):
+            lock.write_text(lock.read_text() + f'\n[[package]]\nname="{name}"\nversion="0.1.0"\n'
+                            f'source="git+https://github.com/Owner/{name}#{oid}"\n')
+        document, agh, commands = self.agh_profile({(other_url, newer): other, (third_url, pinned): third},
+                                                   object_caches={url: origin, other_url: stale})
+        stages = {key.split("#")[0]: Path(row["path"]) for key, row in document["stages"].items()}
+        self.assertEqual(sorted(commands), [
+            [str(agh), "repo", "fetch", "Owner/other", str(stages[other_url]), "--ref", newer,
+             "--into", "refs/agh/trust-daily-dependencies/" + newer, "--checkout-closure", "--checkout-cache", str(stale)],
+            [str(agh), "repo", "fetch", "Owner/third", str(stages[third_url]), "--ref", pinned,
+             "--into", "refs/agh/trust-daily-dependencies/" + pinned, "--checkout-closure"]])
+        rows = {row["commit"]: row for row in document["acquisitions"]}
+        self.assertEqual(rows[current]["method"], "exact-local-object-cache")
+        self.assertEqual(rows[current]["object_stores"], [str(origin / ".git/objects")])
+        self.assertEqual((rows[newer]["method"], rows[newer]["checkout_cache"]), ("owner-routed-agh", str(stale)))
+        self.assertEqual(rows[pinned]["method"], "owner-routed-agh")
+        self.assertNotIn("checkout_cache", rows[pinned])
+        self.assertEqual(rows[pinned]["program"]["resolved"], str(agh.resolve()))
+        stage = Path(document["stages"][url + "#" + current]["path"])
+        self.assertEqual((stage / ".git/shallow").read_text().split(), [current])
+        held = set(git(stage, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)").split())
+        closure = {line.split()[0] for line in git(origin, "rev-list", "--objects", "--no-walk", current).splitlines()}
+        self.assertEqual(held, closure)
+        self.assertTrue(ancestor_only)
+        self.assertFalse(held & ancestor_only)
+        # The declared repository was read, never configured into the stage.
+        self.assertFalse((stage / ".git/objects/info/alternates").exists())
+
+    def test_prewarm_holds_no_ancestor_only_blob(self):
+        # RL-54. The input Cargo home's databases held every ancestor's bodies (28 GB on m86,
+        # 2026-11-14), and the preparation copied them into its home and from there into the
+        # handoff. They are now object sources: only the locked commit's checkout closure enters.
+        origin, current, ancestor_only = self.history("probe")
+        url = "https://github.com/Owner/probe"
+        self.declare(url, current)
+        # A second crate of the same locked commit, as a workspace's crates are locked.
+        lock = self.source / "Cargo.lock"
+        lock.write_text(lock.read_text() + '\n[[package]]\nname="probe-macros"\nversion="0.1.0"\nsource='
+                        + json.dumps(f"git+{url}?rev={current}#{current}") + '\n')
+        given = self.registry_input()
+        name = "probe-0123456789abcdef"
+        db = self.bare_copy(origin, given / "git/db" / name, "+refs/heads/*:refs/heads/*")
+        blobs = {oid for oid in ancestor_only if git(db, "cat-file", "-t", oid) == "blob"}
+        self.assertTrue(blobs, "the input home holds an ancestor-only body")
+        self.recreator["_agh_source_fetch"] = lambda *_a, **_k: self.fail("the input home's database holds the commit")
+        self.cargo_like_git([(url, current, name)])
+        report = self.prepare(given)
+        handoff = Path(report["cargo_home"])
+        stores = [path.parent for home in (self.work / "cargo-home", handoff)
+                  for path in home.rglob("objects") if path.is_dir()]
+        stores += [path / ".git" for path in self.work.glob("agh-git-*/source-*")]
+        self.assertGreaterEqual(len(stores), 4)  # each home's database and checkout, and the stage
+        for store in stores:
+            self.assertFalse((store / "objects/info/alternates").exists(), store)
+            for blob in blobs:
+                found = subprocess.run(["git", "--git-dir", str(store), "cat-file", "-e", blob], capture_output=True)
+                self.assertNotEqual(found.returncode, 0, f"{store} holds ancestor-only body {blob}")
+        self.assertEqual([row["method"] for row in report["transport"]["acquisitions"]], ["exact-local-object-cache"])
+        # The ceiling counts the commit's one acquisition, not its two locked rows.
+        self.assertEqual(report["ceiling"]["git_commits"], 1)
+        self.assertEqual(git(handoff / "git/db" / name, "show", current + ":src/lib.rs"),
+                         "// the body the locked commit has")
+
+    def test_closure_missing_a_checkout_blob_refuses(self):
+        # RL-54. Nothing stands behind a checkout closure (no ancestry to fall back on), so each
+        # is checked whole: a store that lacks a body the locked tree reaches is not lent, and
+        # an acquisition that lacks one refuses, naming the body and its path.
+        origin, oid = self.repository("probe", extra={"src/body.rs": "// a body the locked tree reaches\n"})
+        url = "https://github.com/Owner/probe.git"
+        self.declare("https://github.com/Owner/probe", oid)
+        body = git(origin, "rev-parse", oid + ":src/body.rs")
+        partial = self.bare_copy(origin, self.root / "partial", f"+{oid}:refs/heads/main")
+        (partial / "objects" / body[:2] / body[2:]).unlink()
+        with self.assertRaisesRegex(RuntimeError, f"checkout closure of {url} {oid[:12]} lacks 1 object\\(s\\) "
+                                    f"its tree reaches: {body} \\(src/body.rs\\)"):
+            self.profile({(url, oid): origin}, dropped=(body,), object_caches={url: partial})
+        # The incomplete declared store was not lent; Agh was asked, with it as the cache.
+        self.assertEqual(self.acquisition_calls, [(url, oid)])
+        self.assertEqual(self.acquisition_options, [{"checkout_cache": partial}])
 
     def declare(self, url, oid, **extra):
         selector = next((key for key in ("branch", "tag") if key in extra), "rev")
@@ -1232,7 +1711,7 @@ class DependencyFetchBoundaryTests(unittest.TestCase):
         db = cache / "git/db/owned-support-store-is-not-a-cargo-url-hash"
         db.parent.mkdir(parents=True)
         subprocess.run(["git", "init", "--bare", "-q", str(db)], check=True)
-        subprocess.run(["git", "-c", "protocol.file.allow=always", "--git-dir", str(db),
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "-c", "maintenance.auto=false", "--git-dir", str(db),
                         "fetch", "--no-tags", str(origin), "+" + oid + ":refs/commit/" + oid],
                        check=True, capture_output=True)
         _, _, document, calls = self.profile({})
@@ -1282,8 +1761,78 @@ class DependencyFetchBoundaryTests(unittest.TestCase):
 
     def test_missing_owner_lock_refuses_before_any_acquisition(self):
         (self.source / "Cargo.lock").unlink()
+        # The preparation's ceiling reads the owner locks first, before its home exists.
+        with self.assertRaisesRegex(RuntimeError, "dependency owner lock is missing: no committed lockfile "
+                                    + re.escape(str(self.source / "Cargo.lock"))):
+            self.prepare()
+        self.assertFalse(self.trace.exists())
+        self.assertFalse((self.work / "cargo-home").exists())
         with self.assertRaisesRegex(RuntimeError, "no committed lockfile"):
             self.profile({})
+
+    def test_declared_cache_without_its_own_object_store_refuses_before_any_agh(self):
+        # A declared cache lends its object directory and nothing else of it, so one that routes
+        # its objects elsewhere, or shares another repository's store (a linked worktree's Git
+        # directory, which names it in `commondir`), refuses before any acquisition.
+        origin, oid = self.repository("probe")
+        url = "https://github.com/Owner/probe.git"
+        self.declare("https://github.com/Owner/probe", oid)
+        routed = self.bare_copy(origin, self.root / "routed", f"+{oid}:refs/heads/main")
+        (routed / "objects/info/alternates").write_text(str(origin / ".git/objects") + "\n")
+        with self.assertRaisesRegex(RuntimeError, "declared dependency object cache routes its objects elsewhere: "
+                                    + re.escape(str(routed / "objects/info/alternates"))):
+            self.profile({(url, oid): origin}, object_caches={url: routed})
+        self.assertEqual(self.acquisition_calls, [])
+        worktree = self.root / "linked-worktree"
+        git(origin, "worktree", "add", "--quiet", "--detach", str(worktree), oid)
+        linked = origin / ".git/worktrees" / worktree.name
+        self.assertTrue((linked / "commondir").is_file())
+        for declared in (linked, worktree):  # its Git directory, and the checkout whose .git is a file
+            with self.subTest(declared=declared), self.assertRaisesRegex(
+                    RuntimeError, "must be a repository with its own object store: " + re.escape(str(declared))):
+                self.profile({(url, oid): origin}, object_caches={url: declared})
+            self.assertEqual(self.acquisition_calls, [])
+
+    def test_corrupt_body_in_a_declared_cache_refuses_and_is_never_held(self):
+        # The census that admits a declared cache asks only whether each object is present. A
+        # body stored under its true name with other content is caught by the depth-one transfer
+        # (fetch.fsckObjects, and the object it then lacks), which refuses: the tick stops rather
+        # than take it, and no stage holds the true name.
+        origin, oid = self.repository("probe", extra={"src/body.rs": "// the true body\n"})
+        url = "https://github.com/Owner/probe.git"
+        self.declare("https://github.com/Owner/probe", oid)
+        body = git(origin, "rev-parse", oid + ":src/body.rs")
+        corrupt = self.bare_copy(origin, self.root / "corrupt", f"+{oid}:refs/heads/main")
+        loose = corrupt / "objects" / body[:2] / body[2:]
+        content = b"// another body under the true name\n"
+        loose.chmod(0o644)
+        loose.write_bytes(zlib.compress(b"blob %d\0" % len(content) + content))
+        with self.assertRaisesRegex(RuntimeError, "fixed local dependency Git process did not complete successfully: "
+                                    f"the local transfer of {re.escape(url)} {oid[:12]} from its declared object caches"):
+            self.profile({(url, oid): origin}, object_caches={url: corrupt})
+        self.assertEqual(self.acquisition_calls, [])
+        stages = list(self.work.glob("agh-git-*/source-*"))
+        self.assertEqual(len(stages), 1)
+        held = subprocess.run(["git", "-C", str(stages[0]), "cat-file", "-e", body], capture_output=True)
+        self.assertNotEqual(held.returncode, 0, "the stage holds the corrupt body's true name")
+
+    def test_closure_check_refuses_a_body_that_does_not_hash_to_its_name(self):
+        # Git's --verify-objects reports a body whose content does not hash to its name on stderr
+        # and still exits zero (Git 2.54 and 2.56, measured 2026-11-17): verify_checkout_closure
+        # refuses on any diagnostic, and this is the case that rule exists for.
+        api = self.transport()
+        origin, oid = self.repository("probe", extra={"src/body.rs": "// the true body\n"})
+        body = git(origin, "rev-parse", oid + ":src/body.rs")
+        loose = origin / ".git/objects" / body[:2] / body[2:]
+        content = b"// another body under the true name\n"
+        loose.chmod(0o644)
+        loose.write_bytes(zlib.compress(b"blob %d\0" % len(content) + content))
+        scratch = self.root / "closure-scratch"
+        scratch.mkdir()
+        owner = {**self.recreator, "_dependency_deadline": time.monotonic() + 900}
+        with self.assertRaisesRegex(RuntimeError, "checkout closure of the probe does not verify "
+                                    f"\\(exit 0\\): .*hash mismatch {body}"):
+            api["verify_checkout_closure"](owner, origin, oid, "the probe", scratch)
 
     def test_locked_mutable_selector_is_native_data_not_a_second_resolution(self):
         origin, oid = self.repository("probe", extra={"unrelated/Cargo.toml": "not valid TOML at all"})
@@ -1765,6 +2314,249 @@ class BuildTreeManagerSourceTests(unittest.TestCase):
         self.assertEqual(built, "$root/" + stage.TREE_MANAGERS[-1])
 
 
+class KeptAghTests(unittest.TestCase):
+    """keep_agh: a run's own copy of the Agh on PATH, which an update of the installed one cannot reach."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.app = self.root / "Applications/Fixture.app"
+        self.link = self.root / "local-bin/agh"
+        self.link.parent.mkdir()
+        # As ~/.local/bin/agh is: a link to the bundle's own link, which names the program.
+        self.link.symlink_to(self.app / "Contents/MacOS/agh")
+        self.path = f"{self.link.parent}{os.pathsep}/usr/bin{os.pathsep}/bin"
+        identity = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")),
+                                  run_name="fixture_kept_agh")["_agh_source_identity"]
+        # The identity each acquisition records for its Agh before it starts and compares at its end.
+        self.identity = lambda agh: identity(Path(agh))
+
+    def install(self, version, answer="echo 'agh @VERSION@'; exit 0"):
+        """Install an aterm as its updater does: a whole new bundle in the old one's place."""
+        staged = self.root / f"staged-{version}/Fixture.app"
+        executable(staged / "Contents/MacOS/aterm", stand_in_agh(version, answer))
+        (staged / "Contents/MacOS/agh").symlink_to("aterm")
+        (staged / "Contents/Info.plist").write_text(f"<plist>{version}</plist>\n")
+        (staged / "Contents/MacOS/aterm").chmod(0o555)
+        if self.app.exists():
+            os.replace(self.app, self.root / f"replaced-by-{version}.app")
+        self.app.parent.mkdir(exist_ok=True)
+        os.replace(staged, self.app)
+
+    def answer(self, agh):
+        return subprocess.run([str(agh), "version"], capture_output=True, text=True, timeout=30).stdout
+
+    def slot(self, origin=None):
+        """The directory keep_agh keeps a copy of `origin` (the installed bundle) in."""
+        return self.state / "kept-agh/program" / stage.fingerprint(origin or self.app)["sha256"]
+
+    def test_reused_hash_slot_must_not_be_a_symlink(self):
+        self.install("1.0")
+        stage.keep_agh(self.state, self.path)
+        slot = self.slot()
+        outside = self.root / "outside-state-slot"
+        slot.rename(outside)
+        (outside / "bin/agh").unlink()
+        (outside / "bin").rmdir()
+        slot.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(stage.Refused, "slot"):
+            stage.keep_agh(self.state, self.path)
+        self.assertFalse((outside / "bin").exists())
+        self.assertTrue(slot.is_symlink())
+
+    def test_reused_alias_parent_must_not_be_a_symlink(self):
+        self.install("1.0")
+        stage.keep_agh(self.state, self.path)
+        parent = self.slot() / "bin"
+        outside = self.root / "outside-state-alias"
+        parent.rename(outside)
+        parent.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(stage.Refused, "link directory"):
+            stage.keep_agh(self.state, self.path)
+        self.assertTrue(parent.is_symlink())
+        self.assertTrue((outside / "agh").is_symlink())
+
+    def protect(self, *protected):
+        """macOS's App Management: a copied bundle one of whose programs has run can no longer be
+        changed or removed by a process outside its signer (EPERM, measured 2026-11-17 on m86)."""
+        real = stage.remove_tree
+
+        def remove_tree(path):
+            if any(Path(path) == item or Path(path).is_relative_to(item) for item in protected):
+                raise PermissionError(1, "Operation not permitted", str(path))
+            real(path)
+        return mock.patch.object(stage, "remove_tree", remove_tree)
+
+    def test_a_bundled_agh_is_kept_with_its_bundle_and_an_update_cannot_change_it(self):
+        self.install("1.0")
+        kept = stage.keep_agh(self.state, self.path)
+        slot = self.slot()
+        self.assertEqual(kept, {
+            "selected": str(self.link), "program": str(self.app / "Contents/MacOS/aterm"),
+            "kept": str(slot / "bin/agh"), "directory": str(slot / "bin"),
+            "executable": str(slot / "Fixture.app/Contents/MacOS/aterm"),
+            "sha256": hashlib.sha256(stand_in_agh("1.0").encode()).hexdigest(), "version": "agh 1.0",
+            "reused": False, "left": []})
+        # The directory a run puts on its PATH holds the one name; the bundle is whole beside it.
+        self.assertEqual(os.listdir(slot / "bin"), ["agh"])
+        self.assertEqual(Path(kept["kept"]).resolve(), Path(kept["executable"]))
+        self.assertEqual((slot / "Fixture.app/Contents/Info.plist").read_text(), "<plist>1.0</plist>\n")
+        self.assertEqual(os.readlink(slot / "Fixture.app/Contents/MacOS/agh"), "aterm")
+        installed, copy = self.identity(str(self.link)), self.identity(kept["kept"])
+        self.assertEqual(installed["sha256"], copy["sha256"])
+
+        self.install("2.0")
+        # What ended the 18:26Z tick on 2026-11-16: the identity an acquisition compares at
+        # its end is another program's. The run's copy is the file it was.
+        self.assertNotEqual(self.identity(str(self.link)), installed)
+        self.assertEqual(self.identity(kept["kept"]), copy)
+        self.assertEqual((self.answer(self.link), self.answer(kept["kept"])), ("agh 2.0\n", "agh 1.0\n"))
+
+        # The next run keeps the Agh then installed in a copy of its own, and removes the
+        # earlier copy, read-only files and all, when macOS lets it.
+        again = stage.keep_agh(self.state, self.path)
+        self.assertEqual((again["kept"], again["version"], again["reused"], again["left"]),
+                         (str(self.slot() / "bin/agh"), "agh 2.0", False, []))
+        self.assertNotEqual(again["kept"], kept["kept"])
+        self.assertEqual(self.identity(again["kept"])["sha256"], self.identity(str(self.link))["sha256"])
+        self.assertEqual(os.listdir(self.state / "kept-agh/program"), [self.slot().name])
+        self.assertEqual(os.listdir(self.state / "kept-agh"), ["program"])
+
+    def test_an_agh_outside_a_bundle_is_kept_as_one_file(self):
+        program = self.root / "tools/agh-0.3"
+        executable(program, stand_in_agh("0.3"))
+        self.link.unlink()
+        self.link.symlink_to(program)
+        kept = stage.keep_agh(self.state, self.path)
+        home, slot = self.state / "kept-agh", self.slot(program)
+        self.assertEqual((kept["program"], kept["executable"], kept["version"]),
+                         (str(program), str(slot / "agh-0.3"), "agh 0.3"))
+        name = slot.name
+        self.assertEqual(sorted(str(path.relative_to(home)) for path in home.rglob("*")),
+                         ["program", f"program/{name}", f"program/{name}/agh-0.3",
+                          f"program/{name}/bin", f"program/{name}/bin/agh"])
+        self.assertEqual((slot / "agh-0.3").stat().st_mode & 0o777, 0o755)
+
+    def test_a_path_without_agh_keeps_nothing(self):
+        self.assertIsNone(stage.keep_agh(self.state, "/usr/bin" + os.pathsep + "/bin"))
+        self.assertFalse((self.state / "kept-agh").exists())
+        before = os.environ.get("PATH")
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin" + os.pathsep + "/bin"}):
+            with stage.agh_kept_in(self.state) as kept:
+                self.assertIsNone(kept)
+                self.assertEqual(os.environ["PATH"], "/usr/bin" + os.pathsep + "/bin")
+        self.assertEqual(os.environ.get("PATH"), before)
+
+    def test_the_kept_agh_is_first_on_the_process_path_only_inside_its_block(self):
+        self.install("1.0")
+        with mock.patch.dict(os.environ, {"PATH": self.path}):
+            with self.assertRaisesRegex(RuntimeError, "the block's own error"):
+                with stage.agh_kept_in(self.state) as kept:
+                    self.assertEqual(os.environ["PATH"], kept["directory"] + os.pathsep + self.path)
+                    self.assertEqual(shutil.which("agh"), kept["kept"])
+                    raise RuntimeError("the block's own error")
+            self.assertEqual(os.environ["PATH"], self.path)
+            self.assertEqual(shutil.which("agh"), str(self.link))
+
+    def test_a_copy_that_is_not_the_selected_agh_or_does_not_run_refuses(self):
+        # macOS ends an application's executable that starts outside its bundle; the stand-in
+        # ends itself the same way.
+        self.install("1.0", answer="kill -9 $$")
+        with self.assertRaisesRegex(stage.Refused, r"does not run from .*/kept-agh/program/[0-9a-f]{64}/bin/agh: `agh version` exited -9"):
+            stage.keep_agh(self.state, self.path)
+        self.install("1.1", answer="echo 'no such verb' >&2; exit 2")
+        with self.assertRaisesRegex(stage.Refused, r"`agh version` exited 2: no such verb"):
+            stage.keep_agh(self.state, self.path)
+
+        self.install("2.0")
+        real, nested = shutil.copytree, []
+
+        def updated_while_copied(source, destination, *arguments, **options):
+            # shutil copies each directory through this same name; the update lands once,
+            # after the whole bundle.
+            nested.append(source)
+            try:
+                real(source, destination, *arguments, **options)
+            finally:
+                nested.pop()
+            if not nested:
+                (Path(destination) / "Contents/Info.plist").write_text("<plist>2.1</plist>\n")
+        with mock.patch.object(stage.shutil, "copytree", updated_while_copied), \
+                self.assertRaisesRegex(stage.Refused, "Agh changed while this run copied it"):
+            stage.keep_agh(self.state, self.path)
+
+    def test_an_unchanged_agh_is_reused_and_its_copy_is_never_written_again(self):
+        self.install("1.0")
+        first = stage.keep_agh(self.state, self.path)
+        # The copy has run (`agh version`), so macOS now refuses this process any change to it.
+        with self.protect(self.slot()), \
+                mock.patch.object(stage.shutil, "copytree", side_effect=AssertionError("copied again")):
+            again = stage.keep_agh(self.state, self.path)
+        self.assertEqual({**again, "reused": False}, first)
+        self.assertTrue(again["reused"])
+        self.assertEqual(self.answer(again["kept"]), "agh 1.0\n")
+
+    def test_an_earlier_copy_macos_protects_is_left_named_and_the_run_goes_on(self):
+        # m86, 2026-11-17T17:14Z: the tick after the first ended at its start with
+        # "[Errno 1] Operation not permitted: .../kept-agh/program/aterm.app".
+        self.install("1.0")
+        first = stage.keep_agh(self.state, self.path)
+        earlier = Path(first["directory"]).parent
+        self.install("2.0")
+        with self.protect(earlier), mock.patch("sys.stderr", new_callable=io.StringIO) as said:
+            kept = stage.keep_agh(self.state, self.path)
+        self.assertEqual((kept["version"], kept["reused"], kept["left"]), ("agh 2.0", False, [str(earlier)]))
+        self.assertIn(f"remove from a session in aterm: {earlier}", said.getvalue())
+        self.assertEqual(self.answer(first["kept"]), "agh 1.0\n")
+        # Once something allowed removes it, the next run names nothing.
+        self.assertEqual(stage.keep_agh(self.state, self.path)["left"], [])
+        self.assertFalse(earlier.exists())
+
+    def test_the_single_copy_layout_of_an_earlier_runner_does_not_stop_the_run(self):
+        # trust d0b7f21a61 kept one copy at kept-agh/program/NAME.app with its link in kept-agh/bin.
+        self.install("1.0")
+        legacy = self.state / "kept-agh/program/Fixture.app"
+        shutil.copytree(self.app, legacy, symlinks=True)
+        (self.state / "kept-agh/bin").mkdir()
+        (self.state / "kept-agh/bin/agh").symlink_to(legacy / "Contents/MacOS/aterm")
+        self.install("2.0")
+        with self.protect(legacy):
+            kept = stage.keep_agh(self.state, self.path)
+        self.assertEqual((kept["version"], kept["left"]), ("agh 2.0", [str(legacy)]))
+        self.assertFalse((self.state / "kept-agh/bin").exists())
+        kept = stage.keep_agh(self.state, self.path)
+        self.assertEqual((kept["reused"], kept["left"]), (True, []))
+        self.assertEqual(os.listdir(self.state / "kept-agh/program"), [self.slot().name])
+
+    def test_an_unfinished_copy_is_made_again_and_one_that_cannot_go_refuses(self):
+        self.install("1.0")
+        slot = self.slot()
+        (slot / "Fixture.app/Contents").mkdir(parents=True)  # a run that ended while copying
+        kept = stage.keep_agh(self.state, self.path)
+        self.assertEqual((kept["version"], kept["reused"]), ("agh 1.0", False))
+        (slot / "Fixture.app/Contents/Info.plist").write_text("<plist>edited</plist>\n")
+        with self.protect(slot), self.assertRaisesRegex(stage.Refused, "neither whole nor removable"):
+            stage.keep_agh(self.state, self.path)
+
+    def test_a_kept_directory_that_is_not_the_runs_own_refuses(self):
+        self.install("1.0")
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.state / "kept-agh").symlink_to(elsewhere)
+        with self.assertRaisesRegex(stage.Refused, "must be this state root's own directory"):
+            stage.keep_agh(self.state, self.path)
+        self.assertEqual(os.listdir(elsewhere), [])
+        (self.state / "kept-agh").unlink()
+        # A PATH that already selects this root's copy: replacing it would delete its own source.
+        kept = stage.keep_agh(self.state, self.path)
+        with self.assertRaisesRegex(stage.Refused, "PATH already selects the Agh a run kept"):
+            stage.keep_agh(self.state, kept["directory"] + os.pathsep + self.path)
+        self.assertEqual(self.answer(kept["kept"]), "agh 1.0\n")
+
+
 class DailyCliTests(unittest.TestCase):
     def test_dry_run_refuses_other_actions_before_dispatch(self):
         unsupported = (["run"], ["status"], ["train", "status"],
@@ -1796,6 +2588,316 @@ class DailyCliTests(unittest.TestCase):
                 self.assertEqual(args.verb, words[1] if len(words) == 2 else None)
 
 
+class TrainSourceObjectTests(unittest.TestCase):
+    PATH = "first-party/fixture"
+    URL = "https://github.com/fixture/child.git"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="train-source-objects-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.state = self.root / "train"
+        self.state.mkdir()
+        self.owner = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")), run_name="source_object_fixture")
+        self.external = self.root / "external"
+        self.repository(self.external, "external")
+        self.caches = {self.PATH: self.external}
+        self.manager = stage.TrainSourceObjects(self.state, self.owner, [f"{self.PATH}={self.external}"])
+
+    def repository(self, path, content):
+        path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", "--template=", str(path)], check=True)
+        (path / "README").write_text(content)
+        git(path, "add", "README")
+        self.commit(path, "fixture")
+        git(path, "remote", "add", "origin", self.URL)
+        return git(path, "rev-parse", "HEAD")
+
+    def commit(self, path, message):
+        git(path, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+            "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", message)
+
+    def build(self, name, content="selected", *, child_from=None):
+        build = self.state / "builds" / name
+        source, child = build / "source", build / "source" / self.PATH
+        self.repository(source, "controller")
+        if child_from is None:
+            pin = self.repository(child, content)
+        else:
+            child.parent.mkdir(parents=True)
+            subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", "--template=",
+                            str(child_from), str(child)], check=True)
+            git(child, "remote", "set-url", "origin", self.URL)
+            pin = git(child, "rev-parse", "HEAD")
+        (source / ".gitmodules").write_text(
+            f'[submodule "fixture"]\n\tpath = {self.PATH}\n\turl = {self.URL}\n')
+        git(source, "add", ".gitmodules")
+        git(source, "update-index", "--add", "--cacheinfo", "160000", pin, self.PATH)
+        self.commit(source, "selected child")
+        stage.atomic_json(build / "train-build.json", {"schema": stage.TRAIN_SCHEMA,
+                                                       "main": git(source, "rev-parse", "HEAD")})
+        self.manager.capture(source, build, self.caches)
+        return build, source, child, pin
+
+    def select(self, source, caches, good):
+        return self.manager.select(self.owner["_indexed_submodules"](source), caches, good)
+
+    def next_source(self, source, name):
+        destination = self.root / name
+        subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", "--template=",
+                        str(source), str(destination)], check=True)
+        return destination
+
+    def files(self, root):
+        return {str(path.relative_to(root)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode),
+                                             path.stat().st_ino, path.stat().st_nlink)
+                for path in root.rglob("*") if path.is_file()}
+
+    def failed(self, build):
+        return {"status": "failed", "build_dir": str(build)}
+
+    def test_failed_late_cut_reuses_exact_pin_after_real_retirement_without_copying(self):
+        build, source, child, pin = self.build("failed")
+        next_source = self.next_source(source, "next")
+        original = (child / ".git").stat()
+        external = self.files(self.external)
+        with stage.train_lock(self.state) as owned:
+            self.assertTrue(owned)
+            self.manager.retain_failed(self.failed(build), None)
+            self.assertFalse((child / ".git").exists())
+            self.assertEqual(stage.retire_builds(self.state, None), [])
+            self.assertFalse(build.exists())
+            donor = self.select(next_source, self.caches, None)[self.PATH]
+            retained = (donor / ".git").stat()
+            self.assertEqual((retained.st_dev, retained.st_ino), (original.st_dev, original.st_ino))
+            self.assertFalse((donor / "README").exists())
+            self.assertEqual(git(donor, "show", pin + ":README"), "selected")
+            self.assertEqual(self.files(self.external), external)
+            self.assertEqual({path.name for path in donor.parent.iterdir()}, {"current.json", donor.name})
+
+    def test_exact_last_good_is_preferred_and_does_not_make_another_donor(self):
+        good_build, good_source, good_child, _pin = self.build("good")
+        failed, source, child, _pin = self.build("failed", child_from=good_child)
+        next_source = self.next_source(source, "next")
+        good = {"build_dir": str(good_build)}
+        # Previously retained independent snapshots need no new receipt or write.
+        (good_build / "source-object-pins.json").unlink()
+        stage.atomic_json(good_build / "source.owner.json", {
+            "schema": stage.SCHEMA, "snapshot_kind": "independent-git-v1", "path": str(good_source)})
+        original_good = self.files(good_build)
+        with stage.train_lock(self.state):
+            self.manager.retain_failed(self.failed(failed), good)
+            self.assertTrue((child / ".git").is_dir())
+            self.assertFalse((self.state / "source-objects-v1").exists())
+            self.assertEqual(stage.retire_builds(self.state, good_build), [])
+            self.assertEqual(self.select(next_source, self.caches, good)[self.PATH], good_child)
+            self.assertTrue((good_source / ".git").is_dir())
+            self.assertEqual(self.files(good_build), original_good)
+
+    def test_interrupted_transfer_keeps_working_donor_then_retries_and_bounds_replacement(self):
+        old, source_a, _child_a, _pin_a = self.build("old", "A")
+        source_a = self.next_source(source_a, "source-a")
+        with stage.train_lock(self.state):
+            self.manager.retain_failed(self.failed(old), None)
+            stage.retire_builds(self.state, None)
+            old_donor = self.select(source_a, self.caches, None)[self.PATH]
+            build, source_b, child, pin_b = self.build("new", "B")
+            source_b = self.next_source(source_b, "source-b")
+            actual_move = self.owner["_source_object_exclusive_move"]
+            def interrupted(parent, container):
+                move, close = actual_move(parent, container)
+                def move_then_interrupt(source, destination):
+                    move(source, destination)
+                    raise InterruptedError("after the physical object transfer")
+                return move_then_interrupt, close
+            with mock.patch.dict(self.owner, {"_source_object_exclusive_move": interrupted}):
+                with self.assertRaisesRegex(InterruptedError, "physical object transfer"):
+                    self.manager.retain_failed(self.failed(build), None)
+            self.assertFalse((child / ".git").exists())
+            self.assertEqual(self.select(source_a, self.caches, None)[self.PATH], old_donor)
+            self.assertTrue(old_donor.exists())
+            self.manager.retain_failed(self.failed(build), None)
+            self.assertEqual(stage.retire_builds(self.state, None), [])
+            donor = self.select(source_b, self.caches, None)[self.PATH]
+            self.assertEqual(git(donor, "show", pin_b + ":README"), "B")
+            self.assertFalse(old_donor.exists())
+            self.assertEqual(self.select(source_a, self.caches, None), self.caches)
+            self.assertEqual({path.name for path in donor.parent.iterdir()}, {"current.json", donor.name})
+
+    def test_changed_repository_or_pin_never_reuses_the_retained_donor(self):
+        build, source, _child, _pin = self.build("failed")
+        next_source = self.next_source(source, "next")
+        with stage.train_lock(self.state):
+            self.manager.retain_failed(self.failed(build), None)
+            stage.retire_builds(self.state, None)
+            modules = next_source / ".gitmodules"
+            modules.write_text(modules.read_text().replace(self.URL, "https://github.com/fixture/other.git"))
+            git(next_source, "add", ".gitmodules")
+            self.assertEqual(self.select(next_source, self.caches, None), self.caches)
+            modules.write_text(modules.read_text().replace("https://github.com/fixture/other.git", self.URL))
+            git(next_source, "add", ".gitmodules")
+            git(next_source, "update-index", "--cacheinfo", "160000", "1" * 40, self.PATH)
+            self.assertEqual(self.select(next_source, self.caches, None), self.caches)
+
+    def test_unknown_capture_and_bad_child_custody_do_not_replace_working_donor(self):
+        old, source, _child, _pin = self.build("old", "A")
+        next_source = self.next_source(source, "next")
+        with stage.train_lock(self.state):
+            self.manager.retain_failed(self.failed(old), None)
+            stage.retire_builds(self.state, None)
+            donor = self.select(next_source, self.caches, None)[self.PATH]
+            original = self.files(donor)
+            external = self.files(self.external)
+            for name in ("alternates", "hooks", "symlink", "capture"):
+                with self.subTest(name=name):
+                    build, _source, child, _pin = self.build(name, name)
+                    if name == "alternates":
+                        (child / ".git/objects/info/alternates").write_text(str(self.external / ".git/objects") + "\n")
+                    elif name == "hooks":
+                        git(child, "config", "core.hooksPath", str(self.external))
+                    elif name == "symlink":
+                        child.rename(child.with_name("original"))
+                        child.symlink_to(self.external, target_is_directory=True)
+                    else:
+                        stage.atomic_json(build / "source-object-pins.json", {"schema": "unknown"})
+                    self.manager.retain_failed(self.failed(build), None)
+                    self.assertEqual(self.files(donor), original)
+                    self.assertEqual(self.files(self.external), external)
+
+    def test_creation_interrupted_after_mkdir_reuses_empty_slot_without_deleting_files(self):
+        build, source, _child, _pin = self.build("failed")
+        next_source = self.next_source(source, "next")
+        slot = self.manager.slot(self.PATH)
+        mkdir = Path.mkdir
+        def interrupted(path, *args, **kwargs):
+            result = mkdir(path, *args, **kwargs)
+            if path == slot / "donor-0":
+                raise InterruptedError("after mkdir before binding the empty slot")
+            return result
+        with stage.train_lock(self.state):
+            with mock.patch.object(Path, "mkdir", interrupted):
+                with self.assertRaisesRegex(InterruptedError, "after mkdir"):
+                    self.manager.retain_failed(self.failed(build), None)
+            original_inode = (slot / "donor-0").stat().st_ino
+            self.assertEqual(list((slot / "donor-0").iterdir()), [])
+            self.manager.retain_failed(self.failed(build), None)
+            stage.retire_builds(self.state, None)
+            donor = self.select(next_source, self.caches, None)[self.PATH]
+            self.assertEqual(donor.stat().st_ino, original_inode)
+            self.assertEqual({item.name for item in slot.iterdir()}, {"current.json", "donor-0"})
+
+    def test_unknown_creation_files_and_unusable_current_never_veto_retirement(self):
+        old, source, _child, _pin = self.build("old", "A")
+        next_source = self.next_source(source, "next")
+        with stage.train_lock(self.state):
+            self.manager.retain_failed(self.failed(old), None)
+            stage.retire_builds(self.state, None)
+            donor = self.select(next_source, self.caches, None)[self.PATH]
+            slot = donor.parent
+            build, _source, _child, _pin = self.build("new", "B")
+            mkdir = Path.mkdir
+            def interrupted(path, *args, **kwargs):
+                result = mkdir(path, *args, **kwargs)
+                if path == slot / "donor-1":
+                    (path / "unknown").write_text("must survive")
+                    raise InterruptedError("after unknown directory appeared")
+                return result
+            with mock.patch.object(Path, "mkdir", interrupted):
+                with self.assertRaises(InterruptedError):
+                    self.manager.retain_failed(self.failed(build), None)
+            self.manager.retain_failed(self.failed(build), None)
+            self.assertEqual(stage.retire_builds(self.state, None), [])
+            self.assertEqual((slot / "donor-1/unknown").read_text(), "must survive")
+            self.assertEqual(self.select(next_source, self.caches, None)[self.PATH], donor)
+            # Optional malformed donor DATA cannot block the next otherwise valid cut.
+            git(donor, "config", "core.hooksPath", str(self.external))
+            preserved = self.files(donor)
+            self.assertEqual(self.select(next_source, self.caches, None), self.caches)
+            failed, _source, _child, _pin = self.build("later", "C")
+            self.manager.retain_failed(self.failed(failed), None)
+            self.assertEqual(stage.retire_builds(self.state, None), [])
+            self.assertEqual(self.files(donor), preserved)
+
+    def test_interrupted_old_cleanup_recovers_without_deleted_git_metadata(self):
+        old, source, _child, _pin = self.build("old", "A")
+        with stage.train_lock(self.state):
+            self.manager.retain_failed(self.failed(old), None)
+            donor = self.select(source, self.caches, None)[self.PATH]
+            stage.retire_builds(self.state, None)
+            failed, source, _child, pin = self.build("new", "B")
+            next_source = self.next_source(source, "next")
+            remove = stage.remove_tree
+            def interrupted(path):
+                if path == donor:
+                    (path / ".git/config").unlink()
+                    raise InterruptedError("after deleting previous Git metadata")
+                remove(path)
+            with mock.patch.object(stage, "remove_tree", interrupted):
+                with self.assertRaisesRegex(InterruptedError, "previous Git metadata"):
+                    self.manager.retain_failed(self.failed(failed), None)
+            self.assertTrue((donor.parent / "retiring.json").is_file())
+            self.manager.retain_failed(self.failed(failed), None)
+            self.assertEqual(stage.retire_builds(self.state, None), [])
+            current = self.select(next_source, self.caches, None)[self.PATH]
+            self.assertEqual(git(current, "show", pin + ":README"), "B")
+            self.assertFalse(donor.exists())
+            self.assertEqual({item.name for item in current.parent.iterdir()}, {"current.json", current.name})
+
+    def test_runner_captures_after_offline_restoration_and_landing_never_overwrites_it(self):
+        build, source, child, pin = self.build("source")
+        capture = build / "source-object-pins.json"
+        capture.unlink()
+        (child / "README").write_text("admissible later child")
+        git(child, "add", "README")
+        self.commit(child, "later child")
+        runner = object.__new__(stage.Runner)
+        runner.source, runner.state = source, build
+        runner.invocation = build / "runs/fixture"
+        runner.invocation.mkdir(parents=True)
+        runner.record_lock = threading.RLock()
+        runner.args = types.SimpleNamespace(source_object_cache=[f"{self.PATH}={self.external}"],
+                                            owned_object_cache=[])
+        runner.train = types.SimpleNamespace(source_objects=lambda: self.manager, state={})
+        runner.git_owner = lambda: self.owner
+        runner.git = lambda _name, path, *args: self.manager.git(path, *args)
+        runner.synchronization_git_environment = lambda: nullcontext({})
+        def synchronize(_name, _argv, **_kwargs):
+            if not capture.exists():
+                self.assertNotEqual(git(child, "rev-parse", "HEAD"), pin)
+                git(child, "checkout", "--quiet", "--detach", pin)
+            return ""
+        runner.call = synchronize
+        with stage.train_lock(self.state):
+            runner.synchronize(source, "source")
+            self.assertEqual(git(child, "rev-parse", "HEAD"), pin)
+            original = capture.read_bytes()
+            landing = self.next_source(source, "landing")
+            landing_child = landing / self.PATH
+            subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", "--template=",
+                            str(child), str(landing_child)], check=True)
+            git(landing_child, "remote", "set-url", "origin", self.URL)
+            runner.synchronize(landing, "landing-trust")
+            self.assertEqual(capture.read_bytes(), original)
+
+    def test_installer_confinement_and_independent_transfer_retarget_refusal(self):
+        parent, destination = self.root / "from", self.root / "to"
+        parent.mkdir()
+        destination.mkdir()
+        (parent / "object-data").mkdir()
+        with self.assertRaisesRegex(RuntimeError, "inside its destination parent"):
+            self.owner["_submodule_exclusive_move"](parent, destination)
+        move, close = self.owner["_source_object_exclusive_move"](parent, destination)
+        try:
+            destination.rename(self.root / "held-original")
+            destination.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "directory changed"):
+                move(parent / "object-data", destination / "objects")
+            self.assertTrue((parent / "object-data").is_dir())
+            self.assertEqual(list(destination.iterdir()), [])
+        finally:
+            close()
+
+
 class DailyStagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="daily-stage-test-")
@@ -1816,6 +2918,9 @@ class DailyStagingTests(unittest.TestCase):
         # too, rather than depending on whether the host installs rustup.
         self.rustup = self.root / "consumer-tools/rustup"
         executable(self.rustup, "#!/bin/sh\necho 'fixture rustup must use Owners' >&2\nexit 97\n")
+        # A run keeps the Agh first on its PATH (keep_agh): the fixture's, not this Mac's.
+        self.agh = self.rustup.with_name("agh")
+        executable(self.agh, stand_in_agh("0.0.0-fixture"))
         environment = mock.patch.dict(os.environ, {
             "PATH": str(self.rustup.parent) + os.pathsep + os.environ.get("PATH", ""),
         })
@@ -2117,7 +3222,13 @@ else:
             if "recreate_bootstrap.py" in " ".join(argv):
                 self.assertNotIn("RUSTUP_HOME", env)
                 self.assertNotIn("CARGO_HOME", env)
-            elif name != "locked-dependency-prewarm":
+            elif name == "build-tree-manager":
+                # Built with the prepared seed's Targo and a copy of the prepared handoff, in the
+                # recreator's environment: no rustup selection and not the run's --cargo-home.
+                self.assertNotIn("RUSTUP_HOME", env)
+                self.assertTrue(Path(env["CARGO_HOME"]).is_relative_to(
+                    self.state / "dependencies" / original / "manager-inputs"), env["CARGO_HOME"])
+            elif name not in {"locked-dependency-ceiling", "locked-dependency-prewarm"}:
                 self.assertEqual(env["RUSTUP_HOME"], str(self.state / "rustup"))
             if name in {"sanctioned-mint-and-double-compile", "seal-without-admission", "trust-wp-drivers"} or name.startswith("unsigned-"):
                 self.assertEqual(argv[1], "--")  # build-slot admission
@@ -2247,7 +3358,12 @@ else:
         self.assertIn("_owned-command", call[1])
         self.assertNotIn("CARGO_HOME", call[2])
         self.assertNotIn("RUSTUP_HOME", call[2])
-        self.assertEqual(self.owners.timeouts[call[0]], stage.DEPENDENCY_PREWARM_SECONDS)
+        # The supervisor's bound is the ceiling the preparation's owners computed before it
+        # started, and the preparation is handed the same number to check: no constant total.
+        self.assertEqual(self.owners.assertion_ceiling, [True, False])
+        self.assertEqual(self.owners.timeouts[call[0]], 4321)
+        self.assertEqual(call[1][call[1].index("--ceiling-seconds") + 1], "4321")
+        self.assertLess(names.index("locked-dependency-ceiling"), names.index("locked-dependency-prewarm"))
         report = stage.read_json(Path(record["dependency_preparation"]["report"]))
         self.assertTrue(report["completed_fetches"][-1]["offline"])
         expected = record["dependency_preparation"]["cargo_home"]
@@ -2257,36 +3373,232 @@ else:
                 self.assertEqual(argv[argv.index("--cargo-home") + 1], expected)
                 self.assertEqual(argv[argv.index("--clean-lean-lib") + 1], record["clean_lean_inputs"]["library_path"])
 
-    def test_the_runner_gives_its_snapshot_a_build_tree_manager_before_the_prewarm(self):
+    def test_selected_older_helper_reply_reaches_mint_and_resumes_without_refetch(self):
+        # Owners returns the selected older helper's three-pass wire. The actual
+        # older-helper dispatch is separately exercised by PrewarmBoundaryTests.
+        result, first = self.run_pipeline("--aterm-repo", str(self.aterm))
+        self.assertEqual(result, 0, first.get("error"))
+        receipt = Path(first["dependency_preparation"]["report"])
+        original = receipt.read_bytes()
+        report = stage.read_json(receipt)
+        self.assertNotIn("input_acquisition", report)
+        self.assertEqual(report["completed_fetches"], [
+            {"manifest": "Cargo.toml", "offline": False},
+            {"manifest": "Cargo.toml", "offline": True}])
+        self.assertIn("sanctioned-mint-and-double-compile", self.names())
+        self.owners.calls.clear()
+        result, resumed = self.run_pipeline("--aterm-repo", str(self.aterm))
+        self.assertEqual(result, 0, resumed.get("error"))
+        self.assertIn("mint", resumed["reused"])
+        self.assertNotIn("locked-dependency-prewarm", self.names())
+        self.assertNotIn("sanctioned-mint-and-double-compile", self.names())
+        self.assertEqual(receipt.read_bytes(), original)
+
+    def claiming_build_slot(self):
+        """The snapshot's build-slot takes --rank and --claim-key, and says so when asked."""
+        executable(self.repo / "scripts/build-slot",
+                   "#!/bin/sh\nif [ \"$1\" = --capabilities ]; then echo build-slot-claim-v1; fi\nexit 0\n")
+        git(self.repo, "add", "scripts/build-slot")
+        git(self.repo, "commit", "-qm", "a build-slot that takes claim words")
+        git(self.repo, "push", "origin", "main")
+
+    @staticmethod
+    def admission_words(argv):
+        """What a build-slot step asks of its gate: the words before its first `--`."""
+        return argv[1:argv.index("--")]
+
+    def test_heavy_step_claims_release_rank(self):
+        # LS-104: the train admitted only through the slot pool, invisible to aterm's
+        # capacity ledger, whose watch yields to Release claims. Each build-slot step now
+        # claims at Release rank under one stable key per step. An unsized ledger claim
+        # asks for one pool share, so each compiling step asks for the host (--wide), the
+        # width the slot pool's uncapped borrowing gives it; the sized prewarm does not.
+        self.claiming_build_slot()
+        result, record = self.run_pipeline("--aterm-repo", str(self.aterm))
+        self.assertEqual(result, 0, record.get("error"))
+        heavy = [(name, argv) for name, argv, _ in self.owners.calls if "_owned-command" in argv]
+        self.assertIn("sanctioned-mint-and-double-compile", [name for name, _ in heavy])
+        for name, argv in heavy:
+            with self.subTest(step=name):
+                words = self.admission_words(argv)
+                claim = ["--rank", "release", "--claim-key", f"trust-train:{name}"]
+                if name == "locked-dependency-prewarm":
+                    self.assertEqual(words, ["--cpus", "1", "--mem-gb", "0", *claim])
+                else:
+                    self.assertEqual(words, [*claim, "--wide"])
+        self.assertEqual(stage.train_claim_key("index-publish-3"), "trust-train:index-publish")
+
+    def test_fetch_prewarm_claims_one_core_and_no_memory(self):
+        # The fetch-only prewarm waited 37.6 minutes for a slot on 2026-11-17, and in
+        # the ledger an ALONE claim stops every memory claim. It compiles nothing.
+        for claims in (False, True):
+            with self.subTest(claims=claims):
+                if claims:
+                    self.owners.calls.clear()
+                    self.claiming_build_slot()
+                    self.state = self.root / "state-with-claims"
+                result, record = self.run_pipeline("--aterm-repo", str(self.aterm))
+                self.assertEqual(result, 0, record.get("error"))
+                (argv,) = [argv for name, argv, _ in self.owners.calls if name == "locked-dependency-prewarm"]
+                words = self.admission_words(argv)
+                self.assertEqual(words[:4], ["--cpus", "1", "--mem-gb", "0"])
+                # An older build-slot (a resumed cut's own) gets no words it would refuse.
+                self.assertEqual(words[4:], ["--rank", "release", "--claim-key",
+                                             "trust-train:locked-dependency-prewarm"] if claims else [])
+
+    def test_train_and_runner_forward_exact_dependency_checkout_caches(self):
+        cache = self.root / "source object cache"
+        cache.mkdir()
+        provider = self.root / "seed libraries"
+        provider.mkdir()
+        declarations = [f"https://github.com/fixture/{name}#{oid * 40}={cache}"
+                        for name, oid in (("second", "2"), ("first", "1"))]
+        options = ["--dependency-checkout-cache", declarations[0],
+                   "--dependency-checkout-cache", declarations[1]]
+        words = stage.train_plist(self.train_arguments(*options))["ProgramArguments"]
+        self.assertEqual([words[i + 1] for i, word in enumerate(words) if word == options[0]], declarations)
+
+        result, record = self.run_pipeline("--aterm-repo", str(self.aterm), "--seed-dylib-path", str(provider),
+                                           *options)
+        self.assertEqual(result, 0, record.get("error"))
+        self.assertEqual(record["settings"]["dependency_checkout_cache"], sorted(declarations))
+        command = next(argv for name, argv, _env in self.owners.calls if name == "locked-dependency-prewarm")
+        worker = command[command.index("_prewarm-dependencies"):]
+        with mock.patch.object(stage, "prewarm_dependencies") as prewarm:
+            self.assertEqual(stage.main(worker), 0)
+        # The worker also carries the ceiling its supervisor was given (RL-55) and the
+        # host's per-URL object caches, none here.
+        prewarm.assert_called_once_with(Path(worker[1]), Path(worker[2]), worker[3], Path(worker[4]), [provider],
+                                        self.cargo_home, Path(worker[6]), object_caches={},
+                                        checkout_cache_specs=declarations,
+                                        ceiling_seconds=int(worker[worker.index("--ceiling-seconds") + 1]))
+
+    def test_the_runner_builds_its_snapshot_manager_from_the_prepared_dependencies(self):
         # 2026-11-15, in two state roots: the mint's first x.py refused its lease ("native
-        # build-tree manager v2 is unavailable") after the snapshot and the 20-minute prewarm.
-        # A Targo on PATH that answers v2 does not count: the mint's x.py never sees it.
+        # build-tree manager v2 is unavailable"). A Targo on PATH that answers v2 does not
+        # count: the mint's x.py never sees it. 2026-11-16: built before the preparation with
+        # --cargo-home as its Cargo home, the offline build ended six ticks of the train on
+        # "no matching package named `chrono` found". So the manager is built after the
+        # preparation and before the mint's preflight, from the prepared handoff and seed.
         path_bin = self.root / "path-bin"
         executable(path_bin / "targo", "#!/bin/sh\necho trust-build-tree-manager-v2\n")
         runner = stage.Runner(self.arguments("--aterm-repo", str(self.aterm)), self.owners)
         runner.env["PATH"] = f"{path_bin}:{runner.env['PATH']}"
         self.assertEqual(runner.run(), 0, runner.record.get("error"))
         names = self.names()
-        self.assertLess(names.index("build-tree-manager"), names.index("pinned-bootstrap-config"))
-        self.assertLess(names.index("build-tree-manager"), names.index("locked-dependency-prewarm"))
-        _name, argv, _env = next(row for row in self.owners.calls if row[0] == "build-tree-manager")
+        self.assertEqual(names.count("build-tree-manager"), 1)
+        order = [names.index(name) for name in ("locked-dependency-prewarm", "build-tree-manager-inputs",
+                                                "build-tree-manager", "mint-preflight")]
+        self.assertEqual(order, sorted(order), names)
+        work = self.state / "dependencies" / runner.record["source_commit"]
+        prepared = runner.record["dependency_preparation"]["cargo_home"]
+        _name, copy, _env = next(row for row in self.owners.calls if row[0] == "build-tree-manager-inputs")
+        self.assertEqual(copy[1:5], ["-I", "-S", str(self.state / "source/scripts/mint_seed_support.py"),
+                                     "cargo-home-inputs"])
+        self.assertEqual(copy[copy.index("--source") + 1], prepared)
+        home = Path(copy[copy.index("--destination") + 1])
+        self.assertTrue(home.is_relative_to(work / "manager-inputs"), home)
+        self.assertNotEqual(home, Path(prepared))  # the handoff itself stays the mint's unwritten input
+        _name, argv, env = next(row for row in self.owners.calls if row[0] == "build-tree-manager")
         self.assertEqual(argv[1], "--")  # its own build-slot admission
-        self.assertEqual(argv[-2:], ["bash", str(self.state / "source/scripts/build-tree-manager.sh")])
+        self.assertEqual(argv[-4:], ["bash", str(self.state / "source/scripts/build-tree-manager.sh"),
+                                     "--targo", str(work / "seed/bin/targo")])
+        # The offline build reads the prepared copy, never the optional --cargo-home.
+        self.assertEqual(env["CARGO_HOME"], str(home))
+        self.assertNotEqual(Path(env["CARGO_HOME"]), self.cargo_home)
+        self.assertNotIn("RUSTUP_HOME", env)
         step = next(row for row in runner.record["steps"] if row["name"] == "build-tree-manager")
         self.assertEqual(step["status"], "passed")
         self.assertTrue(Path(step["log"]).is_file())
         manager = self.state / "source/build-tree-manager.noindex/debug/bootstrap"
         self.assertEqual(runner.record["build_tree_manager"],
-                         {"path": str(manager), "sha256": stage.file_hash(manager), "built": True})
+                         {"path": str(manager), "sha256": stage.file_hash(manager), "built": True,
+                          "targo": str(work / "seed/bin/targo"), "cargo_home": str(home),
+                          "cargo_home_inputs": str(home.with_name("cargo-home-inputs.json"))})
         # A snapshot whose own manager answers v2 is given nothing more.
         self.owners.calls.clear()
         result, record = self.run_pipeline("--aterm-repo", str(self.aterm))
         self.assertEqual(result, 0, record.get("error"))
         self.assertNotIn("build-tree-manager", self.names())
-        self.assertEqual(record["build_tree_manager"]["path"], str(manager))
-        self.assertFalse(record["build_tree_manager"]["built"])
+        self.assertNotIn("build-tree-manager-inputs", self.names())
+        self.assertEqual(record["build_tree_manager"],
+                         {"path": str(manager), "sha256": stage.file_hash(manager), "built": False})
 
-    def test_a_snapshot_manager_that_does_not_answer_v2_refuses_before_the_prewarm(self):
+    def offline_manager_owners(self):
+        """Owners whose manager build is Cargo's offline resolution: it knows a locked crate only
+        by the registry index entry in its own Cargo home, and the preparation's handoff holds it."""
+        entry = "registry/index/fixture-index/.cache/ch/ro/chrono"
+
+        def execute(argv, cwd, env, log, timeout=None, **kwargs):
+            name = log.stem.split("-", 1)[1] if Path(argv[0]).name != "git" else None
+            if name == "build-tree-manager" and not (Path(env.get("CARGO_HOME", "/nonexistent")) / entry).is_file():
+                self.owners.calls.append((name, argv, dict(env)))
+                log.write_text(json.dumps({"argv": argv, "cwd": str(cwd)}) + "\n"
+                               "error: no matching package named `chrono` found\nlocation searched: crates.io index\n"
+                               "required by package `bootstrap v0.0.0`\n"
+                               "As a reminder, you're using offline mode (via `--frozen`)\n")
+                stage.atomic_json(Path(argv[argv.index("_owned-command") + 2]),
+                                  {"exit_code": 101, "timed_out": False, "interrupted": False})
+                return log.read_text()
+            result = self.owners(argv, cwd, env, log, timeout, **kwargs)
+            if name == "locked-dependency-prewarm":
+                # The handoff the offline replay resolved holds the entry, and its receipt binds it.
+                receipt = Path(argv[argv.index("_prewarm-dependencies") + 4])
+                report = stage.read_json(receipt)
+                handoff = Path(report["cargo_home"])
+                (handoff / entry).parent.mkdir(parents=True, exist_ok=True)
+                (handoff / entry).write_bytes(b"chrono index entry")
+                report["cache_trees"]["registry/index"] = stage.fingerprint(handoff / "registry/index")
+                stage.atomic_json(receipt, report)
+            elif name == "build-tree-manager-inputs":
+                # mint_seed_support.py cargo-home-inputs: a private copy of the input trees.
+                source, destination = (Path(argv[argv.index(flag) + 1]) for flag in ("--source", "--destination"))
+                self.assertFalse(destination.exists())
+                destination.mkdir(mode=0o700)
+                for tree in ("registry/index", "registry/cache", "git/db"):
+                    if (source / tree).is_dir():
+                        shutil.copytree(source / tree, destination / tree)
+                stage.atomic_json(Path(argv[argv.index("--output") + 1]), {"schema": "trust-cargo-home-inputs-v1"})
+            return result
+        return execute
+
+    def test_a_cargo_home_that_lacks_a_locked_index_entry_still_gets_its_manager(self):
+        # The class of 2026-11-16: --cargo-home held Bootstrap's archives and too few index
+        # entries. This run's --cargo-home holds no entry at all; the manager's own home is the
+        # prepared handoff's copy, so the offline build resolves.
+        self.assertEqual(list(self.cargo_home.iterdir()), [])
+        runner = stage.Runner(self.arguments("--aterm-repo", str(self.aterm)), self.offline_manager_owners())
+        self.assertEqual(runner.run(), 0, runner.record.get("error"))
+        _name, _argv, env = next(row for row in self.owners.calls if row[0] == "build-tree-manager")
+        home = Path(env["CARGO_HOME"])
+        self.assertTrue((home / "registry/index/fixture-index/.cache/ch/ro/chrono").is_file())
+        self.assertEqual(runner.record["build_tree_manager"]["cargo_home"], str(home))
+        self.assertTrue(runner.record["build_tree_manager"]["built"])
+        self.assertIn("mint-preflight", self.names())
+        # The stand-in does fail as Cargo does when the step is handed --cargo-home instead.
+        self.state, self.owners = self.root / "state-ambient-home", Owners()
+        ambient = stage.Runner(self.arguments("--aterm-repo", str(self.aterm)), self.offline_manager_owners())
+        original = ambient.build_tree_manager
+        ambient.build_tree_manager = lambda work=None, prepared=None: original()
+        self.assertEqual(ambient.run(), 1)
+        self.assertIn("the build-tree-manager step built no manager", ambient.record["error"])
+        _name, _argv, env = next(row for row in self.owners.calls if row[0] == "build-tree-manager")
+        self.assertEqual(Path(env["CARGO_HOME"]), self.cargo_home)
+        self.assertIn("no matching package named `chrono`", Path(ambient.record["steps"][-1]["log"]).read_text())
+
+    def test_a_prepare_run_builds_its_manager_before_its_compiler_build(self):
+        result, record = self.run_pipeline("--mode", "prepare")
+        self.assertEqual(result, 0, record.get("error"))
+        names = self.names()
+        self.assertLess(names.index("build-tree-manager"), names.index("pinned-bootstrap"))
+        self.assertNotIn("build-tree-manager-inputs", names)
+        _name, argv, env = next(row for row in self.owners.calls if row[0] == "build-tree-manager")
+        # No preparation exists in this mode: the run's own environment and --cargo-home.
+        self.assertEqual(argv[-2:], ["bash", str(self.state / "source/scripts/build-tree-manager.sh")])
+        self.assertEqual(Path(env["CARGO_HOME"]), self.cargo_home)
+        self.assertEqual(set(record["build_tree_manager"]), {"path", "sha256", "built"})
+
+    def test_a_snapshot_manager_that_does_not_answer_v2_refuses_before_the_mint_preflight(self):
         for outcome in ("answers v1", "script refuses"):
             with self.subTest(outcome=outcome):
                 self.state = self.root / ("state-manager-" + outcome.replace(" ", "-"))
@@ -2309,9 +3621,21 @@ else:
                 self.assertIn("trust-build-tree-manager-v2", record["error"])
                 self.assertEqual(record["steps"][-1]["name"], "build-tree-manager")
                 self.assertNotIn("build_tree_manager", record)
-                for later in ("pinned-bootstrap-config", "locked-dependency-prewarm", "mint-preflight",
-                              "sanctioned-mint-and-double-compile"):
+                for later in ("mint-preflight", "sanctioned-mint-and-double-compile"):
                     self.assertNotIn(later, self.names())
+
+    def test_a_manager_build_that_changes_the_pinned_seed_refuses_before_the_mint_preflight(self):
+        def execute(argv, cwd, env, log, timeout=None, **kwargs):
+            result = self.owners(argv, cwd, env, log, timeout, **kwargs)
+            if log.stem.endswith("-build-tree-manager"):
+                Path(argv[argv.index("--targo") + 1]).with_name("left-by-the-build").write_text("x")
+            return result
+
+        runner = stage.Runner(self.arguments("--aterm-repo", str(self.aterm)), execute)
+        self.assertEqual(runner.run(), 1)
+        self.assertIn("changed the pinned seed it built with", runner.record["error"])
+        self.assertNotIn("build_tree_manager", runner.record)
+        self.assertNotIn("mint-preflight", self.names())
 
     def failed_mint_fixture(self):
         """A seed pin the mint reads, and a stand-in mint that writes its stage receipt, DDC
@@ -2460,6 +3784,16 @@ else:
         self.assertFalse(work.with_name("retained" + work.name).exists())
         self.assertEqual(sorted(path.name for path in runner.invocation.iterdir() if "continuation" in path.name), [])
         self.assertNotIn("evidence", runner.record.get("mint_continuation", {}))
+
+    def test_the_mint_continuation_keeps_the_train_claim(self):
+        # The printed continuation is run in place of the mint step, so it claims as that step did.
+        self.claiming_build_slot()
+        mint = self.failed_mint_fixture()
+        runner, _printed = self.run_failed_mint(mint, "claiming")
+        command = runner.record["mint_continuation"]["command"]
+        self.assertEqual(command[1:command.index("--")],
+                         ["--rank", "release", "--claim-key", "trust-train:sanctioned-mint-and-double-compile",
+                          "--wide"])
 
     def test_a_runner_mint_that_fails_after_provenance_is_inspected_from_what_the_runner_kept(self):
         # The da63c88b7b cut stopped after 5h58m with an identical DDC and an accepted stage
@@ -2863,30 +4197,67 @@ else:
             runner.snapshot(self.repo, runner.source, "trust")
         self.assertFalse(sentinel.exists())
 
-    @unittest.skipUnless(sys.platform == "darwin", "native Darwin CoW DATA cache")
-    def test_snapshot_uses_only_working_data_and_keeps_complete_independent_checkout(self):
+    def test_snapshot_is_gits_checkout_and_reads_no_controller_working_file(self):
+        # The snapshot is Git's checkout of the acquired objects, as in build 27009's cut:
+        # no working file of the controller (or a consumer checkout) is a DATA donor.
         runner = self.snapshot_runner()
+        owner = dict(runner.git_owner())
+        def donor(*_args):
+            self.fail("a snapshot must not read its controller's working files")
+        owner["_prepare_source_working_cache"] = donor
+        runner._managed_git_owner = owner
         controller = git(self.repo, "rev-parse", "HEAD")
         config = (self.repo / ".git/config").read_bytes()
         head = runner.snapshot(self.repo, runner.source, "trust")
-        receipts = list(runner.invocation.glob("*-trust-working-data.json"))
-        self.assertEqual(len(receipts), 1)
-        receipt = json.loads(receipts[0].read_text())
-        self.assertGreater(receipt["cloned"], 0)
-        self.assertTrue(receipt["complete_checkout_verified"])
         self.assertEqual(head, controller)
+        self.assertEqual(list(runner.invocation.glob("*-working-data.json")), [])
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), controller)
         self.assertEqual((self.repo / ".git/config").read_bytes(), config)
         self.assertEqual(git(runner.source, "status", "--porcelain"), "")
         self.assertEqual(git(runner.source, "ls-files", "--stage"), git(self.repo, "ls-files", "--stage"))
-        import gzip
-        with gzip.open(runner.source / receipt["clone_book"]["path"], "rt") as stream:
-            rows = [json.loads(line) for line in stream]
-        for row in rows:
-            source, cloned = self.repo / row["path"], runner.source / row["path"]
-            self.assertNotEqual(source.stat().st_ino, cloned.stat().st_ino)
-            self.assertEqual(cloned.stat().st_nlink, 1)
+        self.assertFalse(os.path.lexists(runner.source / ".git/trust-source-working-cache.json"))
+        select = [step for step in runner.record["steps"] if step["name"] == "select-main"]
+        self.assertEqual([step["status"] for step in select], ["passed"])
+        self.assertEqual(select[0]["argv"][-3:], ["checkout", "--detach", controller])
         self.assertNotIn(b"hooksPath", (runner.source / ".git/config").read_bytes())
+        complete = [step for step in runner.record["steps"] if step["name"] == "snapshot-complete"]
+        self.assertEqual([step["status"] for step in complete], ["passed"])
+        self.assertIn("--ignored", complete[0]["argv"])
+
+    def test_fresh_snapshot_refuses_an_ignored_file_left_after_checkout(self):
+        # Git's checkout leaves a fresh tree with nothing untracked or ignored; a file that
+        # appears beside it (here one the repository's own exclude hides) is refused before
+        # the snapshot is owned, as the per-file route's final audit refused it.
+        runner = self.snapshot_runner()
+        call = runner.call
+        def plant(name, argv, *args, **kwargs):
+            result = call(name, argv, *args, **kwargs)
+            if name == "select-main":
+                (runner.source / ".git/info").mkdir(exist_ok=True)
+                with (runner.source / ".git/info/exclude").open("a") as exclude:
+                    exclude.write("planted.log\n")
+                (runner.source / "planted.log").write_text("not Git's\n")
+            return result
+        runner.call = plant
+        with self.assertRaisesRegex(stage.Refused, "fresh snapshot holds untracked or ignored files"):
+            runner.snapshot(self.repo, runner.source, "trust")
+        self.assertFalse(os.path.lexists(runner.source.with_name(runner.source.name + ".owner.json")))
+        self.assertEqual(git(runner.source, "status", "--porcelain"), "")
+        self.assertIn("planted.log", git(runner.source, "status", "--porcelain", "--ignored"))
+
+    def test_reused_snapshot_keeps_its_ignored_build_outputs(self):
+        # Only a fresh tree must be exactly Git's checkout: an owned snapshot that a build
+        # has used holds ignored outputs, and moving it forward must not refuse them.
+        runner = self.snapshot_runner()
+        head = runner.snapshot(self.repo, runner.source, "trust")
+        (runner.source / ".git/info").mkdir(exist_ok=True)
+        (runner.source / ".git/info/exclude").write_text("build/\n")
+        (runner.source / "build").mkdir()
+        (runner.source / "build/output.o").write_text("an ignored build output\n")
+        self.assertEqual(runner.snapshot(self.repo, runner.source, "trust"), head)
+        self.assertTrue((runner.source / "build/output.o").is_file())
+        complete = [step for step in runner.record["steps"] if step["name"] == "snapshot-complete"]
+        self.assertEqual(len(complete), 1)
 
     def test_https_snapshot_uses_owner_routed_agh_without_a_credential_helper(self):
         api = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")), run_name="fixture_https_authority")
@@ -2906,6 +4277,9 @@ else:
             actual = list(argv)
             if argv[0] == str(client):
                 observed.append((list(argv), dict(env)))
+                private = Path(env["TMPDIR"]).resolve()
+                self.assertEqual(kwargs["progress"].paths, (Path(argv[4]), private))
+                self.assertTrue(private.is_dir())
                 self.assertEqual(argv[1:4], ["repo", "fetch", "fixture/snapshot"])
                 self.assertEqual(argv[5:8], ["--ref", "refs/heads/main", "--into"])
                 self.assertTrue(argv[8].startswith("refs/agh/"))
@@ -2923,12 +4297,21 @@ else:
         self.assertEqual(git(runner.source, "rev-parse", "HEAD"), commit)
         self.assertEqual(git(runner.source, "remote", "get-url", "origin"), "https://github.com/fixture/snapshot.git")
         self.assertEqual(len(observed), 1)
+        # The fetch of main has no total: it ends only for lack of progress in the snapshot or its log.
+        fetch = next(step for step in runner.record["steps"] if step["name"] == "fetch-main")
+        self.assertNotIn("timeout_seconds", fetch)
+        self.assertEqual(fetch["progress_bound"], {"stall_window_seconds": api["SUBMODULE_STALL_WINDOW_SECONDS"],
+                                                   "floor_bytes_per_second": api["SUBMODULE_FLOOR_BYTES_PER_SECOND"]})
+        self.assertNotIn("SUBMODULE_UPDATE_TIMEOUT_SECONDS", api)
         selected["_submodule_auth_config"].assert_not_called()
         _, env = observed[0]
+        self.assertFalse(Path(env["TMPDIR"]).exists())
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertNotIn("GH_TOKEN", env)
         self.assertNotIn("GITHUB_TOKEN", env)
+        # Agh's transfer directory was made in this run's folder, which the train retires.
+        self.assertEqual(Path(env["TMPDIR"]).parent, runner.invocation.resolve())
         receipts = list(runner.invocation.glob("*-trust-source-acquisition.json"))
         self.assertEqual(len(receipts), 1)
         self.assertEqual(json.loads(receipts[0].read_text())["commit"], commit)
@@ -3030,11 +4413,14 @@ else:
         real_fetch = owner["_agh_source_fetch"]
         client = self.root / "fixture-pin-agh"
         executable(client)
-        acquired = []
+        acquired, scratches = [], []
         def execute(argv, cwd, env, log, **kwargs):
             if argv[0] == str(client):
                 acquired.append(list(argv))
                 self.assertEqual(argv[1:7], ["repo", "fetch", "fixture/pin", str(child), "--ref", target])
+                self.assertEqual(kwargs["progress"].paths[:2], (child, Path(env["TMPDIR"])))
+                self.assertEqual(Path(env["TMPDIR"]).parent, runner.invocation.resolve())
+                scratches.append(Path(env["TMPDIR"]))
                 self.assertEqual(git(child, "rev-parse", "HEAD"), old)
                 argv = [*owner["_controlled_git_command"]([]), "-c", "protocol.file.allow=always",
                         "-C", str(child), "fetch", "--quiet", "--no-tags", "--recurse-submodules=no",
@@ -3048,6 +4434,12 @@ else:
             self.assertEqual(git(child, "rev-parse", "HEAD"), old)
             self.assertEqual(git(runner.source, "write-tree"), original_index)
             self.assertEqual(len(acquired), 1)
+            self.assertFalse(scratches[0].exists())
+            # Bounded by the bytes arriving in the child and Agh's scratch, with no total.
+            pin = next(step for step in runner.record["steps"] if step["name"] == "acquire-submodule-pin")
+            self.assertNotIn("timeout_seconds", pin)
+            self.assertEqual(pin["progress_bound"], {"stall_window_seconds": owner["SUBMODULE_STALL_WINDOW_SECONDS"],
+                                                     "floor_bytes_per_second": owner["SUBMODULE_FLOOR_BYTES_PER_SECOND"]})
             runner.synchronize(runner.source, "fixture")
         self.assertEqual(git(child, "rev-parse", "HEAD"), target)
         self.assertEqual(git(previous, "rev-parse", "HEAD"), old)
@@ -3087,6 +4479,148 @@ else:
         # The train's agent carries the declaration to each tick.
         words = stage.train_plist(self.train_arguments("--source-object-cache", declaration))["ProgramArguments"]
         self.assertEqual(words[words.index("--source-object-cache") + 1], declaration)
+
+    def owned_cache_fixture(self):
+        """The source indexes first-party/fixture at a commit an owned bare cache does not hold yet.
+
+        The cache holds the server's history to the commit before, on its main and on the ref an
+        earlier refresh left. Returns the server, the cache, that earlier commit and the pin.
+        """
+        server = self.root / "cache-server"
+        server.mkdir()
+        git(server, "init", "--quiet", "--template=", "--initial-branch=main")
+        git(server, "config", "user.name", "fixture")
+        git(server, "config", "user.email", "fixture@example.invalid")
+        (server / "value").write_text("earlier")
+        git(server, "add", "value")
+        git(server, "commit", "-qm", "earlier")
+        earlier = git(server, "rev-parse", "HEAD")
+        cache = self.root / "owned-cache.git"
+        subprocess.run(["git", "clone", "--quiet", "--bare", "--no-hardlinks", str(server), str(cache)], check=True)
+        git(cache, "update-ref", "refs/agh/owned-object-cache/" + earlier, earlier)
+        (server / "value").write_text("pinned")
+        git(server, "commit", "-qam", "pinned")
+        pin = git(server, "rev-parse", "HEAD")
+        (self.repo / ".gitmodules").write_text(
+            '[submodule "fixture"]\n\tpath = first-party/fixture\n\turl = https://github.com/fixture/pin.git\n')
+        git(self.repo, "add", ".gitmodules")
+        git(self.repo, "update-index", "--add", "--cacheinfo", "160000", pin, "first-party/fixture")
+        git(self.repo, "commit", "-qm", "index a first-party child")
+        git(self.repo, "push", "origin", "main")
+        return server, cache, earlier, pin
+
+    def owned_cache_runner(self, cache, transfer):
+        """A runner whose Agh `transfer`s (argv, env, progress) and whose acquisitions are recorded."""
+        runner = stage.Runner(self.arguments("--owned-object-cache", f"first-party/fixture={cache}"))
+        runner.invocation = self.state / "runs/owned-cache"
+        runner.invocation.mkdir(parents=True)
+        runner.record = {"steps": []}
+        runner.snapshot(self.repo, runner.source, "trust")
+        owner = runner.git_owner()
+        client = self.root / "fixture-cache-agh"
+        executable(client)
+        order = []
+
+        def execute(argv, cwd, env, log, **kwargs):
+            if argv[0] == str(client):
+                order.append(("agh", list(argv), Path(env["TMPDIR"])))
+                self.assertEqual(kwargs["progress"].paths[:2], (Path(argv[4]), Path(env["TMPDIR"])))
+                self.assertEqual(Path(env["TMPDIR"]).parent, runner.invocation.resolve())
+                argv = transfer(argv, owner)
+            return stage.command(argv, cwd, env, log, **kwargs)
+        runner.execute = execute
+        owner["ensure_submodules"] = lambda path, **options: order.append(("acquire", path, options))
+        owner["_inspect_submodule_tree"] = lambda path: []
+        fetch = owner["_agh_source_fetch"]
+        return runner, order, mock.patch.dict(fetch.__globals__, {"which": lambda name: str(client) if name == "agh" else None})
+
+    def test_an_owned_object_cache_is_brought_to_the_pin_before_the_snapshot_acquires_from_it(self):
+        # On 2026-11-17 the train's hand-made cache of clean was three days behind its pin: each cut
+        # copied its 1.94 GB start and fetched 2.6 GB again. A cache the train owns follows the pins.
+        server, cache, earlier, pin = self.owned_cache_fixture()
+
+        def transfer(argv, owner):
+            # Only the transfer is substituted, by local Git from the fixture's server.
+            return [*owner["_controlled_git_command"]([]), "-c", "protocol.file.allow=always", "-C", argv[4],
+                    "fetch", "--quiet", "--no-tags", str(server), argv[6] + ":" + argv[8]]
+        runner, order, agh = self.owned_cache_runner(cache, transfer)
+        with agh:
+            runner.acquire_submodule_pins(runner.source, "source", 0)
+            # The landing worktree at the same pin reads the cache as the snapshot left it.
+            runner.acquire_submodule_pins(runner.source, "landing-fixture", 0)
+        [refresh] = [entry for entry in order if entry[0] == "agh"]
+        # Agh's unfiltered fetch negotiated against the cache, into a private ref: no closure.
+        self.assertEqual(refresh[1][1:], ["repo", "fetch", "fixture/pin", str(cache), "--ref", pin,
+                                          "--into", "refs/agh/owned-object-cache/" + pin])
+        self.assertFalse(refresh[2].exists())
+        self.assertEqual([entry[0] for entry in order], ["agh", "acquire", "acquire"])
+        for _, path, options in order[1:]:
+            self.assertEqual((path, options), (runner.source, {"checkout_caches": {"first-party/fixture": cache}}))
+        # HEAD names the pin, so Agh starts the next closure there; the earlier refresh's ref is gone
+        # and nothing else of the cache moved.
+        self.assertEqual(git(cache, "rev-parse", "HEAD"), pin)
+        self.assertNotEqual(subprocess.run(["git", "-C", str(cache), "symbolic-ref", "-q", "HEAD"]).returncode, 0)
+        self.assertEqual(git(cache, "for-each-ref", "--format=%(refname)", "refs/agh/"),
+                         "refs/agh/owned-object-cache/" + pin)
+        self.assertEqual(git(cache, "rev-parse", "refs/heads/main"), earlier)
+        self.assertFalse((cache / "objects/info/alternates").exists())
+        record = runner.record["owned_object_caches"]["first-party/fixture"]
+        self.assertEqual({key: record[key] for key in ("repository", "pin", "status", "head")},
+                         {"repository": str(cache), "pin": pin, "status": "refreshed", "head": pin})
+        self.assertIsInstance(record["pack_kib"], int)
+        refreshes = [step for step in runner.record["steps"] if step["name"] == "refresh-object-cache"]
+        self.assertEqual(len(refreshes), 1)
+        self.assertNotIn("timeout_seconds", refreshes[0])
+        self.assertIn("progress_bound", refreshes[0])
+
+    def test_an_owned_object_cache_that_is_not_refreshed_is_read_as_it_is(self):
+        server, cache, earlier, pin = self.owned_cache_fixture()
+        runner, order, agh = self.owned_cache_runner(
+            cache, lambda argv, owner: [sys.executable, "-I", "-c", "raise SystemExit(7)"])
+        with agh, mock.patch("sys.stdout", new_callable=io.StringIO) as said, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as diagnostics:
+            runner.acquire_submodule_pins(runner.source, "source", 0)
+            # Nor is it tried again for the landing worktree at the same pin.
+            runner.acquire_submodule_pins(runner.source, "landing-fixture", 0)
+        self.assertIn("the owned object cache of first-party/fixture was not refreshed, and is read as it is",
+                      said.getvalue())
+        self.assertEqual([entry[0] for entry in order], ["agh", "acquire", "acquire"])
+        self.assertEqual(order[1][2], {"checkout_caches": {"first-party/fixture": cache}})
+        # The failed transfer's directory is kept and named, in this run's folder, which the
+        # train retires with its build.
+        self.assertTrue(order[0][2].is_dir())
+        self.assertEqual(order[0][2].parent, runner.invocation.resolve())
+        self.assertIn(str(order[0][2]), diagnostics.getvalue())
+        record = runner.record["owned_object_caches"]["first-party/fixture"]
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("command exited 7", record["error"])
+        self.assertNotIn("head", record)
+        self.assertEqual(git(cache, "rev-parse", "HEAD"), earlier)
+        self.assertEqual(git(cache, "for-each-ref", "--format=%(refname)", "refs/agh/"),
+                         "refs/agh/owned-object-cache/" + earlier)
+
+    def test_an_owned_object_cache_is_a_bare_repository_and_one_gitlinks_only_cache(self):
+        server, cache, earlier, pin = self.owned_cache_fixture()
+        worktree = self.root / "worktree-cache"
+        subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", str(server), str(worktree)], check=True)
+        runner, order, agh = self.owned_cache_runner(worktree, lambda argv, owner: self.fail("Agh must not run"))
+        with agh, mock.patch("sys.stdout", new_callable=io.StringIO):
+            runner.acquire_submodule_pins(runner.source, "source", 0)
+        record = runner.record["owned_object_caches"]["first-party/fixture"]
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("is not one", record["error"])
+        self.assertEqual([entry[0] for entry in order], ["acquire"])
+        self.assertEqual(git(worktree, "symbolic-ref", "HEAD"), "refs/heads/main")
+        # A gitlink takes one cache: declared or owned, never both.
+        runner.args.source_object_cache = [f"first-party/fixture={cache}"]
+        with self.assertRaisesRegex(stage.Refused, "a gitlink takes one object cache, a declared or an owned one: "
+                                                   "first-party/fixture"):
+            runner.acquire_submodule_pins(runner.source, "source", 1)
+        self.assertEqual(len(order), 1)
+        # The train's agent carries the declaration to each tick.
+        declaration = f"first-party/fixture={cache}"
+        words = stage.train_plist(self.train_arguments("--owned-object-cache", declaration))["ProgramArguments"]
+        self.assertEqual(words[words.index("--owned-object-cache") + 1], declaration)
 
     def test_dirty_managed_worktree_is_never_overwritten(self):
         self.run_pipeline("--mode", "prepare")
@@ -3162,8 +4696,11 @@ else:
             agent_path = stage.train_plist(self.train_arguments())["EnvironmentVariables"]["PATH"]
             runner = stage.Runner(args, self.owners)
             self.assertEqual(runner.run(), 0, runner.record.get("error"))
-        # The agent carries the caller's PATH; each tick's runner puts its own python-bin first.
-        self.assertEqual(agent_path, runner.env["PATH"].split(os.pathsep, 1)[1])
+        # The agent carries the caller's PATH; each run puts its own python-bin first, then the
+        # one name of the Agh it keeps.
+        self.assertEqual(runner.env["PATH"].split(os.pathsep, 2),
+                         [str(self.state / "python-bin"), runner.record["agh"]["directory"], agent_path])
+        self.assertEqual(Path(runner.record["agh"]["directory"]).parent.parent, self.state / "kept-agh/program")
         self.assertEqual(agent_path.split(os.pathsep)[0], str(legacy))
         selected = shutil.which("python3", path=runner.env["PATH"])
         self.assertEqual(Path(selected).resolve(), Path(sys.executable).resolve())
@@ -3463,6 +5000,62 @@ else:
         self.assertIn("cached outcome is refused or changed", record["consumers"]["ty"]["error"])
         self.assertNotIn("ty-consumer-check", self.names())
         self.assertTrue(record["consumers"]["aterm"]["reused"])
+
+    def test_consumer_proof_banner_cannot_override_invalid_owner_receipts(self):
+        arguments, _ = self.consumer_arguments()
+        self.owners.consumer_terminal_results["ty-consumer-check"] = {
+            "exit_code": 0, "signal": 9, "timed_out": False, "interrupted": False,
+        }
+        self.owners.consumer_terminal_results["ay-consumer-check"] = (
+            '{"exit_code":7,"exit_code":0,"signal":null,"timed_out":false,"interrupted":false}\n')
+        result, record = self.run_pipeline(*arguments)
+        self.assertEqual(result, 1)
+        self.assertFalse(record["consumer_ready"])
+        self.assertIn("successful owned shell exit", record["consumers"]["ty"]["error"])
+        self.assertIn("duplicate JSON artifact field", record["consumers"]["ay"]["error"])
+        ay_step = next(step for step in record["steps"] if step["name"] == "ay-consumer-check")
+        self.assertEqual(ay_step["status"], "failed")
+        self.assertTrue(record["consumers"]["aterm"]["receipt"])
+
+    def test_cached_consumer_requires_the_unchanged_owned_terminal_receipt(self):
+        arguments, _ = self.consumer_arguments()
+        result, record = self.run_pipeline(*arguments)
+        self.assertEqual(result, 0, record.get("error"))
+        receipt_path = Path(record["consumers"]["ty"]["receipt"])
+        accepted = stage.read_json(receipt_path)
+        other = stage.read_json(Path(record["consumers"]["aterm"]["receipt"]))
+        terminal_path = Path(accepted["step"]["result_file"])
+        original = terminal_path.read_bytes()
+
+        for replacement in (None, original + b"\n", original.replace(b'"exit_code": 0', b'"exit_code": 0.0')):
+            with self.subTest(replacement=replacement):
+                if replacement is None:
+                    terminal_path.unlink()
+                else:
+                    terminal_path.write_bytes(replacement)
+                self.owners.calls.clear()
+                result, record = self.run_pipeline(*arguments)
+                self.assertEqual(result, 1)
+                self.assertFalse(record["consumer_ready"])
+                self.assertRegex(record["consumers"]["ty"]["error"], "terminal receipt|regular JSON artifact")
+                self.assertNotIn("ty-consumer-check", self.names())
+                self.assertTrue(record["consumers"]["aterm"]["reused"])
+                terminal_path.write_bytes(original)
+
+        unbound = {**accepted, "step": dict(accepted["step"])}
+        unbound["step"].pop("owned_result_identity", None)
+        transplanted = {**accepted, **{key: other[key] for key in ("log", "log_identity", "step", "outcome")}}
+        for wrong, reason in [(unbound, "lacks its completion identity"),
+                              (transplanted, "does not belong to its owned command")]:
+            stage.atomic_json(receipt_path, wrong)
+            result, record = self.run_pipeline(*arguments)
+            self.assertEqual(result, 1)
+            self.assertIn(reason, record["consumers"]["ty"]["error"])
+
+        stage.atomic_json(receipt_path, accepted)
+        result, record = self.run_pipeline(*arguments)
+        self.assertEqual(result, 0, record.get("error"))
+        self.assertTrue(all(row["reused"] for row in record["consumers"].values()))
 
     def test_consumer_cache_requires_integer_exit_statuses_without_rerunning(self):
         arguments, _ = self.consumer_arguments()
@@ -3767,6 +5360,122 @@ else:
             self.assertEqual(runner.record["consumers"][name]["status"], "passed")
         self.assertEqual(len([name for name in self.names() if name.endswith("-consumer-check")]), 4)
 
+    def progress_step(self, script, window=1.0):
+        """Run a Python child as a step under a progress bound of `window` seconds on its own directory."""
+        owner = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")), run_name="fixture_progress_bound")
+        destination = self.root / "progress-destination"
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.mkdir()
+        log = self.root / "progress-step.log"
+        bound = owner["_SubmoduleProgress"]("Agh's fetch of fixture main", (destination,), window=window)
+        started = time.monotonic()
+        try:
+            stage.command([sys.executable, "-I", "-c", script, str(destination)], self.root, dict(os.environ), log,
+                          progress=bound)
+            return None, time.monotonic() - started, bound, log
+        except stage.CommandFailed as error:
+            return error, time.monotonic() - started, bound, log
+
+    def test_a_step_under_a_progress_bound_outlives_its_window_while_bytes_arrive_and_ends_when_they_stop(self):
+        writes = ("import sys, time\nfor number in range(16):\n"
+                  "    open(sys.argv[1] + f'/pack-{number}', 'wb').write(b'x' * 4096)\n    time.sleep(0.2)\n")
+        error, elapsed, bound, _log = self.progress_step(writes)
+        # Three windows long, and never under the floor.
+        self.assertIsNone(error)
+        self.assertGreater(elapsed, 3 * bound.window)
+        self.assertGreaterEqual(bound.received, 12 * 4096)
+
+        # What the child prints is in the step's log, and counts as the recreator's relayed output does.
+        prints = "import time\nfor number in range(16):\n    print('x' * 200, flush=True)\n    time.sleep(0.2)\n"
+        error, elapsed, bound, log = self.progress_step(prints)
+        self.assertIsNone(error)
+        self.assertGreater(elapsed, 3 * bound.window)
+        self.assertIn(log, bound.paths)
+
+        stalls = ("import sys, time\nopen(sys.argv[1] + '/pack-0', 'wb').write(b'x' * 4096)\n"
+                  "print('waiting', flush=True)\ntime.sleep(600)\n")
+        error, elapsed, bound, log = self.progress_step(stalls)
+        self.assertIsNotNone(error)
+        self.assertTrue(error.timed_out)
+        self.assertRegex(str(error), r"^Agh's fetch of fixture main showed too little progress: \d+ bytes observed "
+                                     r"under its watched paths and on its output, "
+                                     r"0\.0 bytes/s over its last 1 s against a floor of 16 bytes/s, and none observed "
+                                     r"for the last 1 s; bytes it holds elsewhere are not seen"
+                                     rf"; see {re.escape(str(log))}$")
+        self.assertNotRegex(str(error).partition("; see ")[0], r"received|stood still")
+        # One window after its last byte, not the ten minutes it would have slept.
+        self.assertLess(elapsed, 30)
+
+    def test_a_progress_bound_is_refused_for_a_build_slot_step(self):
+        runner = stage.Runner(self.arguments("--mode", "prepare"), self.owners)
+        with self.assertRaisesRegex(stage.Refused, "a build-slot step is bounded by its own owner"):
+            runner.call("build", ["true"], heavy=True, progress=object())
+
+    def test_a_run_keeps_the_agh_it_started_with_for_every_selection(self):
+        inherited, selected = os.environ["PATH"], []
+
+        def execute(*args, **kwargs):
+            # What an acquisition in this process would select now (the recreator's which).
+            selected.append(shutil.which("agh"))
+            if len(selected) == 1:
+                # The Mac's updater replaces the installed Agh while the run is under way.
+                replaced = self.agh.with_name("agh-next")
+                executable(replaced, stand_in_agh("9.9.9-updated"))
+                os.replace(replaced, self.agh)
+            return self.owners(*args, **kwargs)
+        runner = stage.Runner(self.arguments("--mode", "prepare"), execute)
+        self.assertEqual(runner.run(), 0, runner.record.get("error"))
+        slot = self.state / "kept-agh/program" / runner.record["agh"]["kept"].split("/")[-3]
+        kept = slot / "bin/agh"
+        self.assertEqual(runner.record["agh"], {
+            "selected": str(self.agh), "program": str(self.agh), "kept": str(kept), "directory": str(kept.parent),
+            "executable": str(slot / "agh"),
+            "sha256": hashlib.sha256(stand_in_agh("0.0.0-fixture").encode()).hexdigest(),
+            "version": "agh 0.0.0-fixture", "reused": False, "left": []})
+        self.assertEqual(json.loads((self.state / "latest.json").read_text())["agh"], runner.record["agh"])
+        self.assertEqual(os.listdir(kept.parent), ["agh"])
+        self.assertEqual(kept.resolve().read_text(), stand_in_agh("0.0.0-fixture"))
+        self.assertIn("9.9.9-updated", self.agh.read_text())
+        # In this process and in every step's environment, before and after the update.
+        self.assertGreater(len(selected), 3)
+        self.assertEqual(set(selected), {str(kept)})
+        for name, _argv, environment in self.owners.calls:
+            self.assertEqual(shutil.which("agh", path=environment["PATH"]), str(kept), name)
+        # The run's selection ends with the run.
+        self.assertEqual(os.environ["PATH"], inherited)
+        self.assertEqual(shutil.which("agh"), str(self.agh))
+
+    def test_a_run_whose_kept_agh_does_not_run_refuses_before_its_snapshot(self):
+        executable(self.agh, stand_in_agh("0", answer="kill -9 $$"))
+        runner = stage.Runner(self.arguments("--mode", "prepare"), self.owners)
+        with self.assertRaisesRegex(stage.Refused, r"the Agh this run kept does not run from "
+                                                   r".*kept-agh/program/[0-9a-f]{64}/bin/agh: `agh version` exited -9"):
+            runner.run()
+        self.assertEqual(self.owners.calls, [])
+        self.assertFalse((self.state / "source").exists())
+
+    def test_a_tick_keeps_one_agh_for_its_reader_and_its_cut(self):
+        self.gated_trust()
+        arguments, _ = self.consumer_arguments()
+        tools = {name: f"/fixture/bin/{name}" for name in ("aterm", "targo")}
+        train = stage.Train(self.train_arguments(*arguments), self.owners, self.github, tools)
+        inherited = os.environ["PATH"]
+        with mock.patch("builtins.print"):
+            self.assertEqual(train.tick(), 0, self.train_state())
+        kept = self.state / "kept-agh/program" / stage.fingerprint(self.agh)["sha256"] / "bin/agh"
+        # The train's own Agh call, and the cut's record and steps: one copy, under the train's
+        # root and not once more under the build's.
+        admitted = [argv for name, argv, _env in self.owners.calls if name == "trust-repo-admitted"]
+        self.assertEqual([argv[0] for argv in admitted], [str(kept)])
+        self.assertEqual(train.tool("agh"), str(self.agh))
+        build = Path(self.train_state()["good"]["build_dir"])
+        self.assertEqual(json.loads((build / "latest.json").read_text())["agh"]["kept"], str(kept))
+        self.assertFalse((build / "kept-agh").exists())
+        for name, _argv, environment in self.owners.calls:
+            self.assertEqual(shutil.which("agh", path=environment["PATH"]), str(kept), name)
+        self.assertEqual(os.environ["PATH"], inherited)
+
     # The fleet train.
 
     def gated_trust(self):
@@ -3807,6 +5516,33 @@ else:
         git(self.repo, "commit", "-qm", text)
         git(self.repo, "push", "-q", "origin", "main")
         return git(self.repo, "rev-parse", "HEAD")
+
+    def test_train_cuts_the_observed_commit_when_main_advances_before_snapshot(self):
+        self.gated_trust()
+        selected = self.github.main()
+        build = int(git(self.repo, "rev-list", "--count", selected))
+        train = self.train()
+        read_main = train.read_main
+        later = []
+
+        def read_then_advance(state=None):
+            reading = read_main(state)
+            if not later:
+                later.append(self.foreign_commit("main advanced before the snapshot"))
+            return reading
+
+        with mock.patch.object(train, "read_main", side_effect=read_then_advance):
+            with mock.patch("builtins.print"):
+                self.assertEqual(train.tick(), 0, self.train_state())
+
+        state = self.train_state()
+        record = json.loads((Path(state["good"]["build_dir"]) / "latest.json").read_text())
+        self.assertNotEqual(selected, later[0])
+        self.assertEqual(record["source_commit"], selected)
+        self.assertEqual(record["source_main"], later[0])
+        self.assertEqual(state["last"]["main"], selected)
+        self.assertEqual((state["good"]["commit"], state["good"]["build"]), (selected, build))
+        self.assertEqual(git(self.github.remote, "merge-base", later[0], self.github.main()), later[0])
 
     def test_train_cuts_when_main_moved_publishes_to_the_index_and_then_waits(self):
         self.gated_trust()
@@ -4080,6 +5816,27 @@ else:
         self.assertEqual(self.tick(), 0, self.train_state())
         self.assertEqual(git(self.state / "landing.noindex/first-party/fixture", "rev-parse", "HEAD"), pin)
 
+    def test_a_repo_with_the_hook_installers_ssh_keepalive_lands(self):
+        # A train's --repo pushes through the hook, so scripts/install-git-hooks.sh has run in
+        # it, and that also writes core.sshCommand. The landing worktree shares that config:
+        # the first tick to reach it would have ended at its first read, before the mint.
+        pin, _url, server, _log = self.submodule_trust()
+        owner = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")), run_name="fixture_keepalive")
+        git(self.repo, "config", "core.sshCommand", owner["INSTALLED_SSH_KEEPALIVE_COMMAND"])
+        # Exercise the same declared donor and separately loaded retention owner as the fleet.
+        original = (self.repo / ".git/config").read_bytes()
+        self.assertEqual(self.tick("--source-object-cache", f"first-party/fixture={server}"), 0, self.train_state())
+        self.assertEqual((self.repo / ".git/config").read_bytes(), original)
+        self.assertEqual(self.hook_ran.read_text(), "ran\nran\n")
+        landing = self.state / "landing.noindex"
+        self.assertEqual(git(landing / "first-party/fixture", "rev-parse", "HEAD"), pin)
+        self.assertEqual(self.hook_ran.read_text(), "ran\nran\n")
+        self.assertEqual(git(self.repo, "config", "core.sshCommand"), owner["INSTALLED_SSH_KEEPALIVE_COMMAND"])
+        # Any other ssh command in --repo still refuses the landing worktree.
+        git(self.repo, "config", "core.sshCommand", "/usr/bin/false")
+        with owner["admitted_trust_checkout"](landing), self.assertRaisesRegex(RuntimeError, "local:core.sshcommand"):
+            owner["submodule_registrations_off_index"](landing)
+
     def test_a_landing_worktree_under_the_main_worktrees_absolute_hooks_path_lands(self):
         # scripts/install-git-hooks.sh writes the main worktree's absolute scripts/hooks, which
         # scripts/prewarm_push.sh's hooks_verdict accepts for a linked worktree (main-of-linked).
@@ -4162,12 +5919,37 @@ else:
         self.assertTrue(self.train_state()["last"]["error"].endswith(f"once it is gone: {remedy}"),
                         self.train_state()["last"]["error"])
 
+    def test_landing_materialization_names_its_phase_before_checkout_and_pin_work(self):
+        self.gated_trust()
+        observed = []
+        checkout = stage.Train.landing_checkout
+        submodules = stage.Train.landing_submodules
+
+        def checkout_with_phase(train, runner):
+            if not observed:
+                observed.append(("checkout", self.train_state()["last"]["phase"]))
+            return checkout(train, runner)
+
+        def submodules_with_phase(train, runner, landing, name):
+            if name == "cut":
+                observed.append(("pins", self.train_state()["last"]["phase"]))
+            return submodules(train, runner, landing, name)
+
+        with mock.patch.object(stage.Train, "landing_checkout", checkout_with_phase), \
+             mock.patch.object(stage.Train, "landing_submodules", submodules_with_phase):
+            self.assertEqual(self.tick(), 0, self.train_state())
+        self.assertEqual(observed, [("checkout", "materializing landing source"),
+                                    ("pins", "materializing landing source")])
+        self.assertIn("sanctioned-mint-and-double-compile", self.names())
+        self.assertEqual(self.names().count("release-signing-ready"), 1)
+
     def test_landing_submodules_that_cannot_be_materialized_end_the_tick_before_any_push(self):
         pin, _url, _server, log = self.submodule_trust(refuse_landing=True)
         cut = git(self.repo, "rev-parse", "HEAD")
         self.assertEqual(self.tick(), 1)
         state = self.train_state()
         self.assertEqual(state["last"]["status"], "failed")
+        self.assertEqual(state["last"]["phase"], "materializing landing source")
         self.assertIn("Agh source fetch failed", state["last"]["error"])
         # Nothing was left in the train's worktree, so its removal is not offered as the remedy.
         self.assertNotIn("is the train's own landing worktree", state["last"]["error"])
@@ -4863,25 +6645,117 @@ else:
     def test_a_tick_fast_forwards_its_own_clean_checkout_on_main_and_nothing_else(self):
         self.gated_trust()
         before = git(self.repo, "rev-parse", "HEAD")
+        original_blob = git(self.repo, "rev-parse", "HEAD:README")
         writer = self.root / "writer"
         subprocess.run(["git", "clone", "-q", str(self.root / "trust.git"), str(writer)], check=True)
         git(writer, "config", "user.email", "fixture@example.invalid")
         git(writer, "config", "user.name", "fixture")
+        (writer / "README").write_text("historical file content")
+        git(writer, "commit", "-qam", "intermediate controller source")
+        historical = git(writer, "rev-parse", "HEAD:README")
         (writer / "README").write_text("moved on main")
         git(writer, "commit", "-qam", "main moved")
         git(writer, "push", "-q", "origin", "main")
         moved = git(writer, "rev-parse", "HEAD")
+        # The controller has a GitHub origin with no usable raw Git transport.
+        # Agh supplies the exact objects from the fixture's local bare source.
+        git(self.repo, "remote", "set-url", "origin", "git@github.com:fixture/trust.git")
+        git(self.repo, "config", "core.sshCommand", "/usr/bin/false")
+        agh_bin = self.root / "source-bin"
+        log = self.root / "source-transport-arguments"
+        wrong = self.root / "wrong-source"
+        rejected = self.root / "reject-fetch"
+        scratch_log = self.root / "source-transport-scratch"
+        executable(agh_bin / "agh", f"""#!/bin/sh
+printf '%s\\n' "$@" >> {shlex.quote(str(log))}
+printf '%s\\n' "$TMPDIR" >> {shlex.quote(str(scratch_log))}
+[ "$1" = repo ] && [ "$2" = fetch ] && [ "$3" = fixture/trust ] &&
+    [ "$5" = --ref ] && [ "$7" = --into ] && [ "$#" -eq 8 ] || exit 2
+for guarded in core.hooksPath core.sshCommand; do
+    /usr/bin/git -C "$4" config --local --get "$guarded" >/dev/null && exit 8
+done
+[ "$(/usr/bin/git -C "$4" config --local --get remote.origin.url)" = https://github.com/fixture/trust.git ] || exit 8
+[ ! -e {shlex.quote(str(rejected))} ] || exit 9
+if [ -e {shlex.quote(str(wrong))} ]; then
+    exec /usr/bin/git -C "$4" update-ref "$8" {before}
+fi
+# Like NativeExact, supply old history even when the destination had its commit
+# but lacked the blob before the fetch.
+/usr/bin/git -C {shlex.quote(str(self.root / 'trust.git'))} cat-file blob {original_blob} |
+    /usr/bin/git -C "$4" hash-object -w --stdin >/dev/null || exit 3
+exec /usr/bin/git -C "$4" fetch --quiet --no-write-fetch-head --refmap= --no-tags \
+    {shlex.quote(str(self.root / 'trust.git'))} "$6:$8"
+""")
+        selected_path = str(agh_bin) + os.pathsep + os.environ["PATH"]
         train = self.train()
-        with mock.patch("builtins.print") as said:
+        # tick() calls advance() holding the train's lock, which made its state root.
+        train.root.mkdir(parents=True, exist_ok=True)
+        # A killed advance left its intake and Agh's scratch behind; the lock says nothing
+        # uses them.
+        left = train.root / "controller-intake-killed.noindex"
+        (left / "agh-1.noindex/.ubd/agh-git-1_0.noindex").mkdir(parents=True)
+        (left / "agh-1.noindex/.ubd/agh-git-1_0.noindex/pack").write_bytes(b"partial")
+        (left / "source").mkdir()
+        (train.root / "controller-intake-link.noindex").symlink_to(self.repo)
+        with mock.patch.dict(os.environ, {"PATH": selected_path}), mock.patch("builtins.print") as said:
             # This runner's bytes did not change, so the tick goes on in this process.
             self.assertFalse(train.advance())
+        self.assertFalse(left.exists())
+        self.assertTrue((train.root / "controller-intake-link.noindex").is_symlink())
+        self.assertTrue((self.repo / "README").exists())
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), moved)
+        self.assertEqual(git(self.repo, "rev-parse", "refs/remotes/origin/main"), moved)
         self.assertNotEqual(moved, before)
+        arguments = log.read_text().splitlines()
+        intake = Path(arguments[3])
+        self.assertEqual(intake.parent.parent, self.state)
+        self.assertFalse(intake.parent.exists())
+        self.assertEqual(arguments, ["repo", "fetch", "fixture/trust", str(intake),
+            "--ref", moved, "--into", "refs/agh/trust-train/advance"])
+        # Agh's scratch was the train's own, inside the intake's directory, and is gone.
+        [scratch] = map(Path, scratch_log.read_text().splitlines())
+        self.assertEqual(scratch.parent, intake.parent.resolve())
+        self.assertFalse(scratch.exists())
+        self.assertEqual(git(self.repo, "cat-file", "-p", historical), "historical file content")
+        self.assertEqual(git(self.repo, "config", "--get", "core.hooksPath"), "scripts/hooks")
+        self.assertEqual(git(self.repo, "config", "--get", "core.sshCommand"), "/usr/bin/false")
         said.assert_not_called()
+        # On a tracking-only update the local tip already matches. Its missing
+        # older README must still make it all the way back from the private intake.
+        (self.repo / ".git/objects" / original_blob[:2] / original_blob[2:]).unlink()
+        git(self.repo, "update-ref", "refs/remotes/origin/main", before, moved)
+        with mock.patch.dict(os.environ, {"PATH": selected_path}), mock.patch("builtins.print") as said:
+            self.assertFalse(train.advance())
+        said.assert_not_called()
+        self.assertEqual(git(self.repo, "rev-parse", "refs/remotes/origin/main"), moved)
+        self.assertEqual(git(self.repo, "cat-file", "-p", original_blob), "trust")
         # A checkout with uncommitted changes, or on another branch, is left as it is.
         (writer / "README").write_text("moved again")
         git(writer, "commit", "-qam", "main moved again")
         git(writer, "push", "-q", "origin", "main")
+        requested = git(writer, "rev-parse", "HEAD")
+        # A failed fetch must not use the previous private ref, and a successful
+        # fetch reporting the wrong commit must not select its checkout.
+        for marker, message in [(rejected, "source fetch failed (exit 9)"),
+                                (wrong, "source ref differs from the requested immutable commit")]:
+            marker.touch()
+            with mock.patch.dict(os.environ, {"PATH": selected_path}), mock.patch("builtins.print") as said:
+                self.assertFalse(train.advance())
+            self.assertIn(message, "\n".join(str(call.args[0]) for call in said.call_args_list))
+            self.assertEqual(git(self.repo, "rev-parse", "HEAD"), moved)
+            self.assertEqual(git(self.repo, "rev-parse", "refs/remotes/origin/main"), moved)
+            marker.unlink()
+        self.assertIn(requested, log.read_text().splitlines())
+        mismatched = self.train("--github-repo", "elsewhere/trust")
+        mismatched.github = None
+        with mock.patch("builtins.print") as said:
+            self.assertFalse(mismatched.advance())
+        self.assertIn("differs from the checkout's origin", said.call_args[0][0])
+        with mock.patch.object(stage.runpy, "run_path", side_effect=OSError("source helper unavailable")), \
+                mock.patch("builtins.print") as said:
+            self.assertFalse(train.advance())
+        self.assertIn("source helper unavailable", said.call_args[0][0])
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), moved)
         (self.repo / "README").write_text("an edit of the checkout's own")
         with mock.patch("builtins.print") as said:
             self.assertFalse(train.advance())
@@ -4898,25 +6772,42 @@ else:
         (self.repo / "README").write_text("a local commit")
         git(self.repo, "commit", "-qam", "local")
         local = git(self.repo, "rev-parse", "HEAD")
-        with mock.patch("builtins.print") as said:
+        with mock.patch.dict(os.environ, {"PATH": selected_path}), mock.patch("builtins.print") as said:
             self.assertFalse(train.advance())
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), local)
-        self.assertIn("does not fast-forward", said.call_args[0][0])
+        self.assertEqual(git(self.repo, "rev-parse", "refs/remotes/origin/main"), moved)
+        self.assertIn("does not fast-forward", "\n".join(str(call.args[0]) for call in said.call_args_list))
 
     def test_a_tick_whose_runner_changed_on_main_runs_the_new_runner_once(self):
         self.gated_trust()
         argv = ["/agent/runner.py", "train", "run", "--state-root", str(self.state)]
-        with mock.patch.object(stage.Train, "advance", return_value=True) as advanced, \
-                mock.patch.object(stage.os, "execv", side_effect=SystemExit("exec")) as execv, \
+        train = self.train()
+        train.tools.pop("agh")
+        original = os.environ["PATH"]
+        kept = {"directory": "/fixture/kept-agh/bin"}
+
+        def advance():
+            self.assertEqual(os.environ["PATH"], kept["directory"] + os.pathsep + original)
+            return True
+
+        def replaced(*_args):
+            self.assertEqual(os.environ["PATH"], original)
+            raise SystemExit("exec")
+
+        with mock.patch.object(stage.Train, "advance", side_effect=advance) as advanced, \
+                mock.patch.object(stage, "keep_agh", return_value=kept), \
+                mock.patch.object(stage.os, "execv", side_effect=replaced) as execv, \
                 mock.patch.object(stage.sys, "argv", argv), mock.patch.dict(os.environ, clear=False), \
                 mock.patch("builtins.print"):
             os.environ.pop(stage.TRAIN_ADVANCED, None)
             with self.assertRaisesRegex(SystemExit, "exec"):
-                self.train().tick()
+                train.tick()
             execv.assert_called_once_with(sys.executable, [sys.executable, *argv])
             self.assertEqual(os.environ[stage.TRAIN_ADVANCED], "1")
             # The new process does not advance again, and a dry run never advances.
             advanced.reset_mock()
+            with mock.patch.object(stage.Train, "locked", return_value=0):
+                self.assertEqual(train.tick(), 0)
             self.train("--dry-run").tick()
             os.environ.pop(stage.TRAIN_ADVANCED)
             self.train("--dry-run").tick()

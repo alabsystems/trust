@@ -349,7 +349,11 @@ fn ty_expr(ty: &Ty, path: &str) -> Result<String, LiteralRefinementError> {
         | Ty::Storage(_)
         // trust-ir v67: a tensor is a run-time-shaped array value with no
         // layout and no EvalIR carrier, so it is refused like `Storage`.
-        | Ty::Tensor(_, _) => {
+        | Ty::Tensor(_, _)
+        // trust-ir v73: a function item is a zero-sized token naming one
+        // function; EvalIR has no function-identity scalar for it (`Func`
+        // above is refused on the same terms).
+        | Ty::FnItem(_) => {
             return Err(unsupported(
                 path,
                 format!("type outside the exact scalar operational fragment: {ty:?}"),

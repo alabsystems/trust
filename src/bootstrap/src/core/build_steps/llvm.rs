@@ -33,6 +33,8 @@ use crate::utils::helpers::{
 mod cmake_plan;
 // Trust: LLD consumes the declared whole zstd dependency, as rustc_llvm does.
 mod lld_zstd;
+// Trust: the LLVM build tree as an atpkg package (DC-16c).
+mod package_tree;
 mod reuse_evidence;
 mod source_recipe;
 
@@ -661,6 +663,14 @@ fn llvm_cmake_config_with_tools(
     let LlvmCmakeRequest { source, output, target_native, link_shared } = request;
     // https://llvm.org/docs/CMake.html
     let mut cfg = cmake::Config::new(source);
+    // Trust: the request key (`.llvm-stamp`'s `request`) names this checkout's own paths as
+    // tokens, so the same request in another worktree, or the tree atpkg's `llvm-tree`
+    // package carries (`llvm/package_tree.rs`, DC-16c), is recognized as the same build.
+    // The commands themselves still name the real paths.
+    cfg.cache_root(&builder.src);
+    if !builder.out.starts_with(&builder.src) {
+        cfg.cache_root(&builder.out);
+    }
     // Owned derived input: fixed before preparation, written only after the
     // generation reset. It is not an external cleanup-protected dependency.
     cfg.define("LLVM_BUILD_KEY_FILE", output.join(".trust-llvm-build-id"));
@@ -902,6 +912,97 @@ fn llvm_cmake_config_with_tools(
     Ok(LlvmCmakeConfig { config: cfg, postprocess_version_suffix: llvm_version_suffix })
 }
 
+/// Trust: the key inputs of the LLVM tree `stamp` completes for `target`, built on this host
+/// by its C and C++ compilers (`llvm/package_tree.rs`, DC-16c).
+fn package_key_inputs(
+    builder: &Builder<'_>,
+    target: TargetSelection,
+    stamp: &BuildStamp,
+) -> Result<String, String> {
+    let compilers =
+        package_tree::Compilers::query(&builder.cc_tool(target), &builder.cxx_tool(target))?;
+    package_tree::key_inputs(&builder.config.host_target.triple, &compilers, stamp.stamp())
+        .ok_or_else(|| "this build's LLVM request has no complete key".into())
+}
+
+/// Trust: writes the key inputs into the LLVM tree this build completed at `root`, which a
+/// builder packs it under (`atpkg-publish pack-tree --key-inputs <root>/.trust-llvm-tree-key`).
+fn record_package_key(
+    builder: &Builder<'_>,
+    target: TargetSelection,
+    stamp: &BuildStamp,
+    root: &Path,
+) {
+    let inputs = package_key_inputs(builder, target, stamp);
+    if let Err(why) = &inputs {
+        println!("LLVM package: no key inputs recorded: {why}");
+    }
+    if let Err(error) = package_tree::record(root, inputs.as_deref().ok()) {
+        eprintln!("WARNING: cannot write {}: {error}", root.join(package_tree::KEY_FILE).display());
+    }
+}
+
+/// Trust: clones atpkg's `llvm-tree` of this build's key in place of the LLVM directory
+/// `root`, which this miss began afresh and which holds only its generation records
+/// (DC-16c), saying why where it does not. Offered only for the host's own LLVM and where
+/// `rust.trust-stage1-seed` is on. The stage-1 seed's rule that a tree whose stage 0 is not
+/// x.py's extraction is neither donor nor recipient does not apply: LLVM is compiled by the
+/// host C and C++ compilers, which the key names, never by stage 0. A refusal leaves no
+/// `root`; the caller begins it again.
+fn offer_package_tree(
+    builder: &Builder<'_>,
+    target: TargetSelection,
+    stamp: &BuildStamp,
+    root: &Path,
+) -> bool {
+    if !builder.config.trust_stage1_seed || target != builder.config.host_target {
+        return false;
+    }
+    let fresh = fs::read_dir(root).is_ok_and(|entries| {
+        entries.into_iter().all(|entry| {
+            entry.is_ok_and(|entry| {
+                reuse_evidence::FRESH_CMAKE_ROOT.iter().any(|name| entry.file_name() == *name)
+            })
+        })
+    });
+    if !fresh {
+        println!(
+            "LLVM package: build/{}/llvm holds more than a fresh CMake root; building LLVM",
+            target.triple
+        );
+        return false;
+    }
+    if let Err(error) = fs::remove_dir_all(root) {
+        println!(
+            "LLVM package: cannot clear build/{}/llvm ({error}); building LLVM",
+            target.triple
+        );
+        return false;
+    }
+    let taken = package_key_inputs(builder, target, stamp).and_then(|inputs| {
+        let home = env::var_os("HOME").ok_or("HOME is not set")?;
+        let prefix = package_tree::atpkg_prefix(Path::new(&home))?;
+        let store = package_tree::store_dir(&prefix, &builder.config.host_target.triple);
+        package_tree::take(&store, &inputs, root)
+    });
+    match taken {
+        Ok(taken) => {
+            println!(
+                "LLVM package: cloned build/{}/llvm from atpkg's store ({} key {}, {} files)",
+                target.triple,
+                package_tree::PROGRAM,
+                &taken.key[..12],
+                taken.files
+            );
+            true
+        }
+        Err(why) => {
+            println!("LLVM package: {why}; building LLVM");
+            false
+        }
+    }
+}
+
 impl CommandLineStep for Llvm {
     type Output = LlvmOutput;
 
@@ -969,16 +1070,37 @@ impl CommandLineStep for Llvm {
             t!(selected.ensure_selected(builder));
         }
         let known = key.is_some() && source_generation.observed.is_some();
+        // Trust: the key inputs name the completed tree; a miss leaves none behind (DC-16c).
+        t!(package_tree::record(output.root_dir(), None));
         let selected_inputs = dependencies
             .iter()
             .map(|selected| selected.output.root_dir().to_owned())
             .collect::<Vec<_>>();
-        t!(source_generation.begin(
+        let kept = t!(source_generation.begin(
             &stamp,
             &prepared,
             if known { CmakeGeneration::Known } else { CmakeGeneration::Unknown },
             &selected_inputs
         ));
+        // Trust (DC-16c): a root this miss began afresh (none yet, another tree's clone, a
+        // build of another generation) first takes the LLVM build tree atpkg's store holds
+        // under this build's key, and keeps it only where this step's own reuse checks pass.
+        if known && !kept && offer_package_tree(builder, target, &stamp, output.root_dir()) {
+            if dependencies.iter().all(SelectedLlvmDependency::unchanged)
+                && source_generation.cache_matches("llvm", &stamp, output.llvm_config())
+            {
+                return output;
+            }
+            t!(package_tree::remove_tree(output.root_dir()));
+            println!(
+                "LLVM package: the cloned tree fails this build's reuse checks; removed; \
+                 building LLVM"
+            );
+        }
+        if known && !kept && fs::symlink_metadata(output.root_dir()).is_err() {
+            // The offer took the fresh root and laid nothing that stays: begin it again.
+            t!(begin_cmake_miss(&stamp, CmakeGeneration::Known));
+        }
         let build_identity =
             LlvmBuildCacheIdentity::derive(&source_generation, &target.triple, key.as_ref());
         t!(build_identity.write());
@@ -1037,8 +1159,11 @@ impl CommandLineStep for Llvm {
             && dependencies.iter().all(SelectedLlvmDependency::unchanged)
             && regular_source_artifact(output.llvm_config())
         {
-            t!(source_generation
+            let completed = t!(source_generation
                 .complete(&stamp, || dependencies.iter().all(SelectedLlvmDependency::unchanged)));
+            if completed && target == builder.config.host_target {
+                record_package_key(builder, target, &stamp, output.root_dir());
+            }
         }
 
         output

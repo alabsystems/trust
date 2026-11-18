@@ -24,6 +24,7 @@ pub use self::target_info::FileFlavor;
 pub use self::target_info::FileType;
 pub use self::target_info::RustcTargetData;
 pub use self::target_info::TargetInfo;
+pub(crate) use self::target_info::target_configuration;
 
 /// The build context, containing complete information needed for a build task
 /// before it gets started.
@@ -80,6 +81,23 @@ pub struct BuildContext<'a, 'gctx> {
     pub action_environment: Option<cargo_util::EnvironmentInputs>,
     pub shared_dependency_root: Option<std::path::PathBuf>,
     pub shared_dependency_units: HashSet<Unit>,
+    /// Trust (DC-18b): the shared units that are workspace members' libraries:
+    /// compiled path-free into a slot keyed by their contents.
+    pub shared_member_units: HashSet<Unit>,
+    /// Trust (DC-18b): what selection and the logged exclusions both read.
+    pub(crate) shared_eligibility: crate::compiler::shared_dependencies::Eligibility,
+    /// Trust (DC-18b): the environment a shared unit's compiler sees: the
+    /// confined one without the ambient platform selection (deployment
+    /// targets, `SDKROOT`, `DEVELOPER_DIR`) unless `[env]` declares it.
+    pub shared_action_environment: Option<cargo_util::EnvironmentInputs>,
+    /// Trust (DC-24a): the program named in `TRUST_TARGO_UNIT_SOURCE`, asked
+    /// for a shared unit whose check missed under its lock. Only a build that
+    /// shares has one; it starts at the first ask and stops with the build.
+    pub(crate) unit_source: Option<std::sync::Arc<crate::compiler::unit_source::UnitSource>>,
+    /// Trust: this build uses fine-grain locking, given by
+    /// `-Zfine-grain-locking` or turned on by `build.shared-dependency-cache`
+    /// (DC-17a). Every reader of the build's locking asks this, not the flag.
+    pub fine_grain_locking: bool,
 
     /// Associated [`DepKind`]s for root targets
     pub selected_dep_kinds: DepKindSet,
@@ -147,26 +165,88 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
 
         let gctx = ws.gctx();
         let action_sandbox = gctx.build_config()?.action_sandbox.unwrap_or(false);
-        let shared_dependencies = gctx
+        // Trust (DC-17a): a lane that cannot share runs exactly as with the
+        // key unset; one that shares turns fine-grain locking on itself.
+        let requested = gctx
             .build_config()?
             .shared_dependency_cache
             .unwrap_or(false);
-        if shared_dependencies
-            && (!gctx.cli_unstable().fine_grain_locking
-                || !gctx.cli_unstable().build_dir_new_layout
-                || !crate::is_targo_invocation()
-                || crate::trust_verified_targo()
-                || !cfg!(target_os = "macos"))
-        {
-            anyhow::bail!(
-                "build.shared-dependency-cache requires native unverified Targo on macOS with -Zfine-grain-locking and -Zbuild-dir-new-layout"
-            );
-        }
-        let shared_dependency_units = if shared_dependencies {
-            crate::compiler::shared_dependencies::eligible_units(&unit_graph, &roots, ws.root())
+        let policy = crate::compiler::shared_dependencies::cache_policy(
+            crate::compiler::shared_dependencies::CacheLane {
+                requested,
+                // The frontend is asked only where the key is set.
+                targo: requested && crate::is_targo_invocation(),
+                verified: crate::trust_verified_targo(),
+                os: std::env::consts::OS,
+                arch: std::env::consts::ARCH,
+                compiler_host: target_data.rustc.host.as_str(),
+                compiler_wrapper: target_data.rustc.wrapper.is_some()
+                    || target_data.rustc.workspace_wrapper.is_some(),
+                new_layout: gctx.cli_unstable().build_dir_new_layout,
+                fine_grain_flag: gctx.cli_unstable().fine_grain_locking,
+            },
+        );
+        let shared_dependencies = policy.shares;
+        let fine_grain_locking = policy.fine_grain_locking;
+        // The environment is captured before selection: a member's path-bound
+        // record holds for the environment its compile saw.
+        let captured_environment = if action_sandbox || shared_dependencies {
+            let mut environment = cargo_util::ProcessBuilder::new("__action_environment__");
+            crate::compiler::apply_env_config(gctx, &mut environment)?;
+            // env_config omits force=false entries supplied by the caller.
+            // Keep their declarations, and capture the selected caller value.
+            for name in gctx.get::<crate::context::EnvConfig>(["env"])?.keys() {
+                if !environment.get_envs().contains_key(name)
+                    && let Some(value) = gctx.get_env_os(name)
+                {
+                    environment.env(name, value);
+                }
+            }
+            crate::util::rustc::scrub_trust_targo_internal_env(&mut environment);
+            Some(environment)
         } else {
-            HashSet::default()
+            None
         };
+        // Trust: preserve standard compiler/locale selection. Additional
+        // environment inputs must be declared through Cargo's [env];
+        // orchestration tags are not compiler inputs by inheritance.
+        const SELECTION: &[&str] = &[
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "LC_MESSAGES",
+            "TZ",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTC_BOOTSTRAP",
+        ];
+        // Trust (DC-18b): inherited by a confined private action only. A shared
+        // unit's bytes must not follow a setting its key does not hold, so
+        // its compiler sees one of these only where `[env]` declares it.
+        const PLATFORM: &[&str] = &[
+            "MACOSX_DEPLOYMENT_TARGET",
+            "IPHONEOS_DEPLOYMENT_TARGET",
+            "TVOS_DEPLOYMENT_TARGET",
+            "WATCHOS_DEPLOYMENT_TARGET",
+            "XROS_DEPLOYMENT_TARGET",
+            "SDKROOT",
+            "DEVELOPER_DIR",
+        ];
+        let shared_action_environment = match &captured_environment {
+            Some(environment) if shared_dependencies => {
+                let mut inherited = SELECTION.to_vec();
+                inherited.push(cargo_util::paths::dylib_path_envvar());
+                Some(cargo_util::EnvironmentInputs::capture_for(
+                    environment,
+                    &inherited,
+                )?)
+            }
+            _ => None,
+        };
+        // The store is made private (`storage_root`) before members are
+        // judged against it.
         let shared_dependency_root = if shared_dependencies {
             Some(crate::compiler::shared_dependencies::storage_root(
                 gctx.home().as_path_unlocked(),
@@ -174,6 +254,42 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
         } else {
             None
         };
+        let shared_eligibility = if shared_dependencies {
+            crate::compiler::shared_dependencies::Eligibility::new(
+                ws,
+                &unit_graph,
+                crate::compiler::shared_dependencies::EligibilityInputs {
+                    export_dir: build_config.export_dir.as_deref(),
+                    store: shared_dependency_root.as_deref(),
+                    environment: shared_action_environment.as_ref(),
+                    compiler: target_data
+                        .rustc
+                        .full_content_identity(false)
+                        .map(|identity| {
+                            identity.iter().map(|byte| format!("{byte:02x}")).collect()
+                        }),
+                    path_free: target_data.rustc.supports_trust_path_free(gctx)?,
+                    driven: build_config.primary_unit_rustc.is_some() || build_config.force_rebuild,
+                    extra_args: &extra_compiler_args,
+                },
+            )?
+        } else {
+            Default::default()
+        };
+        let shared_dependency_units = if shared_dependencies {
+            crate::compiler::shared_dependencies::eligible_units(
+                &unit_graph,
+                &roots,
+                &shared_eligibility,
+            )
+        } else {
+            HashSet::default()
+        };
+        let shared_member_units: HashSet<Unit> = shared_dependency_units
+            .iter()
+            .filter(|unit| shared_eligibility.member(unit))
+            .cloned()
+            .collect();
         let has_confined_actions = action_sandbox || !shared_dependency_units.is_empty();
         if has_confined_actions
             && (target_data.rustc.wrapper.is_some()
@@ -235,48 +351,20 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
         } else {
             None
         };
-        let action_environment = if has_confined_actions {
-            let mut environment = cargo_util::ProcessBuilder::new("__action_environment__");
-            crate::compiler::apply_env_config(gctx, &mut environment)?;
-            // env_config omits force=false entries supplied by the caller.
-            // Keep their declarations, and capture the selected caller value.
-            for name in gctx.get::<crate::context::EnvConfig>(["env"])?.keys() {
-                if !environment.get_envs().contains_key(name)
-                    && let Some(value) = gctx.get_env_os(name)
-                {
-                    environment.env(name, value);
-                }
+        let action_environment = match &captured_environment {
+            Some(environment) if has_confined_actions => {
+                let mut inherited = SELECTION.to_vec();
+                inherited.extend_from_slice(PLATFORM);
+                inherited.push(cargo_util::paths::dylib_path_envvar());
+                Some(cargo_util::EnvironmentInputs::capture_for(
+                    environment,
+                    &inherited,
+                )?)
             }
-            crate::util::rustc::scrub_trust_targo_internal_env(&mut environment);
-            // Trust: preserve standard compiler/locale selection. Additional
-            // environment inputs must be declared through Cargo's [env];
-            // orchestration tags are not compiler inputs by inheritance.
-            Some(cargo_util::EnvironmentInputs::capture_for(
-                &environment,
-                &[
-                    "PATH",
-                    "HOME",
-                    "LANG",
-                    "LC_ALL",
-                    "LC_CTYPE",
-                    "LC_MESSAGES",
-                    "TZ",
-                    "RUSTUP_HOME",
-                    "RUSTUP_TOOLCHAIN",
-                    "RUSTC_BOOTSTRAP",
-                    "MACOSX_DEPLOYMENT_TARGET",
-                    "IPHONEOS_DEPLOYMENT_TARGET",
-                    "TVOS_DEPLOYMENT_TARGET",
-                    "WATCHOS_DEPLOYMENT_TARGET",
-                    "XROS_DEPLOYMENT_TARGET",
-                    "SDKROOT",
-                    "DEVELOPER_DIR",
-                    cargo_util::paths::dylib_path_envvar(),
-                ],
-            )?)
-        } else {
-            None
+            _ => None,
         };
+        let shared_action_environment =
+            shared_action_environment.filter(|_| !shared_dependency_units.is_empty());
         let configured = gctx.build_config()?.fingerprint;
         let source_fingerprint = if gctx.cli_unstable().checksum_freshness {
             configured.unwrap_or_default()
@@ -300,8 +388,16 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
             action_sandbox,
             action_platform,
             action_environment,
+            unit_source: crate::compiler::unit_source::UnitSource::named(
+                gctx,
+                shared_dependency_root.as_deref(),
+            ),
             shared_dependency_root,
             shared_dependency_units,
+            shared_member_units,
+            shared_eligibility,
+            shared_action_environment,
+            fine_grain_locking,
             selected_dep_kinds,
             profiles,
             extra_compiler_args,
@@ -323,6 +419,30 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
 
     pub fn confines(&self, unit: &Unit) -> bool {
         self.action_sandbox || self.shared_dependency_units.contains(unit)
+    }
+
+    /// Trust (DC-18b): a workspace member's library this build shares.
+    pub fn shared_member(&self, unit: &Unit) -> bool {
+        self.shared_member_units.contains(unit)
+    }
+
+    /// Trust (DC-18c): `dep` stays per checkout and the shared member
+    /// `parent`'s slot is named by its output: the member's build-script run,
+    /// or a proc macro it loads. Such an edge carries no fingerprint, no
+    /// write lease and no sandbox walk: the member's key holds what it
+    /// passes on (`shared_dependencies::MemberInputs`).
+    pub fn keyed_dependency(&self, parent: &Unit, dep: &Unit) -> bool {
+        self.shared_member(parent) && crate::compiler::shared_dependencies::keyed_kind(parent, dep)
+    }
+
+    /// Trust (DC-18b): the environment a confined unit's compiler sees and
+    /// its key holds.
+    pub fn action_environment_for(&self, unit: &Unit) -> Option<&cargo_util::EnvironmentInputs> {
+        if self.shared_dependency_units.contains(unit) {
+            self.shared_action_environment.as_ref()
+        } else {
+            self.action_environment.as_ref()
+        }
     }
 
     /// Gets the host architecture tuple.

@@ -1,7 +1,8 @@
 //! Trust: a real `targo build` keeps the receipt of the units its graph used
 //! (DC-12a), and a failed one leaves the receipt before it; a build that holds
 //! its profile's lock exclusively removes, when it ends, the incremental
-//! folders no kept receipt's unit uses (DC-12b).
+//! folders no kept receipt's unit uses (DC-12b); a build with incremental
+//! compilation off keeps a receipt of its own (DC-12e).
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright 2026 Andrew Yates
 //
@@ -70,7 +71,10 @@ fn world() -> tempfile::TempDir {
 /// `targo --unverified build --offline --message-format=json` in the world's
 /// workspace, run as `targo`, with the world's Cargo home and build directory,
 /// and nothing of the caller's environment that would move the build
-/// directory or a unit out of it, pick the old layout or wrap the compiler.
+/// directory or a unit out of it, pick the old layout, wrap the compiler or
+/// turn incremental compilation off (`CARGO_INCREMENTAL`,
+/// `CARGO_BUILD_INCREMENTAL`, a `CARGO_PROFILE_*_INCREMENTAL` of the dev or
+/// test profile, or a CI run's `CI` or `TF_BUILD`).
 ///
 /// Freshness is by modification time (`build.fingerprint="mtime"`), so the
 /// second build of an unchanged world compiles nothing under any compiler.
@@ -103,15 +107,20 @@ fn build_command(world: &Path) -> Command {
     for name in [
         "CARGO_BUILD_ACTION_SANDBOX",
         "CARGO_BUILD_BUILD_DIR",
+        "CARGO_BUILD_INCREMENTAL",
         "CARGO_BUILD_SHARED_DEPENDENCY_CACHE",
         "CARGO_BUILD_TARGET",
         "CARGO_INCREMENTAL",
         "CARGO_LOG",
         "CARGO_MAKEFLAGS",
+        "CARGO_PROFILE_DEV_INCREMENTAL",
+        "CARGO_PROFILE_TEST_INCREMENTAL",
+        "CI",
         "MAKEFLAGS",
         "MFLAGS",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
+        "TF_BUILD",
         "__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT",
     ] {
         command.env_remove(name);
@@ -670,4 +679,84 @@ fn a_targo_build_removes_the_incremental_folder_of_a_variant_no_kept_receipt_use
     assert!(named.contains(&new), "{named:?}");
     assert_eq!(member, new);
     assert_eq!(crate_folders(world, "receipt_member"), [new]);
+}
+
+/// The receipts in the world's build directory, by name: each one's bytes.
+fn receipts(world: &Path) -> Vec<(String, Vec<u8>)> {
+    let dir = world.join("target").join(RECEIPTS);
+    names(&dir)
+        .into_iter()
+        .map(|name| {
+            let bytes = fs::read(dir.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// DC-12e. A plain `targo build` and the same build with
+/// `CARGO_INCREMENTAL=0` (aterm verify's main lane, in the build directory
+/// plain builds share) keep a receipt each: the plain build's selection has no
+/// `incremental`, and the one with it off says `"incremental":false`, is
+/// otherwise the plain build's selection, names the member's library under
+/// another unit hash and no unit under `incremental`, and leaves the plain
+/// build's receipt byte for byte.
+///
+/// Negative control: the same build with `CARGO_INCREMENTAL=1`, which is
+/// the profile's default, is the plain build's selection: it replaces the
+/// plain build's receipt at its name, and the build with it off keeps its own.
+#[test]
+fn a_targo_build_with_cargo_incremental_0_keeps_its_own_receipt() {
+    let scratch = world();
+    let world = scratch.path();
+
+    let plain = build(world, "plain");
+    succeeded(&plain);
+    let (plain_path, plain_bytes) = receipt(world);
+    let first: Value = serde_json::from_slice(&plain_bytes).unwrap();
+    assert!(first["selection"].get("incremental").is_none(), "{first}");
+    assert!(!incremental_named(&first).is_empty(), "{first}");
+
+    let mut off = build_command(world);
+    off.env("CARGO_INCREMENTAL", "0");
+    let off = run(world, "off", off);
+    succeeded(&off);
+    let kept = receipts(world);
+    assert_eq!(
+        kept.len(),
+        2,
+        "{:?}",
+        kept.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
+    assert_eq!(fs::read(&plain_path).unwrap(), plain_bytes);
+    let plain_name = plain_path.file_name().unwrap().to_str().unwrap();
+    let (_, off_bytes) = kept.iter().find(|(name, _)| name != plain_name).unwrap();
+    let second: Value = serde_json::from_slice(off_bytes).unwrap();
+    assert_eq!(second["selection"]["incremental"], false, "{second}");
+    let mut without = second["selection"].clone();
+    without.as_object_mut().unwrap().remove("incremental");
+    assert_eq!(without, first["selection"]);
+    assert_eq!(second["incremental"], serde_json::json!({}), "{second}");
+    assert_ne!(
+        second["profiles"]["debug"], first["profiles"]["debug"],
+        "{second}"
+    );
+
+    // Negative control: incremental compilation on, as the profile says.
+    let mut on = build_command(world);
+    on.env("CARGO_INCREMENTAL", "1");
+    let on = run(world, "on", on);
+    succeeded(&on);
+    let after = receipts(world);
+    assert_eq!(
+        after.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        kept.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
+    let third: Value = serde_json::from_slice(&fs::read(&plain_path).unwrap()).unwrap();
+    assert!(
+        third["began_ms"].as_u64() > first["began_ms"].as_u64(),
+        "{third}"
+    );
+    assert_eq!(third["selection"], first["selection"]);
+    let (_, off_again) = after.iter().find(|(name, _)| name != plain_name).unwrap();
+    assert_eq!(off_again, off_bytes);
 }

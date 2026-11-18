@@ -539,6 +539,14 @@ pub struct Session {
     /// File paths accessed during the build.
     pub file_depinfo: Lock<FxIndexSet<Symbol>>,
 
+    // Trust (DC-18a): under `-Ztrust-path-free` only, each host path a check found the
+    // unit's metadata would carry, in the order found (`env!`/`option_env!` reads during
+    // expansion, then `rustc_metadata`'s checks). `rustc_metadata` reports the first and
+    // writes no metadata. Empty without the option.
+    pub trust_path_free_refusals: Lock<Vec<rustc_span::trust_path_free::Refusal>>,
+    // Trust (DC-18a): this session's host prefixes, built on first use under the option.
+    trust_path_free_prefixes: std::sync::OnceLock<rustc_span::trust_path_free::HostPrefixes>,
+
     // Trust: only the opt-in producer can populate this invocation's collection.
     pub(crate) tool_input_collection: Lock<crate::tool_inputs::Collection>,
     // Trust: bind child observations to the original compiler parent context.
@@ -1040,6 +1048,33 @@ impl TrustCrateRole {
 impl Session {
     pub fn miri_unleashed_feature(&self, span: Span, feature_gate: Option<Symbol>) {
         self.miri_unleashed_features.lock().push((span, feature_gate));
+    }
+
+    /// Trust (DC-18a): the host prefixes `-Ztrust-path-free` refuses in metadata: the local
+    /// working directory, every `--remap-path-prefix` source, the sysroot, the output,
+    /// temporary and incremental directories, and the home directory (`HOME`, and
+    /// `USERPROFILE` on Windows hosts). Each names this checkout or this machine and no
+    /// other, so a unit that writes one cannot be shared.
+    pub fn trust_path_free_prefixes(&self) -> &rustc_span::trust_path_free::HostPrefixes {
+        self.trust_path_free_prefixes.get_or_init(|| {
+            let working_dir = self
+                .source_map()
+                .working_dir()
+                .local_path()
+                .map(|path| path.to_path_buf())
+                .or_else(|| env::current_dir().ok())
+                .unwrap_or_default();
+            let mut candidates = vec![working_dir.clone()];
+            candidates.extend(self.opts.remap_path_prefix.iter().map(|(from, _)| from.clone()));
+            candidates.extend(self.opts.sysroot.all_paths().map(|path| path.to_path_buf()));
+            candidates.extend(self.io.output_dir.clone());
+            candidates.extend(self.io.temps_dir.clone());
+            candidates.extend(self.opts.incremental.clone());
+            candidates.extend(
+                ["HOME", "USERPROFILE"].into_iter().filter_map(env::var_os).map(PathBuf::from),
+            );
+            rustc_span::trust_path_free::HostPrefixes::new(&working_dir, candidates)
+        })
     }
 
     pub fn local_crate_source_file(&self) -> Option<RealFileName> {
@@ -2273,6 +2308,8 @@ pub fn build_session(
         using_internal_features,
         env_depinfo: Default::default(),
         file_depinfo: Default::default(),
+        trust_path_free_refusals: Default::default(),
+        trust_path_free_prefixes: Default::default(),
         tool_input_collection,
         tool_input_parent_path,
         target_filesearch,

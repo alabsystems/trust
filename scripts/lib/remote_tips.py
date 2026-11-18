@@ -359,6 +359,122 @@ def _run_local_git(args, duration, input_text, env, cwd, *, isolate_git_config=F
         return subprocess.CompletedProcess(list(args), status, text(output), text(errors))
 
 
+def _verified_original_rows(stream, shas, *, expected=None, retain_body=True,
+                            byte_budget=None, object_limit=None):
+    """The shared exact cat-file framing/hash contract, with bounded body reads.
+
+    Metadata callers retain their already bounded payloads. Snapshot reuse
+    hashes each body in chunks and retains only its verified object identity.
+    """
+    for oid in shas:
+        header = stream.readline(256)
+        if not header.endswith(b"\n"):
+            raise ValueError("original object header is truncated or oversized")
+        fields = header[:-1].split()
+        if fields == [oid.encode(), b"missing"]:
+            yield oid, None, None
+            continue
+        if (len(fields) != 3 or fields[0] != oid.encode() or not fields[2].isdigit()
+                or fields[1] not in (b"commit", b"tag", b"tree", b"blob")
+                or (expected is not None and fields[1] != expected[oid][0].encode())):
+            raise ValueError("original object identity/type/size differs")
+        size = int(fields[2])
+        if expected is not None and size != expected[oid][1]:
+            raise ValueError("original object size differs from native source")
+        if object_limit is not None and size > object_limit:
+            raise ValueError("original object exceeds source object budget")
+        if byte_budget is not None:
+            if size > byte_budget:
+                raise ValueError("original objects exceed source byte budget")
+            byte_budget -= size
+        digest = hashlib.sha1(fields[1] + b" " + str(size).encode() + b"\0")
+        body = bytearray() if retain_body else None
+        remaining = size
+        while remaining:
+            chunk = stream.read(min(65536, remaining))
+            if not chunk:
+                raise ValueError("original object body is truncated")
+            remaining -= len(chunk)
+            digest.update(chunk)
+            if body is not None:
+                body.extend(chunk)
+        if stream.read(1) != b"\n" or digest.hexdigest() != oid:
+            raise ValueError("original object framing/hash differs")
+        yield oid, fields[1], bytes(body) if body is not None else None
+    if stream.read(1):
+        raise ValueError("original object stream has trailing bytes")
+
+
+def _verified_present_objects(root, selected, *, env, timeout):
+    """Read/hash every existing selected object before deciding what to import.
+
+    Original lookup uses the same neutral, local-only Git profile as the
+    surrounding intake. A missing response is usable only after a clean Git
+    exit with no corruption diagnostic. The owned reader is drained/reaped on
+    every path; no object body is buffered as a Python payload.
+    """
+    args = ["git", "-C", str(root), "cat-file", "--batch"]
+    deadline = time.monotonic() + timeout
+    byte_budget = sum(size for _kind, size in selected.values())
+    object_limit = max((size for _kind, size in selected.values()), default=0)
+    resources = _process_owner.resource_fds(_env(env))
+    with _operation_signals(), tempfile.TemporaryFile() as request, tempfile.TemporaryFile() as errors:
+        for oid in selected:
+            request.write((oid + "\n").encode())
+        request.seek(0)
+        child = None
+        reader = None
+        reader_started = False
+        finished = False
+        result = queue.Queue(maxsize=1)
+        try:
+            child = subprocess.Popen(args, stdin=request, stdout=subprocess.PIPE, stderr=errors,
+                                     env=_env(env, isolate_git_config=True), cwd=root,
+                                     start_new_session=True, pass_fds=resources)
+            def read():
+                try:
+                    held = {oid for oid, kind, _ in _verified_original_rows(
+                        child.stdout, selected, expected=selected, retain_body=False,
+                        byte_budget=byte_budget, object_limit=object_limit) if kind is not None}
+                    result.put((held, None))
+                except (OSError, ValueError) as error:
+                    result.put((None, str(error)))
+            reader = threading.Thread(target=read)
+            reader.start()
+            reader_started = True
+            while True:
+                if _stop_pending() is not None:
+                    return _stopped(args, _stop_pending()), None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return subprocess.CompletedProcess(args, 124, "", "original object verification deadline exhausted"), None
+                try:
+                    held, problem = result.get(timeout=min(0.02, remaining))
+                    break
+                except queue.Empty:
+                    continue
+            if problem:
+                return subprocess.CompletedProcess(args, 2, "", problem), None
+            if not _observe_until(child, deadline):
+                return subprocess.CompletedProcess(args, 124, "", "original object verification deadline exhausted"), None
+            status = _finish_operation(child)
+            finished = True
+            errors.seek(0)
+            diagnostic = errors.read(65536).decode("utf-8", "surrogateescape")
+            if status or diagnostic:
+                return subprocess.CompletedProcess(args, status or 2, "", diagnostic), None
+            return subprocess.CompletedProcess(args, 0, "", ""), held
+        except (OSError, RuntimeError) as error:
+            return subprocess.CompletedProcess(args, 2, "", str(error)), None
+        finally:
+            if child is not None and not finished:
+                _finish_operation(child)
+            if reader_started:
+                reader.join()
+            if child is not None:
+                child.stdout.close()
+
+
 def _run_binary(args: Sequence[str], *, timeout: Optional[float], input_text: Optional[str],
                 env: Optional[dict[str, str]], cwd: Optional[Path],
                 isolate_git_config: bool = False) -> subprocess.CompletedProcess:
@@ -742,14 +858,39 @@ def remote_refs(url: str, *, git_dir: Optional[Path] = None,
         entries = json.loads(done.stdout, object_pairs_hook=_unique_json_fields)
         if not isinstance(entries, list):
             raise ValueError("refs collection is not a list")
+        # Agh reports an annotated tag's peeled object in its row's `peeled`
+        # field, where `git ls-remote` reports a separate `<ref>^{}` row. Read
+        # it as those two rows, so every check below judges them as before.
+        rows = []
+        for entry in entries:
+            if isinstance(entry, dict) and set(entry) == {"ref", "oid", "peeled"}:
+                if not isinstance(entry["ref"], str) or entry["ref"].endswith("^{}"):
+                    raise ValueError("invalid peeled native ref entry")
+                rows += [{"ref": entry["ref"], "oid": entry["oid"]},
+                         {"ref": entry["ref"] + "^{}", "oid": entry["peeled"]}]
+            else:
+                rows.append(entry)
+        entries = rows
         refs = {}
         advertised = {}
         seen = set()
+        head = None
         named = None if witness is None else frozenset(witness)
         for entry in entries:
             if not isinstance(entry, dict) or set(entry) != {"ref", "oid"}:
                 raise ValueError("invalid native ref entry")
             name = entry["ref"]
+            if name == "HEAD":
+                # Agh lists the HEAD pseudoref with the refs; `git ls-remote
+                # --refs`, the non-GitHub path above, omits it. Only one
+                # well-formed row naming an advertised branch tip (checked
+                # after the loop) is dropped; it is never advertised.
+                oid = entry["oid"]
+                if (head is not None or not isinstance(oid, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", oid) or oid == "0" * 40):
+                    raise ValueError("ambiguous or invalid remote HEAD")
+                head = oid
+                continue
             if not isinstance(name, str) or not name.startswith("refs/"):
                 raise ValueError("invalid remote ref")
             oid = entry["oid"]
@@ -769,6 +910,8 @@ def remote_refs(url: str, *, git_dir: Optional[Path] = None,
                 raise ValueError("peeled objects cannot supply durable remote refs")
             if named is None or name in named:
                 refs[name] = oid
+        if head is not None and head not in {oid for name, oid in advertised.items() if name.startswith(HEADS)}:
+            raise ValueError("remote HEAD names no advertised branch tip")
         if refs:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1227,37 +1370,63 @@ def _fetch_exact_github(repository, root, oid, *, env, timeout=FETCH_TIMEOUT_S):
                 # A checkout closure may omit historical tree/blob bodies.
                 # Transfer its exact commit ancestry and selected snapshot;
                 # upload-pack's negotiation can revisit absent old objects.
-                selected = set(local(["-C", str(acquisition), "rev-list", oid], acquisition).splitlines())
-                selected.add(tree)
+                selected = {item: "commit" for item in local(
+                    ["-C", str(acquisition), "rev-list", oid], acquisition).splitlines()}
+                selected[tree] = "tree"
                 rows = local(["-C", str(acquisition), "ls-tree", "-r", "-t", "--full-tree", oid], acquisition)
                 for row in rows.splitlines():
                     fields = row.partition("\t")[0].split()
                     require(len(fields) == 3 and fields[1] in ("tree", "blob", "commit"),
                             "source intake has an invalid snapshot entry")
                     if fields[1] != "commit":  # Gitlinks own no objects here.
-                        selected.add(fields[2])
+                        require(fields[2] not in selected or selected[fields[2]] == fields[1],
+                                "source intake has conflicting selected object types")
+                        selected[fields[2]] = fields[1]
                 require(oid in selected and all(re.fullmatch(r"[0-9a-f]{40}", item) for item in selected),
                         "source intake has an invalid exact object identity")
-                pack_prefix = data / "snapshot"
-                pack_id = local(["-C", str(acquisition), "pack-objects", "--threads=1", str(pack_prefix)],
-                                acquisition, input_text="".join(item + "\n" for item in sorted(selected)))
-                require(re.fullmatch(r"[0-9a-f]{40}", pack_id), "source intake pack has no exact identity")
-                pack = data / ("snapshot-" + pack_id + ".pack")
-                destination = data / "intake.git"
-                local(["init", "--quiet", "--bare", "--template=", str(destination)], directory)
-
+                # The authenticated native snapshot owns the precise raw
+                # sizes, including multi-GiB total source trees. Do not widen
+                # the separate 32-MiB metadata reader or confuse raw size with
+                # the existing compressed-pack import cap.
+                inventory = local(["-C", str(acquisition), "cat-file", "--batch-check"], acquisition,
+                                  input_text="".join(item + "\n" for item in selected))
+                records = inventory.splitlines()
+                require(len(records) == len(selected), "source intake size inventory is incomplete")
+                sized = {}
+                for item, record in zip(selected, records):
+                    fields = record.split()
+                    require(len(fields) == 3 and fields[:2] == [item, selected[item]]
+                            and fields[2].isascii() and fields[2].isdigit() and len(fields[2]) <= 20,
+                            "source intake size inventory differs from selected identities")
+                    sized[item] = (fields[1], int(fields[2]))
                 check_original()
-                with os.fdopen(os.open(pack, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb") as stream:
-                    before = os.fstat(stream.fileno())
-                    require(stat.S_ISREG(before.st_mode), "source intake pack is not a regular file")
-                    require(before.st_size <= 2 * 1024 ** 3, "source intake snapshot pack exceeds 2 GiB")
-                    imported = local(["--git-dir", str(destination), "index-pack", "--stdin"], directory,
-                                     objects=objects, input_file=stream)
-                    require(imported == "pack\t" + pack_id, "source intake imported a different pack")
-                    after, named = os.fstat(stream.fileno()), pack.lstat()
-                    identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-                    require(identity(before) == identity(after) == identity(named),
-                            "source intake pack changed during import")
+                verified, held = _verified_present_objects(root, sized, env=env, timeout=remaining())
+                if verified.returncode:
+                    raise _PublicationSourceFailure(verified)
+                check_private()
+                check_original()
+                missing = sorted(set(selected) - held)
+                if missing:
+                    pack_prefix = data / "snapshot"
+                    pack_id = local(["-C", str(acquisition), "pack-objects", "--threads=1", str(pack_prefix)],
+                                    acquisition, input_text="".join(item + "\n" for item in missing))
+                    require(re.fullmatch(r"[0-9a-f]{40}", pack_id), "source intake pack has no exact identity")
+                    pack = data / ("snapshot-" + pack_id + ".pack")
+                    destination = data / "intake.git"
+                    local(["init", "--quiet", "--bare", "--template=", str(destination)], directory)
+
+                    check_original()
+                    with os.fdopen(os.open(pack, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb") as stream:
+                        before = os.fstat(stream.fileno())
+                        require(stat.S_ISREG(before.st_mode), "source intake pack is not a regular file")
+                        require(before.st_size <= 2 * 1024 ** 3, "source intake snapshot pack exceeds 2 GiB")
+                        imported = local(["--git-dir", str(destination), "index-pack", "--stdin"], directory,
+                                         objects=objects, input_file=stream)
+                        require(imported == "pack\t" + pack_id, "source intake imported a different pack")
+                        after, named = os.fstat(stream.fileno()), pack.lstat()
+                        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                        require(identity(before) == identity(after) == identity(named),
+                                "source intake pack changed during import")
                 check_private()
                 check_original()
             # Check through the original repository after private stores are
@@ -1900,38 +2069,13 @@ class RemoteTips:
         )
         if done.returncode:
             return None
-        held = {}
-        # Text mode performs universal-newline conversion even with
-        # surrogateescape. Commit messages may legally contain CRLF, bare CR
-        # or non-UTF8 bytes: frame and hash the original bytes untouched.
-        data = done.stdout
-        if not isinstance(data, bytes):
+        if not isinstance(done.stdout, bytes):
             return None
-        offset = 0
-        for sha in shas:
-            end = data.find(b"\n", offset)
-            if end < 0:
-                return None
-            fields = data[offset:end].split()
-            offset = end + 1
-            if fields == [sha.encode(), b"missing"]:
-                continue
-            if len(fields) != 3 or fields[0] != sha.encode() or not fields[2].isdigit():
-                return None
-            size = int(fields[2])
-            body = data[offset:offset + size]
-            if len(body) != size or data[offset + size:offset + size + 1] != b"\n":
-                return None
-            offset += size + 1
-            digest = hashlib.sha1(fields[1] + b" " + str(size).encode() + b"\0" + body).hexdigest()
-            if digest != sha:
-                return None
-            if fields[1] not in (b"commit", b"tag", b"tree", b"blob"):
-                return None
-            held[sha] = (fields[1], body)
-        if offset != len(data):
+        try:
+            return {oid: (kind, body) for oid, kind, body in _verified_original_rows(
+                io.BytesIO(done.stdout), shas) if kind is not None}
+        except (ValueError, OSError):
             return None
-        return held
 
     def _fetch(
         self,

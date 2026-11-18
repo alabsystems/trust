@@ -268,4 +268,18 @@
 #   sources of 401ce4326291 with the corrected counter:
 #   bash scripts/check_tcb_panic_freedom.sh --print
 #   The updater now refuses increases and malformed/overflowing baselines.
-145
+# 2026-11-17: 145 -> 137. Main (c57ca62cc1) measured 153, above this baseline
+#   (OPEN_ISSUES TCB-PANIC-RATCHET-RED-1, now removed). The counter did not
+#   change; sixteen production sites now refuse instead of panicking:
+#   - trust-cg-bridge module_to_lir `lower_aggregate_inst`: six
+#     `result0.expect("guarded")` become an `UnsupportedAggregate` refusal,
+#     should a tracked-aggregate guard and its arm ever disagree;
+#   - trust-cg-bridge object_replay/scalar_certificate.rs: the three
+#     `try_into().unwrap()` in u16_at/u32_at/u64_at join the bounds-checked
+#     Option chain, and the RET-word check compares the slice with the
+#     encoded bytes, so a wrong-length slice is refused, not unwrapped;
+#   - trust-wasm-bridge `exact_non_empty_scalar_target_binding`: six
+#     "blockers empty only when ..." expects become one let-else that
+#     returns a `non-empty-scalar-binding-component-missing` blocker.
+#   153 - 16 = 137. Reproduce: bash scripts/check_tcb_panic_freedom.sh --list
+137

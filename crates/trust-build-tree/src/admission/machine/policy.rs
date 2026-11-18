@@ -170,6 +170,7 @@ impl FixedCommandAdmission {
                 };
                 Ok(budget)
             },
+            FixedPublication::UnlaunchedCommand,
         );
         if let Some(pool) = initialized {
             self.pool = Some(pool);

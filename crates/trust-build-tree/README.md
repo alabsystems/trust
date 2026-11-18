@@ -387,3 +387,53 @@ explicitly unverified test lane and passing checks confer no formal proof grade.
 This package adds no importer or consumer-specific source copy. Any later
 packaging must preserve the canonical implementations and their dependency,
 licence and test boundaries; that integration needs its own qualification.
+
+On macOS arm64, the distinct held-image group launcher reports the existing
+17-byte execution-start lifecycle frame only after checking the actual stopped
+image and original claim, immediately before GO. Its original nonblocking pipe
+stays in the supervisor and is disjoint from original fixed/GNU resources.
+Notification failure kills and retires the still-stopped owned group; it cannot
+start the target or become CPU, SDK or Host authority. Generic V1 launches keep
+their existing behavior. The native CLI accepts this observer for an original
+fixed Root and a V2 suboperation retaining that SAME original output member and
+GNU currency. Nested notification follows the actual stopped/loaded image,
+original claim and cwd bookends immediately before GO. It creates no group or
+reservation; direct-child cancellation stays local and the ancestor retains
+group drain. V1 nested execution obtains no observer or output wildcard.
+
+The observed native Root issues its private output member before launching the
+selected tool. A distinct V2 envelope binds that original directory/EX-lock pair
+into every held fixed record. The existing ancestor courier has a distinct
+`fixed2` role for this complete population; V1's regular-file-only role and
+decoder remain closed. Neither the member digest, TMPDIR routing name nor an
+advertised population creates CPU, source, SDK or proof authority.
+`targo --resource-capabilities --fixed-admission-v2` reports only whether this
+native lifecycle/member protocol is implemented; the existing V1 query keeps
+its response and actual admission remains independent of both observations.
+
+Nested output execution retains the same fixed/GNU continuation and uses native
+child-only fchdir from its actual member directory. Targo prepares both resolved
+target and build directories through the original no-follow directory owner,
+retains them with the same claim, and checks them during queue processing and
+after actual GNU retirement. The actual selected workspace/root-package
+manifests are checked separately from cwd: they must reside in that member or
+match the already-held original source worktree. Cwd membership cannot authorize
+a foreign `--manifest-path`; existing dependency-source/byte ownership remains
+separate. The nested cwd is rechecked after loaded-image validation and before
+GO. An outside/foreign member, parent escape, symlink,
+replaced target or unbound non-Git continuation refuses. The original Root keeps
+its output exclusion until actual group drain. This is cooperating-owner
+exclusion, not confinement against root or malicious same-UID code; filesystem
+observations and a successful development run do not establish a source seal or
+Host/SDK grade. The native execution consumer remains macOS arm64; unsupported
+platforms do not obtain a cwd or resource fallback.
+
+`trust-build-status --json` exposes the same `admission::status::command` used
+by Targo. Build it with `--features machine-admission --bin trust-build-status`.
+This small native client needs no compiler or prover graph: it only observes
+existing canonical namespaces and calls the shared kernel-memory observer.
+It creates no namespace, claim or capacity grant. `scripts/build-slot` prefers
+this client when it is on PATH and otherwise uses Targo's status command.
+A present client with unknown, malformed or failed output supplies no native
+estimate; it is never replaced by an older Targo estimate. The original bounded
+query, process-group cleanup, CPU claims and memory floors still apply.

@@ -38,10 +38,11 @@ const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_SOURCES: usize = 64;
 
-/// Copy bounded stored cache DATA to an absent home under original donor locks.
-/// The distinct full-history Git importer keeps its expanded-object limits.
-/// This profile accepts sparse crates.io routing only. Normal locked/offline
-/// fetching must subsequently validate all selected sources and archive checksums.
+/// Copy locked Git closure and stored registry DATA to an absent home under
+/// original donor locks. Git export reuses the full-history importer's checked
+/// object/byte limits; unrelated donor objects are not output. This profile
+/// accepts sparse crates.io routing only. Normal locked/offline fetching must
+/// subsequently validate all selected sources and archive checksums.
 pub fn snapshot_locked_cache_data(
     ws: &Workspace<'_>,
     donor: &Path,
@@ -588,6 +589,38 @@ fn inspect_closure_scope(
     pack_reads: &mut pack_stream::ReadBudget,
     historical_trees: bool,
 ) -> CargoResult<()> {
+    inspect_closure_objects(
+        database,
+        revision,
+        stats,
+        pack_reads,
+        historical_trees,
+        true,
+    )
+}
+
+// Trust: the selected snapshot packs the bounded ordinary objects with native
+// libgit2 after this SAME hash/closure walk. Oversized blobs keep the existing
+// streaming writer; they never enter the pack builder's in-memory body path.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn inspect_closure_for_pack(
+    database: &mut Database,
+    revision: git2::Oid,
+    stats: &mut Stats,
+    pack_reads: &mut pack_stream::ReadBudget,
+) -> CargoResult<()> {
+    inspect_closure_objects(database, revision, stats, pack_reads, true, false)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn inspect_closure_objects(
+    database: &mut Database,
+    revision: git2::Oid,
+    stats: &mut Stats,
+    pack_reads: &mut pack_stream::ReadBudget,
+    historical_trees: bool,
+    write_ordinary: bool,
+) -> CargoResult<()> {
     let input = &database.input;
     let source = input.odb()?;
     let sink = database
@@ -644,7 +677,7 @@ fn inspect_closure_scope(
                 git2::Oid::hash_object(expected, object.data())? == oid,
                 "corrupt locked Git object: {oid}"
             );
-            if let Some(sink) = &sink {
+            if write_ordinary && let Some(sink) = &sink {
                 ensure!(
                     sink.write(expected, object.data())? == oid,
                     "Git source object write disagrees: {oid}"

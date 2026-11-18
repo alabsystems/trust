@@ -423,7 +423,8 @@ impl ProcessExecutor for Executor {
         self.output_inner(process)
     }
     fn status(&self, process: &ProcessBuilder) -> io::Result<ExitStatus> {
-        self.output_inner(process).map(|output| output.status)
+        self.output_inner(process)
+            .and_then(|output| process.report_captured_status(output))
     }
     fn streaming(
         &self,

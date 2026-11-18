@@ -257,7 +257,24 @@ fn capture(
 
 /// Called before workspace discovery and compiler probing. Only the existing
 /// authenticated frontend handoff can authorize this execution-only branch.
-pub fn try_run_prepared_tests(gctx: &GlobalContext) -> Result<bool, CliError> {
+pub fn try_run_prepared_tests(
+    gctx: &GlobalContext,
+    child_supervision: Option<cargo_util::ChildSupervision>,
+) -> Result<bool, CliError> {
+    if child_supervision.is_some()
+        && (gctx.has_retained_test()
+            || [
+                TRUST_TARGO_PREPARED_TEST_SESSION,
+                TRUST_TARGO_TEST_EXECUTION_MANIFEST,
+                TRUST_TARGO_TEST_EXECUTION_MANIFEST_SHA256,
+            ]
+            .iter()
+            .any(|key| gctx.get_env_os(key).is_some()))
+    {
+        return Err(anyhow::anyhow!(
+            "ordinary child supervision is unsupported by prepared or retained test execution; no test started"
+        ).into());
+    }
     if gctx.has_retained_test() {
         if [
             TRUST_TARGO_PREPARED_TEST_SESSION,
@@ -548,6 +565,28 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_supervision_refuses_prepared_authority_before_execution() {
+        let policy =
+            cargo_util::ChildSupervision::new(std::time::Duration::from_secs(1), None).unwrap();
+        for name in [
+            TRUST_TARGO_PREPARED_TEST_SESSION,
+            TRUST_TARGO_TEST_EXECUTION_MANIFEST,
+            TRUST_TARGO_TEST_EXECUTION_MANIFEST_SHA256,
+        ] {
+            let mut context = GlobalContext::default().unwrap();
+            context.set_env(
+                [(name.to_owned(), "unread-policy-fixture".to_owned())]
+                    .into_iter()
+                    .collect(),
+            );
+            let error = try_run_prepared_tests(&context, Some(policy)).unwrap_err();
+            assert!(error.error.unwrap().to_string().contains(
+                "ordinary child supervision is unsupported by prepared or retained test execution"
+            ));
+        }
+    }
+
+    #[test]
     fn ambient_execution_authority_cannot_enter_prepared_execution() {
         for name in [
             TRUST_TARGO_PREPARED_TEST_SESSION,
@@ -560,7 +599,7 @@ mod tests {
                     .into_iter()
                     .collect(),
             );
-            let error = try_run_prepared_tests(&context).unwrap_err();
+            let error = try_run_prepared_tests(&context, None).unwrap_err();
             assert!(
                 error
                     .error
@@ -571,7 +610,7 @@ mod tests {
         }
         let mut context = GlobalContext::default().unwrap();
         context.set_env(Default::default());
-        assert!(!try_run_prepared_tests(&context).unwrap());
+        assert!(!try_run_prepared_tests(&context, None).unwrap());
     }
 
     #[test]

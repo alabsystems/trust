@@ -12,12 +12,16 @@
 // added `EnumTagEncoding::SingleInhabited`, and `to_mir.rs` moved by exactly one match arm
 // for it (ada3447e0b, +4/-0 from the pin 0676e4e8a2) in the reason-collecting match of the
 // enum-return REFUSAL arm. The waiver row claims the move refuses more and admits nothing new.
+// trust-ir v72 added `EnumTagEncoding::DirectWithUninhabited`, and DC-28 moved `to_mir.rs` by
+// one more reason arm for it in the same match, under the same claim.
+//
 // That claim holds iff, in the shim:
 //
 //   * the by-value byte gate `enum_flip_direct_only` admits a recorded descriptor only when it
 //     is `Direct` (a positive allow-list, so a new encoding refuses);
 //   * the by-ref logical-read gate `enum_flip_logical_read_ok` admits only `Direct | Niche`;
-//   * the only `SingleInhabited` token is inside the enum-return refusal arm, which has no exit
+//   * the only `SingleInhabited` and `DirectWithUninhabited` tokens are inside the enum-return
+//     refusal arm, which has no exit
 //     but `return unsup(..)`, and whose reason match stays exhaustive (no wildcard, so the next
 //     trust-ir encoding again fails to compile and needs its own adjudication);
 //   * the enum-return ADMIT arm above it is unchanged and still conjoins the byte gate;
@@ -209,7 +213,7 @@ const REFUSAL_ARM_OPENER: &str =
 
 const REFUSAL_ARM_EXIT: &str = r#"return unsup(format!("enum return type {}", why.join("; "))); }"#;
 
-const REASON_MATCH: &str = r#"let enc = match desc.encoding { trust_ir::ty::EnumTagEncoding::Direct { .. } => None, trust_ir::ty::EnumTagEncoding::Niche { .. } => { Some("Niche") } trust_ir::ty::EnumTagEncoding::Untagged => { Some("Untagged") } trust_ir::ty::EnumTagEncoding::SingleInhabited { .. } => { Some("SingleInhabited") } };"#;
+const REASON_MATCH: &str = r#"let enc = match desc.encoding { trust_ir::ty::EnumTagEncoding::Direct { .. } => None, trust_ir::ty::EnumTagEncoding::Niche { .. } => { Some("Niche") } trust_ir::ty::EnumTagEncoding::Untagged => { Some("Untagged") } trust_ir::ty::EnumTagEncoding::SingleInhabited { .. } => { Some("SingleInhabited") } trust_ir::ty::EnumTagEncoding::DirectWithUninhabited { .. } => Some("DirectWithUninhabited"), };"#;
 
 /// The source span `[start, end)` of `fn <name>` — exactly one definition — through its body.
 fn fn_span(v: &Views, name: &str, what: &str) -> Result<(usize, usize), String> {
@@ -283,14 +287,15 @@ fn refusal_arm(src: &str) -> Result<(), String> {
     let got = norm(&v.code[reason..=reason_end]);
     if got != REASON_MATCH {
         return Err(format!(
-            "the reason match is no longer the exhaustive four-arm match:\n  {got}"
+            "the reason match is no longer the exhaustive five-arm match:\n  {got}"
         ));
     }
     Ok(())
 }
 
 /// Every read of an enum layout descriptor or its encoding, and every mention of
-/// `SingleInhabited`, in the shim's code (comments and string contents excluded).
+/// `SingleInhabited` and `DirectWithUninhabited`, in the shim's code (comments and string
+/// contents excluded).
 fn descriptor_census(src: &str) -> Result<(), String> {
     let v = views(src);
     let regions = [
@@ -319,8 +324,9 @@ fn descriptor_census(src: &str) -> Result<(), String> {
         (".layout", 3, [1, 1, 1]),
         (".encoding", 3, [1, 1, 1]),
         ("enum_def(", 3, [1, 1, 1]),
-        ("EnumTagEncoding", 7, [1, 2, 4]),
+        ("EnumTagEncoding", 8, [1, 2, 5]),
         ("SingleInhabited", 1, [0, 0, 1]),
+        ("DirectWithUninhabited", 1, [0, 0, 1]),
     ] {
         let hits = field_reads(needle);
         if hits.len() != expected {

@@ -263,6 +263,25 @@ pub struct ConcreteCalleeKey {
 }
 
 impl ConcreteCalleeKey {
+    /// Preserve the real definition and concrete typed arguments as nominal
+    /// type data. No display spelling or module-local arena id participates.
+    pub(crate) fn type_origin(&self) -> trust_ir::ty::TypeOrigin {
+        let mut args = Vec::new();
+        args.push(1); // canonical argument encoding version
+        encode_u64(&mut args, self.args.len() as u64);
+        for arg in &self.args {
+            encode_concrete_arg(&mut args, arg);
+        }
+        let mut def_path_hash = [0; 16];
+        def_path_hash[..8].copy_from_slice(&self.definition.stable_crate_id.to_le_bytes());
+        def_path_hash[8..].copy_from_slice(&self.definition.local_hash.to_le_bytes());
+        trust_ir::ty::TypeOrigin::Rust {
+            stable_crate_id: self.definition.stable_crate_id,
+            def_path_hash,
+            args_digest: ProofDigest::sha256_domain(trust_ir::ty::RUST_TYPE_ARGS_DOMAIN, &args),
+        }
+    }
+
     /// Convert the already-normalized, region-erased reconstruction encoding into a stable
     /// declaration key. The caller must pass args from the resolved rustc `Instance`, not
     /// the raw MIR site spelling.
@@ -1269,6 +1288,32 @@ mod tests {
         assert_ne!(one, two);
         assert_ne!(one.symbol_suffix(), two.symbol_suffix());
         assert_eq!(one.symbol_suffix(), const_u32_key(1).symbol_suffix());
+        assert_ne!(one.type_origin(), two.type_origin());
+        assert_eq!(one.type_origin(), const_u32_key(1).type_origin());
+    }
+
+    #[test]
+    fn nominal_type_origin_retains_definition_hash_and_concrete_argument_kinds() {
+        let definition = DefinitionIdentity::test_only(0x1020, 0x3040);
+        let key = ConcreteCalleeKey::test_only(
+            definition, ConcreteInstanceKind::Item,
+            vec![ConcreteInstanceArg::Ty(ConcreteInstanceTy::Bool)],
+        );
+        let trust_ir::ty::TypeOrigin::Rust {
+            stable_crate_id, def_path_hash, args_digest,
+        } = key.type_origin() else { unreachable!() };
+        assert_eq!(stable_crate_id, 0x1020);
+        assert_eq!(&def_path_hash[..8], &0x1020u64.to_le_bytes());
+        assert_eq!(&def_path_hash[8..], &0x3040u64.to_le_bytes());
+        let empty = ConcreteCalleeKey::test_only(definition, ConcreteInstanceKind::Item, vec![]);
+        let trust_ir::ty::TypeOrigin::Rust { args_digest: empty_args, .. } = empty.type_origin()
+            else { unreachable!() };
+        assert_ne!(args_digest, empty_args);
+        let other = ConcreteCalleeKey::test_only(
+            DefinitionIdentity::test_only(0x1020, 0x3041),
+            ConcreteInstanceKind::Item, vec![ConcreteInstanceArg::Ty(ConcreteInstanceTy::Bool)],
+        );
+        assert_ne!(key.type_origin(), other.type_origin());
     }
 
     /// A reify shim is a different codegen object from the underlying item even with the same

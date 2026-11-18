@@ -6,7 +6,140 @@
 use std::time::{Duration, Instant};
 
 use super::*;
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+use crate::trust_repo_lock::management::exec::native;
 use crate::trust_repo_lock::management::process;
+
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+#[path = "group/execution_start.rs"]
+pub(super) mod execution_start;
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+pub use execution_start::ExecutionStartPipe;
+
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+struct NativeGroupInputs {
+    image: NativeGroupImage,
+    _scheduler: jobserver_utils::Jobserver,
+    // The original supervisor serves SAME rights across unaware std execs.
+    // No descriptor parser or endpoint is manufactured by an App descendant.
+    _fixed_courier: jobserver_utils::FixedClaimHandoff,
+    completion: Option<Result<(), (io::ErrorKind, String)>>,
+}
+
+/// Different original-input owners; neither variant supplies resource admission.
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+enum NativeGroupImage {
+    System(trust_resource_provenance::program::HeldSystemCommand),
+    Produced(trust_resource_provenance::program::produced::HeldProducedExecution),
+}
+
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+impl NativeGroupImage {
+    fn program(&self) -> &Path {
+        match self {
+            Self::System(image) => image.program(),
+            Self::Produced(image) => image.program(),
+        }
+    }
+    fn validate(&self, deadline: Instant) -> io::Result<()> {
+        match self {
+            Self::System(image) => image.validate(deadline),
+            Self::Produced(image) => image.validate(deadline),
+        }
+    }
+    fn validate_loaded(
+        &self,
+        child: trust_resource_provenance::process::Identity,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        match self {
+            Self::System(image) => image.validate_loaded(child, deadline),
+            Self::Produced(image) => image.validate_loaded(child, deadline),
+        }
+    }
+    fn check_environment(&self, command: &Command) -> io::Result<()> {
+        use std::collections::BTreeMap;
+        use std::os::unix::ffi::OsStrExt;
+        let loader = |name: &OsStr| {
+            name.as_bytes().starts_with(b"DYLD_") || name.as_bytes().starts_with(b"LD_")
+        };
+        let mut actual: BTreeMap<OsString, OsString> =
+            std::env::vars_os().filter(|(name, _)| loader(name)).collect();
+        for (name, value) in command.get_envs().filter(|(name, _)| loader(name)) {
+            if let Some(value) = value {
+                actual.insert(name.to_owned(), value.to_owned());
+            } else {
+                actual.remove(name);
+            }
+        }
+        match self {
+            Self::System(_) if !actual.is_empty() => {
+                Err(invalid("native group refuses loader overrides"))
+            }
+            Self::System(_) => Ok(()),
+            Self::Produced(image) => {
+                if &actual != image.environment() {
+                    return Err(invalid(
+                        "produced native group differs from its original runtime environment",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+impl NativeGroupInputs {
+    fn completed(&mut self) -> io::Result<()> {
+        let result = self.completion.get_or_insert_with(|| {
+            self.image
+                .validate(Instant::now() + ORIGINAL_TRANSACTION_WAIT)
+                .map_err(|error| (error.kind(), error.to_string()))
+        });
+        match result {
+            Ok(()) => Ok(()),
+            Err((kind, message)) => Err(io::Error::new(*kind, message.clone())),
+        }
+    }
+}
+
+enum GroupChild {
+    Standard(Child),
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    Native(native::Child),
+}
+
+impl GroupChild {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Standard(child) => child.id(),
+            #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+            Self::Native(child) => child.id(),
+        }
+    }
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            Self::Standard(child) => child.wait(),
+            #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+            Self::Native(child) => child.wait(),
+        }
+    }
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        match self {
+            Self::Standard(child) => child.stdout.take(),
+            #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+            Self::Native(_) => None,
+        }
+    }
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        match self {
+            Self::Standard(child) => child.stderr.take(),
+            #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+            Self::Native(_) => None,
+        }
+    }
+}
 
 #[path = "group/relay.rs"]
 mod relay;
@@ -14,6 +147,18 @@ use relay::SignalRelay;
 
 const POLL: Duration = Duration::from_millis(10);
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
+
+#[cfg(all(test, feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreGoExit {
+    BeforeIdentity,
+    BeforeResume,
+}
+
+#[cfg(all(test, feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    static PRE_GO_EXIT: std::cell::Cell<Option<PreGoExit>> = const { std::cell::Cell::new(None) };
+}
 
 /// Signals the owning launcher can forward to its actual isolated group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,35 +184,304 @@ impl FixedCommandSignal {
 pub struct RunningFixedGroup {
     claim: Option<FixedClaim>,
     _packet: File,
-    child: Child,
+    child: Option<GroupChild>,
     group: libc::pid_t,
     status: Option<ExitStatus>,
     retired: bool,
     absence_error: Option<io::Error>,
     relay: Option<SignalRelay>,
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    native_inputs: Option<NativeGroupInputs>,
 }
 
 impl PreparedFixedCommand {
+    #[cfg(all(test, feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    pub(super) unsafe fn spawn_loaded_output_fixture(
+        self,
+        image: trust_resource_provenance::program::HeldSystemCommand,
+        scheduler: jobserver_utils::Jobserver,
+        deadline: Instant,
+    ) -> io::Result<RunningFixedGroup> {
+        // SAFETY: only the isolated real-FD output fixture calls this private
+        // test entry; its exact inherited-console/original-GNU contract holds.
+        unsafe {
+            self.spawn_loaded_group_checked(
+                NativeGroupImage::System(image),
+                scheduler,
+                None,
+                deadline,
+                None,
+            )
+        }
+    }
+    /// Start the admitted orchestrator at its actual stopped-image GO boundary.
+    /// The observer is lifecycle DATA only and never reaches the child. The
+    /// same group owner retains CPU/GNU/image custody through real retirement.
+    ///
+    /// # Safety
+    /// The caller supplies the SAME original GNU server, with its implicit
+    /// continuation serially paused. The command uses inherited cwd/console
+    /// stdio and environment plus explicit edits; no caller pre_exec, env_clear,
+    /// arg0 or stdio/cwd redirection is supported. Only this preparation's own
+    /// original-descriptor pre_exec is replaced by native inheritance actions.
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    pub unsafe fn spawn_loaded_group_with_signal_forwarding_before(
+        self,
+        image: trust_resource_provenance::program::HeldSystemCommand,
+        scheduler: jobserver_utils::Jobserver,
+        execution_start: Option<ExecutionStartPipe>,
+        deadline: Instant,
+    ) -> io::Result<RunningFixedGroup> {
+        // SAFETY: the unchanged public caller contract applies to this exact
+        // original system image and the same command/scheduler.
+        unsafe {
+            self.spawn_loaded_program_before(
+                NativeGroupImage::System(image),
+                scheduler,
+                execution_start,
+                deadline,
+            )
+        }
+    }
+
+    /// Execute a genuinely retained produced artifact under the same fixed
+    /// claim. Its original output/SDK/runtime owners survive group retirement;
+    /// path/hash observations cannot construct this input. Loader edits must
+    /// equal that owner's complete retained startup environment.
+    ///
+    /// # Safety
+    /// The caller must satisfy the same serial original-GNU and command-field
+    /// contract as `spawn_loaded_group_with_signal_forwarding_before`, and must
+    /// have positively retired every compiler writer before capturing `image`.
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    pub unsafe fn spawn_loaded_produced_group_with_signal_forwarding_before(
+        self,
+        image: trust_resource_provenance::program::produced::HeldProducedExecution,
+        scheduler: jobserver_utils::Jobserver,
+        execution_start: Option<ExecutionStartPipe>,
+        deadline: Instant,
+    ) -> io::Result<RunningFixedGroup> {
+        // SAFETY: the caller retains the actual produced-input owner and
+        // satisfies the same original command and GNU continuation contract.
+        unsafe {
+            self.spawn_loaded_program_before(
+                NativeGroupImage::Produced(image),
+                scheduler,
+                execution_start,
+                deadline,
+            )
+        }
+    }
+
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    unsafe fn spawn_loaded_program_before(
+        self,
+        image: NativeGroupImage,
+        scheduler: jobserver_utils::Jobserver,
+        execution_start: Option<ExecutionStartPipe>,
+        deadline: Instant,
+    ) -> io::Result<RunningFixedGroup> {
+        let deadline = deadline.min(Instant::now() + ORIGINAL_TRANSACTION_WAIT);
+        let relay = SignalRelay::install()?;
+        let interrupt = || {
+            if relay.take().is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted before native GO"))
+            }
+        };
+        interrupt()?;
+        match self.claim.observe_native_room_before(deadline, interrupt)? {
+            LegacyFixedRoom::Fits { .. } => {}
+            room => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("native fixed group prelaunch refused: {room:?}"),
+                ));
+            }
+        }
+        // SAFETY: the same caller contract above applies; no command field is
+        // changed after the ordinary actual-room check.
+        unsafe {
+            self.spawn_loaded_group_checked(
+                image,
+                scheduler,
+                execution_start,
+                deadline,
+                Some(relay),
+            )
+        }
+    }
+
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    unsafe fn spawn_loaded_group_checked(
+        mut self,
+        image: NativeGroupImage,
+        scheduler: jobserver_utils::Jobserver,
+        execution_start: Option<ExecutionStartPipe>,
+        deadline: Instant,
+        relay: Option<SignalRelay>,
+    ) -> io::Result<RunningFixedGroup> {
+        use std::os::fd::AsRawFd;
+        self.claim.check_current()?;
+        if self.command.get_program() != image.program().as_os_str() {
+            return Err(invalid("native group differs from the same held image"));
+        }
+        image.check_environment(&self.command)?;
+        let original_gnu = scheduler.retain_transport_descriptors()?;
+        let execution_start = execution_start
+            .map(|pipe| {
+                execution_start::ExecutionStart::capture(
+                    pipe,
+                    self.original_descriptors
+                        .iter()
+                        .copied()
+                        .chain(original_gnu.iter().map(AsRawFd::as_raw_fd)),
+                )
+            })
+            .transpose()?;
+        if let Some(quiet) = self.quiet.as_mut() {
+            quiet.check(&self.claim)?;
+        }
+        image.validate(deadline)?;
+        let mut originals = original_entries(&self.claim)?
+            .iter()
+            .map(|entry| {
+                trust_build_cpu::duplicate_descriptor(OsStr::new(&entry.descriptor.to_string()))
+                    .map(Into::into)
+            })
+            .collect::<io::Result<Vec<std::os::fd::OwnedFd>>>()?;
+        let output = self.claim.output.as_ref().map(output_member::Issued::wire).transpose()?;
+        if let Some(output) = &output {
+            for fd in output.descriptors() {
+                originals.push(
+                    trust_build_cpu::duplicate_descriptor(OsStr::new(&fd.to_string()))?.into(),
+                );
+            }
+        }
+        let packet = self.packet.try_clone()?.into();
+        let courier = if output.is_some() {
+            jobserver_utils::FixedClaimHandoff::new_with_output_member(packet, originals)?
+        } else {
+            jobserver_utils::FixedClaimHandoff::new(packet, originals)?
+        };
+        self.command.env(jobserver_utils::FIXED_CLAIM_HANDOFF_ENV, courier.advertisement());
+        self.command.env(FIXED_HANDOFF_ENV, "requires-live-ancestor-v1");
+        self.claim.check_current()?;
+        let child = native::Child::spawn_group_suspended(
+            &self.command,
+            &scheduler,
+            &self.original_descriptors,
+            deadline,
+        )?;
+        let group = child.id() as libc::pid_t;
+        // Install the actual child/group owner before any fallible observation:
+        // every error below kills the still-stopped group and retires it using
+        // the same existing bounded cancellation, never TERM-only waiting.
+        let mut owner = RunningFixedGroup {
+            claim: Some(self.claim),
+            _packet: self.packet,
+            child: Some(GroupChild::Native(child)),
+            group,
+            status: None,
+            retired: false,
+            absence_error: None,
+            relay,
+            native_inputs: Some(NativeGroupInputs {
+                image,
+                _scheduler: scheduler,
+                _fixed_courier: courier,
+                completion: None,
+            }),
+        };
+        #[cfg(test)]
+        owner.fixture_exit_before_go(PreGoExit::BeforeIdentity, deadline)?;
+        let identity = match owner.child_mut() {
+            GroupChild::Native(child) => child.stopped_group_identity(deadline)?,
+            GroupChild::Standard(_) => unreachable!("native child installed above"),
+        };
+        owner
+            .native_inputs
+            .as_ref()
+            .expect("same original native inputs")
+            .image
+            .validate_loaded(identity, deadline)?;
+        owner.claim.as_ref().expect("same original claim").check_current()?;
+        if owner.relay.as_ref().is_some_and(|relay| !relay.take().is_empty()) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted before native GO"));
+        }
+        if let Some(observer) = execution_start {
+            observer.notify(identity.pid, deadline)?;
+        }
+        #[cfg(test)]
+        owner.fixture_exit_before_go(PreGoExit::BeforeResume, deadline)?;
+        match owner.child_mut() {
+            GroupChild::Native(child) => child.resume_group(identity, deadline)?,
+            GroupChild::Standard(_) => unreachable!("same original native child"),
+        }
+        owner.claim.as_mut().expect("same original claim").release_prelaunch_admission();
+        Ok(owner)
+    }
+
     /// Launch in a new session and original process group, retaining the same
     /// complete fixed resource claim. No existing group can be named or joined.
     pub fn spawn_group(self) -> io::Result<RunningFixedGroup> {
-        match self.claim.observe_native_room()? {
+        match self
+            .claim
+            .observe_native_room_before(Instant::now() + ORIGINAL_TRANSACTION_WAIT, || Ok(()))?
+        {
             LegacyFixedRoom::Fits { .. } => self.spawn_group_checked(),
-            _ => Err(io::ErrorKind::WouldBlock.into()),
+            room => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("native fixed group prelaunch refused: {room:?}"),
+            )),
         }
     }
 
     /// A standalone launcher's scoped INT/TERM/HUP relay. Only one relay can
     /// be live in this process; existing application handlers are not replaced.
     pub fn spawn_group_with_signal_forwarding(self) -> io::Result<RunningFixedGroup> {
-        match self.claim.observe_native_room()? {
-            LegacyFixedRoom::Fits { .. } => self.spawn_with_forwarder_checked(),
-            _ => Err(io::ErrorKind::WouldBlock.into()),
+        self.spawn_group_with_signal_forwarding_before(Instant::now() + ORIGINAL_TRANSACTION_WAIT)
+    }
+
+    /// Retain the same unlaunched claim through transient manifest contention.
+    /// The existing metadata bound and caller's remaining queue deadline both
+    /// apply. Unknown or over-capacity observations never authorize a launch.
+    pub fn spawn_group_with_signal_forwarding_before(
+        self,
+        deadline: Instant,
+    ) -> io::Result<RunningFixedGroup> {
+        let relay = SignalRelay::install()?;
+        let interrupt = || {
+            if relay.take().is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "interrupted before original group launch",
+                ))
+            }
+        };
+        interrupt()?;
+        match self.claim.observe_native_room_before(
+            deadline.min(Instant::now() + ORIGINAL_TRANSACTION_WAIT),
+            interrupt,
+        )? {
+            LegacyFixedRoom::Fits { .. } => self.spawn_with_relay_checked(relay),
+            room => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("native fixed group prelaunch refused: {room:?}"),
+            )),
         }
     }
 
+    #[cfg(test)]
     fn spawn_with_forwarder_checked(self) -> io::Result<RunningFixedGroup> {
         let relay = SignalRelay::install()?;
+        self.spawn_with_relay_checked(relay)
+    }
+
+    fn spawn_with_relay_checked(self, relay: SignalRelay) -> io::Result<RunningFixedGroup> {
         if !relay.take().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -110,27 +524,62 @@ impl PreparedFixedCommand {
         Ok(RunningFixedGroup {
             claim: Some(spawned.claim),
             _packet: spawned.packet,
-            child: spawned.child,
+            child: Some(GroupChild::Standard(spawned.child)),
             group,
             status: None,
             retired: false,
             absence_error: None,
             relay: None,
+            #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+            native_inputs: None,
         })
     }
 }
 
 impl RunningFixedGroup {
+    #[cfg(all(test, feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    fn fixture_exit_before_go(&mut self, point: PreGoExit, deadline: Instant) -> io::Result<()> {
+        let kill = PRE_GO_EXIT.with(|fault| {
+            if fault.get() == Some(point) {
+                fault.set(None);
+                true
+            } else {
+                false
+            }
+        });
+        if kill {
+            match self.child_mut() {
+                GroupChild::Native(child) => child.kill()?,
+                GroupChild::Standard(_) => unreachable!("native-only fixture point"),
+            }
+            while !self.leader_exited()? {
+                if Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+        Ok(())
+    }
+
+    fn child(&self) -> &GroupChild {
+        self.child.as_ref().expect("original group child retained through retirement")
+    }
+
+    fn child_mut(&mut self) -> &mut GroupChild {
+        self.child.as_mut().expect("original group child retained through retirement")
+    }
+
     pub fn id(&self) -> u32 {
-        self.child.id()
+        self.child().id()
     }
 
     pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.stdout.take()
+        self.child_mut().take_stdout()
     }
 
     pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.stderr.take()
+        self.child_mut().take_stderr()
     }
 
     /// Forward only while the actual child remains this owner's unreaped group
@@ -170,7 +619,7 @@ impl RunningFixedGroup {
             let result = unsafe {
                 libc::waitid(
                     libc::P_PID,
-                    self.child.id() as libc::id_t,
+                    self.child().id() as libc::id_t,
                     info.as_mut_ptr(),
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 )
@@ -178,11 +627,20 @@ impl RunningFixedGroup {
             if result == 0 {
                 // SAFETY: success initialized siginfo, including the no-event
                 // zero PID. No exit status is fabricated from the observation.
-                let observed = unsafe { info.assume_init().si_pid() };
+                let info = unsafe { info.assume_init() };
+                // SAFETY: successful waitid initialized this siginfo observation.
+                let observed = unsafe { info.si_pid() };
                 return if observed == 0 {
                     Ok(false)
                 } else if observed == self.group {
-                    Ok(true)
+                    // A reported child is not necessarily terminal. In
+                    // particular, Darwin can report the initial exec stop;
+                    // never enter a blocking owning wait for that event.
+                    match info.si_code {
+                        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => Ok(true),
+                        libc::CLD_STOPPED | libc::CLD_CONTINUED | libc::CLD_TRAPPED => Ok(false),
+                        _ => Err(invalid("unknown original child wait event")),
+                    }
                 } else {
                     Err(invalid("owning wait observed another child"))
                 };
@@ -224,16 +682,16 @@ impl RunningFixedGroup {
             if !self.leader_exited()? {
                 return Ok(None);
             }
-            let members = process::group_pids(self.child.id()).inspect_err(|error| {
+            let members = process::group_pids(self.child().id()).inspect_err(|error| {
                 #[cfg(test)]
                 eprintln!("original group {} actual proc_listpids: {error}", self.group);
                 #[cfg(not(test))]
                 let _ = error;
             })?;
-            if members.iter().any(|pid| *pid != self.child.id()) {
+            if members.iter().any(|pid| *pid != self.child().id()) {
                 return Ok(None);
             }
-            self.status = Some(self.child.wait().inspect_err(|error| {
+            self.status = Some(self.child_mut().wait().inspect_err(|error| {
                 #[cfg(test)]
                 eprintln!("original group {} actual owning wait: {error}", self.group);
                 #[cfg(not(test))]
@@ -258,12 +716,26 @@ impl RunningFixedGroup {
         for signal in signals {
             if let Err(error) = self.forward_signal(signal) {
                 return match self.poll_retirement()? {
-                    Some(status) => Ok(Some(status)),
+                    Some(status) => self.completed_terminal(Some(status)),
                     None => Err(error),
                 };
             }
         }
-        self.poll_retirement()
+        let terminal = self.poll_retirement()?;
+        self.completed_terminal(terminal)
+    }
+
+    fn completed_terminal(
+        &mut self,
+        terminal: Option<ExitStatus>,
+    ) -> io::Result<Option<ExitStatus>> {
+        #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+        if terminal.is_some() {
+            if let Some(inputs) = self.native_inputs.as_mut() {
+                inputs.completed()?;
+            }
+        }
+        Ok(terminal)
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -339,6 +811,17 @@ impl Drop for RunningFixedGroup {
             if let Some(claim) = self.claim.take() {
                 std::mem::forget(claim);
             }
+            // Native direct-child Drop intentionally waits indefinitely on an
+            // unknown owning wait. The GROUP owner already applied its bounded
+            // kill/retirement protocol; retain that actual child too instead of
+            // starting a second unbounded wait after its terminal refusal.
+            if let Some(child) = self.child.take() {
+                std::mem::forget(child);
+            }
+            #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+            if let Some(inputs) = self.native_inputs.take() {
+                std::mem::forget(inputs);
+            }
             let _ = writeln!(
                 io::stderr().lock(),
                 "native original group retirement unknown; actual resources retained: {error}"
@@ -349,4 +832,8 @@ impl Drop for RunningFixedGroup {
 
 #[cfg(test)]
 #[path = "group/tests.rs"]
-mod tests;
+pub(super) mod tests;
+
+#[cfg(all(test, feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+#[path = "group/loaded_tests.rs"]
+pub(super) mod loaded_tests;

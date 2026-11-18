@@ -21,6 +21,12 @@ PREFLIGHT = SCRIPT.with_name("check_upstream_rust_test_toolchain.sh")
 COLLECTOR = SCRIPT.with_name("collect_strict_superiority_artifacts.sh")
 
 
+# A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces (atpkg's python
+# lives under `Application Support/`): exec splits it and the fake never runs. This sh/python
+# polyglot execs the interpreter quoted and keeps argv[0] as the fake's own path.
+PYTHON_SHEBANG = f'#!/bin/sh\n""":"\nexec "{sys.executable}" "$0" "$@"\n":"""\n'
+
+
 class SummaryValidationTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="trust-upstream-summary-")
@@ -568,7 +574,7 @@ class SummaryValidationTests(unittest.TestCase):
         (target_lib / "libstd-fixture.rlib").write_bytes(b"synthetic")
         for name in TOOLS:
             tool = stage2 / "bin" / name
-            tool.write_text(f"#!{sys.executable}\n{VERSION_TOOL}", encoding="utf-8")
+            tool.write_text(PYTHON_SHEBANG + VERSION_TOOL, encoding="utf-8")
             tool.chmod(0o755)
         env = dict(os.environ)
         env.update(TRUST_STAGE2_SYSROOT=str(stage2), TRUST_FIXTURE_COMMIT=self.head,

@@ -45,8 +45,9 @@ IDENTITY, and how every body is paired (each row discloses `paired_by`):
                    there overwrites `compiler_failed`.  A control compile with
                    no integer exit status is printed-path and a
                    `rust.compiler-census-exit-unmeasured` error.
-  kernel-identity  a Lean kernel-roster declaration from a compile that exited
-                   0 and whose completion footer lists, for its own root input,
+  kernel-identity  a Lean computational census row paired with a
+                   computational-candidate kernel declaration from a compile
+                   that exited 0 and whose completion footer lists, for its own root input,
                    the admitted file's SHA-256 as its source-map checksum:
                    admitted file SHA-256 + declaration name + kernel payload
                    SHA-256.  A transcript whose root-input checksum is not the
@@ -54,6 +55,9 @@ IDENTITY, and how every body is paired (each row discloses `paired_by`):
                    `lean.island-input-differs-from-admitted` error.  (Only the
                    digest binds the transcript to the admitted file; its own
                    input label is not compared with the manifest path.)
+                   Declared proof-only and computational rows are reconciled
+                   with that roster's type classification. A disagreement is
+                   recorded even if the supplied row has no body to index.
   kernel-identity-from-failed-compile
                    the same, from an island census whose compile exited
                    non-zero.  Never counted as kernel-identity; the file is also
@@ -482,33 +486,48 @@ class Producer:
             if row["file"] not in by_path:
                 self.error("admission.producer-file-not-admitted", f"lean {row['file']}")
                 continue
+            if row["kind"] not in {"computational", "proof-only"}:
+                raise InputRefusal(f"Lean body census: unknown declaration kind {row['kind']!r}")
             listed.setdefault(row["file"], set()).add(row["name"])
-            if row["kind"] != "computational":
-                continue
             fid, admitted_sha = by_path[row["file"]]
             supplied = rosters.get(row["file"])
             roster = supplied["names"] if supplied else None
             status = supplied["process_status"] if supplied else "unmeasured"
             input_source = supplied["input_source"] if supplied else None
             kernel = roster.get(row["name"]) if roster else None
-            if (kernel is not None and isinstance(kernel.get("kernel_payload_sha256"), str)
-                    and input_source == "match"):
+            classification = kernel["kernel_classification"]["kind"] if kernel and input_source == "match" else None
+            kernel_kind = {
+                "computational-candidate": "computational",
+                "proof-only": "proof-only",
+                "type-family": "proof-only",
+            }.get(classification)
+            classification_reason = None
+            if classification is not None and row["kind"] != kernel_kind:
+                error = ("lean.kernel-classification-inconclusive" if kernel_kind is None
+                         else "lean.census-kernel-kind-mismatch")
+                classification_reason = f"census {row['kind']}, kernel {classification}"
+                self.error(error, f"{row['file']} {row['name']}: {classification_reason}")
+            if row["kind"] != "computational":
+                continue
+            kernel_payload = kernel.get("kernel_payload_sha256") if kernel else None
+            kernel_row = isinstance(kernel_payload, str)
+            if kernel_row and kernel_kind == "computational":
                 # A roster from a compile that did not exit 0 is disclosed as
                 # such, never counted as kernel-identity.
                 failed = status != "success"
                 identity = {"language": "lean",
                             "basis": "kernel-identity-from-failed-compile" if failed else "kernel-identity",
                             "admitted_source_sha256": admitted_sha, "name": row["name"],
-                            "kernel_payload_sha256": kernel["kernel_payload_sha256"]}
+                            "kernel_payload_sha256": kernel_payload}
                 reason = f"island census compile process is {status}" if failed else None
             else:
-                kernel_row = kernel is not None and isinstance(kernel.get("kernel_payload_sha256"), str)
                 if roster and not kernel_row:
                     self.error("lean.census-declaration-without-kernel-row", f"{row['file']} {row['name']}")
                 identity = {"language": "lean", "basis": "printed-path",
                             "admitted_source_sha256": admitted_sha, "printed_path": row["name"]}
                 reason = ("no usable Lean island census supplied for this file" if not roster
                           else "no kernel roster row for this name" if not kernel_row
+                          else classification_reason if classification_reason is not None
                           else "the island compile's root-input checksum is not the admitted file's")
             bodies.append({"language": "lean", "file_id": fid, "source_body": row["name"],
                            "source_kind": row["kind"], "identity": identity, "reason": reason,

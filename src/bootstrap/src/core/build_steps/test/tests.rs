@@ -10,18 +10,20 @@ use crate::utils::tests::TestCtx;
 fn native_compiler_unit_program_selection_is_doc_free_and_host_only() {
     use crate::core::builder::CargoInput;
 
-    assert_eq!(
-        super::compiler_unit_test_cargo_input(
-            Mode::Rustc,
-            Kind::Test,
-            TestTarget::Tests,
-            true,
-            true,
-            false,
-            false,
-        ),
-        CargoInput::CurrentNativeUnitTests,
-    );
+    for target in [TestTarget::Tests, TestTarget::Lib] {
+        assert_eq!(
+            super::compiler_unit_test_cargo_input(
+                Mode::Rustc,
+                Kind::Test,
+                target,
+                true,
+                true,
+                false,
+                false,
+            ),
+            CargoInput::CurrentNativeUnitTests,
+        );
+    }
     for (mode, kind, target, native, supported, remote, runner) in [
         (Mode::Rustc, Kind::Test, TestTarget::Tests, false, true, false, false),
         (Mode::Rustc, Kind::Test, TestTarget::Tests, true, false, false, false),
@@ -60,7 +62,7 @@ fn explicit_doctests_use_current_compiler_metadata() {
 #[test]
 fn explicit_non_doc_and_later_stage_passes_keep_their_scope() {
     for stage in 0..=2 {
-        for target in [TestTarget::Tests, TestTarget::AllTargets] {
+        for target in [TestTarget::Tests, TestTarget::Lib, TestTarget::AllTargets] {
             assert_eq!(compiler_crate_test_passes(stage, target), [(stage, target)]);
         }
     }
@@ -75,7 +77,7 @@ fn explicit_non_doc_and_later_stage_passes_keep_their_scope() {
 #[test]
 fn compiler_unit_commands_keep_build_inputs_and_use_matching_fixture_runtime() {
     for (build_stage, test_target) in (0..=2).flat_map(|stage| {
-        [TestTarget::AllTargets, TestTarget::Tests, TestTarget::Default]
+        [TestTarget::AllTargets, TestTarget::Tests, TestTarget::Lib, TestTarget::Default]
             .map(|target| (stage, target))
     }) {
         let ctx = TestCtx::new();
@@ -119,13 +121,14 @@ fn compiler_unit_commands_keep_build_inputs_and_use_matching_fixture_runtime() {
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(
             args.contains(&std::ffi::OsStr::new("--tests")),
-            test_target != TestTarget::Default
+            matches!(test_target, TestTarget::Tests | TestTarget::AllTargets)
         );
         assert_eq!(
             args.contains(&std::ffi::OsStr::new("--examples")),
             test_target == TestTarget::AllTargets
         );
         assert!(!args.contains(&std::ffi::OsStr::new("--doc")));
+        assert_eq!(args.contains(&std::ffi::OsStr::new("--lib")), test_target == TestTarget::Lib);
     }
 }
 

@@ -16,7 +16,7 @@ use crate::compiler::{CompileMode, UnitIndex};
 use crate::util::log_message::{
     COMPILER_OBSERVATION_VERSION, EXECUTION_VERSION, ExecutionGraphOutcome, ExecutionUnitOutcome,
     INPUT_WORK_VERSION, LogMessage, SHARED_DEPENDENCY_POLICY_VERSION, SharedDependencyDecision,
-    Target,
+    Target, UnitSourceRefusal,
 };
 use crate::util::logger::RunId;
 use crate::workspace::Workspace;
@@ -152,6 +152,28 @@ struct UnitRow {
     duration_seconds: Option<f64>,
     process: ProcessObservation,
     shared_dependency: Option<SharedDependencyDecision>,
+    /// Trust (DC-18b): the policy named the unit a workspace member's, whose
+    /// requested package does not keep it private.
+    #[serde(skip)]
+    shared_member: bool,
+    /// Trust (DC-18c): the policy named the unit one a member may be keyed on
+    /// (a build-script run or a proc macro), which stays per checkout.
+    #[serde(skip)]
+    shared_keyed: bool,
+    /// Trust (DC-24a): what became of the unit a unit source staged for this
+    /// eligible unit during execution (`taken`, or `refused` with a reason).
+    /// Absent where no source staged it, so a build that names no source
+    /// reports as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit_source: Option<UnitSourceOutcome>,
+}
+
+/// Trust (DC-24a): the unit source decisions, apart from the planning ones.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+enum UnitSourceOutcome {
+    Taken {},
+    Refused { reason: UnitSourceRefusal },
 }
 
 #[derive(Default, Serialize)]
@@ -361,6 +383,9 @@ fn analyze(reader: impl BufRead, run: &str) -> CargoResult<Report> {
                         duration_seconds: None,
                         process: ProcessObservation::default(),
                         shared_dependency: None,
+                        shared_member: false,
+                        shared_keyed: false,
+                        unit_source: None,
                     },
                 );
             }
@@ -419,6 +444,8 @@ fn analyze(reader: impl BufRead, run: &str) -> CargoResult<Report> {
             LogMessage::SharedDependencyPolicy {
                 version,
                 enabled: sharing,
+                members,
+                keyed,
             } => {
                 if !graph_registered
                     || shared_policy.is_some()
@@ -428,7 +455,61 @@ fn analyze(reader: impl BufRead, run: &str) -> CargoResult<Report> {
                 {
                     bail!("unsupported, duplicate or late shared dependency policy");
                 }
+                if !sharing && !(members.is_empty() && keyed.is_empty()) {
+                    bail!("workspace members named by a disabled shared dependency policy");
+                }
+                for index in keyed {
+                    let unit = units
+                        .get_mut(&index)
+                        .context("unit a member is keyed on is unregistered")?;
+                    // A build-script run or a library (a proc macro's kind).
+                    if !(unit.mode.is_run_custom_build() || unit.target.kind == "lib")
+                        || std::mem::replace(&mut unit.shared_keyed, true)
+                    {
+                        bail!("unit a member is keyed on is not a unique script run or library");
+                    }
+                }
+                for index in members {
+                    let unit = units
+                        .get_mut(&index)
+                        .context("shared workspace member is unregistered")?;
+                    // A member is a path package of the workspace.
+                    if !unit.package_id.starts_with("path+file://")
+                        || std::mem::replace(&mut unit.shared_member, true)
+                    {
+                        bail!("shared workspace member is not a unique path package unit");
+                    }
+                }
                 shared_policy = Some(sharing);
+            }
+            LogMessage::SharedDependencyDecision {
+                index,
+                decision:
+                    decision @ (SharedDependencyDecision::Taken {}
+                    | SharedDependencyDecision::Refused { .. }),
+            } => {
+                let decision = match decision {
+                    SharedDependencyDecision::Refused { reason } => {
+                        UnitSourceOutcome::Refused { reason }
+                    }
+                    _ => UnitSourceOutcome::Taken {},
+                };
+                // Trust (DC-24a): a unit source's staged unit is decided on the
+                // worker of a planned-eligible unit dispatched dirty, before
+                // its outcome and before any compiler process of its own.
+                let unit = units
+                    .get_mut(&index)
+                    .context("unit source decision is unregistered")?;
+                if shared_policy != Some(true)
+                    || terminal.is_some()
+                    || unit.shared_dependency != Some(SharedDependencyDecision::Eligible {})
+                    || unit.scheduled_fresh != Some(false)
+                    || unit.outcome.is_some()
+                    || unit.process.command_started_seconds.is_some()
+                    || unit.unit_source.replace(decision).is_some()
+                {
+                    bail!("unit source decision outside a dirty eligible unit's execution");
+                }
             }
             LogMessage::SharedDependencyDecision { index, decision } => {
                 if shared_policy != Some(true) || counts.scheduled != 0 || terminal.is_some() {
@@ -825,7 +906,7 @@ mod tests {
     }
 
     fn shared_policy(enabled: bool) -> Value {
-        json!({"reason":"shared-dependency-policy","version":1,"enabled":enabled})
+        json!({"reason":"shared-dependency-policy","version":SHARED_DEPENDENCY_POLICY_VERSION,"enabled":enabled})
     }
 
     fn shared_decision(index: u64, decision: Value) -> Value {

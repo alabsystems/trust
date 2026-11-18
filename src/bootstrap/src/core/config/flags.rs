@@ -451,6 +451,9 @@ pub enum Subcommand {
         /// Only run unit and integration tests
         #[arg(long)]
         tests: bool,
+        /// Only run library unit tests
+        #[arg(long, conflicts_with_all = ["all_targets", "doc", "tests", "no_doc"])]
+        lib: bool,
         // Trust: an explicit fixture is only a runtime input to compiler
         // library tests; it never selects the compiler building those tests.
         #[arg(long, value_hint = clap::ValueHint::DirPath, value_name = "SYSROOT")]
@@ -531,6 +534,9 @@ pub enum Subcommand {
         /// Only run unit and integration tests
         #[arg(long)]
         tests: bool,
+        /// Only run library unit tests
+        #[arg(long, conflicts_with_all = ["all_targets", "doc", "tests", "no_doc"])]
+        lib: bool,
 
         /// Deprecated. Use `--all-targets` or `--tests` instead.
         #[arg(long)]
@@ -682,19 +688,20 @@ impl Subcommand {
 
     pub fn test_target(&self) -> TestTarget {
         match *self {
-            Subcommand::Test { mut all_targets, doc, tests, no_doc, .. }
-            | Subcommand::Miri { mut all_targets, doc, tests, no_doc, .. } => {
+            Subcommand::Test { mut all_targets, doc, tests, lib, no_doc, .. }
+            | Subcommand::Miri { mut all_targets, doc, tests, lib, no_doc, .. } => {
                 // for backwards compatibility --no-doc keeps working
                 all_targets = all_targets || no_doc;
 
-                match (all_targets, doc, tests) {
-                    (true, true, _) | (true, _, true) | (_, true, true) => {
-                        panic!("You can only set one of `--all-targets`, `--doc` and `--tests`.")
-                    }
-                    (true, false, false) => TestTarget::AllTargets,
-                    (false, true, false) => TestTarget::DocOnly,
-                    (false, false, true) => TestTarget::Tests,
-                    (false, false, false) => TestTarget::Default,
+                match (all_targets, doc, tests, lib) {
+                    (true, false, false, false) => TestTarget::AllTargets,
+                    (false, true, false, false) => TestTarget::DocOnly,
+                    (false, false, true, false) => TestTarget::Tests,
+                    (false, false, false, true) => TestTarget::Lib,
+                    (false, false, false, false) => TestTarget::Default,
+                    _ => panic!(
+                        "You can only set one of `--all-targets`, `--doc`, `--tests` and `--lib`."
+                    ),
                 }
             }
             _ => TestTarget::Default,

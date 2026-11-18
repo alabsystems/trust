@@ -130,14 +130,19 @@ fn run(gctx: &mut GlobalContext, argv: Vec<OsString>, purpose: RunPurpose) -> Cl
     // In general, try to avoid loading config values unless necessary (like
     // the [alias] table).
 
-    let native_shape =
-        super::resource_capabilities::invocation_supported(argv.get(1..).unwrap_or_default());
     // Trust: a library call's actual argv is independent of the Root process
     // prelude. Capture consent before this canonical parser consumes it.
     let original_tail_unverified = argv_has_unverified_before_delimiter(&argv);
     let mut command = cli(gctx);
     let args = command.try_get_matches_from_mut(argv)?;
-    if args.flag("resource-worker-v2") && !native_shape {
+    let native_phase = if matches!(purpose, RunPurpose::NativeCapability) {
+        Some(NativeOperationPhase::Discovery)
+    } else if args.flag("resource-worker-v2") {
+        Some(NativeOperationPhase::Execution)
+    } else {
+        None
+    };
+    if native_phase.is_some_and(|phase| !native_operation_supported(&args, phase)) {
         return Err(anyhow::anyhow!(
             "native worker invocation is outside the supported command profile"
         )
@@ -350,7 +355,15 @@ fn run(gctx: &mut GlobalContext, argv: Vec<OsString>, purpose: RunPurpose) -> Cl
         {
             // Older admission clients may not understand a fatal discovery
             // field. Actual selected execution enforces the same restriction.
-            let _ = commands::test::native_budget_check(gctx, subcommand_args)?;
+            let scope = commands::test::native_budget_check(gctx, subcommand_args)?;
+            if targo::resource_worker_v2()
+                && matches!(scope, commands::test::NativeBudgetCheck::ExistingBoundary)
+            {
+                return Err(anyhow::anyhow!(
+                    "native worker test execution requires its existing runner or argument boundary"
+                )
+                .into());
+            }
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         if targo::resource_worker_v2() {
@@ -363,6 +376,34 @@ fn run(gctx: &mut GlobalContext, argv: Vec<OsString>, purpose: RunPurpose) -> Cl
         exec.exec(gctx, subcommand_args)?;
     }
     Ok(())
+}
+
+/// Classify the canonical parser's operation and selection, never raw spelling
+/// or opaque harness words. This is a restriction, not a worker grant. Custom
+/// aliases, external/manifest commands and verified lanes retain their existing
+/// boundary before alias expansion or any command execution.
+#[derive(Clone, Copy)]
+enum NativeOperationPhase {
+    Discovery,
+    Execution,
+}
+
+fn native_operation_supported(args: &ArgMatches, phase: NativeOperationPhase) -> bool {
+    if !args.flag("unverified")
+        || args.flag("resource-worker-v3")
+        || args.flag("resource-subgroups-v3")
+        || (matches!(phase, NativeOperationPhase::Discovery) && args.flag("resource-worker-v2"))
+    {
+        return false;
+    }
+    match args.subcommand() {
+        Some(("build" | "check", _)) => true,
+        Some(("test", selected)) => {
+            !selected.flag("doc")
+                && (selected.flag("no-run") || selected.compile_filter().is_specific())
+        }
+        _ => false,
+    }
 }
 
 // Trust: marker rejection is a restriction. Only the typed actual owner above
@@ -1676,6 +1717,40 @@ mod append_transport_tests {
     }
 
     #[test]
+    fn native_lint_parent_and_child_policy_use_the_ordinary_cargo_parser() {
+        for verb in ["check", "fix"] {
+            for (parent, child, offline, locked) in [
+                ("--offline", "--offline", true, false),
+                ("--locked", "--locked", false, true),
+                ("--frozen", "--offline", true, true),
+                ("--frozen", "--locked", true, true),
+                ("--offline", "--locked", true, true),
+                ("--locked", "--offline", true, true),
+            ] {
+                let (_directory, mut gctx) = alias_context("");
+                let (args, append_args) = parse(&gctx, &["targo", parent, verb, child]);
+                configure_gctx(
+                    &mut gctx,
+                    &args,
+                    args.subcommand().map(|(_, args)| args),
+                    GlobalArgs {
+                        append_args,
+                        ..GlobalArgs::default()
+                    },
+                    None,
+                )
+                .unwrap();
+                if offline {
+                    assert!(!gctx.network_allowed(), "{parent} {verb} {child}");
+                }
+                if locked {
+                    assert!(!gctx.lock_update_allowed(), "{parent} {verb} {child}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scalar_global_propagation_is_unchanged() {
         let gctx = GlobalContext::default().unwrap();
         let (args, append) = parse(
@@ -2606,5 +2681,123 @@ invalid-option=['locate-project','--not-a-real-option']
             .try_get_matches_from(["cargo", "--resource-worker-v2", "build"])
             .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn native_operation_profile_uses_parsed_consent_selection_and_opaque_harness_data() {
+        let (_directory, gctx) = alias_context("[alias]\ncustom = 'build'\n");
+        for words in [
+            vec!["targo", "--unverified", "test", "--lib"],
+            vec![
+                "targo",
+                "--config",
+                "net.offline=true",
+                "--unverified",
+                "check",
+                "--all-targets",
+            ],
+            vec![
+                "targo",
+                "--unverified",
+                "--config",
+                "env.X='--resource-worker-v2'",
+                "build",
+            ],
+            vec![
+                "targo",
+                "--resource-worker-v2",
+                "--unverified",
+                "test",
+                "--lib",
+                "--",
+                "--skip",
+                "--resource-worker-v2",
+            ],
+            vec!["targo", "--unverified", "test", "--no-run"],
+            vec!["targo", "--unverified", "test", "--lib", "--", "--doc"],
+            vec![
+                "targo",
+                "--resource-worker-v2",
+                "--unverified",
+                "test",
+                "--lib",
+                "--",
+                "--skip",
+                "--resource-worker-v3",
+                "--skip",
+                "--resource-subgroups-v3",
+            ],
+        ] {
+            let parsed = cli_for_frontend(&gctx, true)
+                .try_get_matches_from(&words)
+                .unwrap();
+            assert!(
+                native_operation_supported(&parsed, NativeOperationPhase::Execution),
+                "{words:?}"
+            );
+        }
+        for words in [
+            vec!["targo", "--unverified", "test"],
+            vec!["targo", "--unverified", "test", "--doc", "--lib"],
+            vec!["targo", "--unverified", "test", "--", "--lib"],
+            vec!["targo", "trust", "test", "--lib"],
+            vec!["targo", "--unverified", "run"],
+            vec!["targo", "--unverified", "custom"],
+            vec![
+                "targo",
+                "--unverified",
+                "build",
+                "--resource-worker-v3",
+                "--resource-subgroups-v3",
+            ],
+            vec!["targo", "--config", "env.X='--unverified'", "build"],
+        ] {
+            let parsed = cli_for_frontend(&gctx, true)
+                .try_get_matches_from(&words)
+                .unwrap();
+            assert!(
+                !native_operation_supported(&parsed, NativeOperationPhase::Execution),
+                "{words:?}"
+            );
+        }
+
+        // A discovered operation must not already contain the private selector
+        // the bridge will prepend. Execution accepts its one parsed selector;
+        // identically spelled harness data remains opaque in both phases.
+        for (words, discovery) in [
+            (
+                vec!["targo", "--unverified", "--resource-worker-v2", "build"],
+                false,
+            ),
+            (
+                vec!["targo", "--resource-worker-v2", "--unverified", "build"],
+                false,
+            ),
+            (
+                vec![
+                    "targo",
+                    "--unverified",
+                    "test",
+                    "--lib",
+                    "--",
+                    "--skip",
+                    "--resource-worker-v2",
+                ],
+                true,
+            ),
+        ] {
+            let parsed = cli_for_frontend(&gctx, true)
+                .try_get_matches_from(&words)
+                .unwrap();
+            assert!(
+                native_operation_supported(&parsed, NativeOperationPhase::Execution),
+                "{words:?}"
+            );
+            assert_eq!(
+                native_operation_supported(&parsed, NativeOperationPhase::Discovery),
+                discovery,
+                "{words:?}"
+            );
+        }
     }
 }

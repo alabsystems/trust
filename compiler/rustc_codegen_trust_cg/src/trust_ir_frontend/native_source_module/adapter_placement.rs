@@ -6,9 +6,7 @@
 //! synthetic DefIndex, source coverage row or rustc FnAbi is manufactured.
 
 use trust_cg_bridge::call_event::{AbiExt, ParamPlace, ReturnPlace, ScalarPlace, Slot};
-use trust_ir::{
-    Block, BlockId, CallingConv, ClosureTyId, FuncTy, Function, InstrNode, Ty, ValueId,
-};
+use trust_ir::{CallingConv, ClosureTyId, FuncTy, Ty};
 
 use super::*;
 
@@ -68,7 +66,10 @@ fn source_item<'a>(
 /// The exact canonical function emitted by closure_adapter::build. Equality
 /// includes instructions, types, SSA IDs, producer, linkage, attrs and metadata;
 /// only the later publication gate is removed for this structural comparison.
-fn protocol(input: &NativeModuleInput<'_>, id: FuncId) -> Result<(ClosureTyId, FuncId), String> {
+fn protocol(
+    input: &NativeModuleInput<'_>,
+    id: FuncId,
+) -> Result<(ClosureTyId, FuncId, bool), String> {
     let module = input.producer;
     if !matches!(input.base, Some(base) if base == module)
         || input.source_ids.contains(&id)
@@ -80,87 +81,26 @@ fn protocol(input: &NativeModuleInput<'_>, id: FuncId) -> Result<(ClosureTyId, F
     if module.functions.iter().filter(|f| f.name == adapter.name).count() != 1 {
         return Err("adapter link symbol is ambiguous".into());
     }
-    let block = adapter.blocks.first().ok_or("adapter has no constructor block")?;
-    let Some(first) = block.body.first() else {
-        return Err("adapter constructor is missing".into());
-    };
-    let Inst::MakeClosure { ty: closure, func, .. } = first.inst else {
-        return Err("non-source body is not a typed closure adapter".into());
-    };
-    if func != id {
-        return Err("adapter constructor does not retain its own target".into());
-    }
-    let Some(second) = block.body.get(1) else {
-        return Err("adapter direct call is missing".into());
-    };
-    let Inst::Call { callee: target, .. } = second.inst else {
-        return Err("adapter does not directly call its source body".into());
-    };
-    let declaration =
-        module.closure_type(closure).ok_or("adapter nominal closure type is missing")?;
+    // One owner defines the full typed protocol. Native placement must not
+    // maintain a second constructor that drifts from source assembly.
+    let shape = trust_thir_lower::closure_adapter::inspect(
+        adapter,
+        &module.closure_types,
+        &module.func_types,
+    )
+    .ok_or("adapter differs from the canonical typed construction protocol")?;
+    let closure = shape.closure;
+    let target = shape.body;
+    let declaration = module.closure_type(closure).ok_or("adapter closure type is missing")?;
     let apparent =
         module.func_type(declaration.func).ok_or("adapter apparent signature is missing")?;
-    if apparent.is_vararg || apparent.abi.is_some() || apparent.returns.len() > 1 {
-        return Err("adapter apparent signature has no canonical construction protocol".into());
-    }
-    let signature = module.func_type(adapter.ty).ok_or("adapter physical signature is missing")?;
-    let params: Vec<_> = declaration.captures.iter().chain(&apparent.params).cloned().collect();
-    if signature
-        != &(FuncTy { params, returns: apparent.returns.clone(), is_vararg: false, abi: None })
-    {
-        return Err(
-            "adapter physical signature is not captures followed by apparent parameters".into()
-        );
-    }
-    let n =
-        u32::try_from(signature.params.len()).map_err(|_| "adapter argument count overflows")?;
-    let captures =
-        u32::try_from(declaration.captures.len()).map_err(|_| "adapter capture count overflows")?;
-    let result = n.checked_add(1).ok_or("adapter result ID overflows")?;
-    let mut expected_block = Block::new(BlockId::new(0));
-    for (i, ty) in signature.params.iter().enumerate() {
-        expected_block = expected_block.with_param(
-            ValueId::new(u32::try_from(i).map_err(|_| "adapter argument ID overflows")?),
-            ty.clone(),
-        );
-    }
-    expected_block.body.push(
-        InstrNode::new(Inst::MakeClosure {
-            ty: closure,
-            func: id,
-            captures: (0..captures).map(ValueId::new).collect(),
-        })
-        .with_result(ValueId::new(n)),
-    );
-    let mut args = vec![ValueId::new(n)];
-    args.extend((captures..n).map(ValueId::new));
-    let call = InstrNode::new(Inst::Call { callee: target, args });
-    let returns = if signature.returns.is_empty() {
-        expected_block.body.push(call);
-        Vec::new()
-    } else {
-        expected_block.body.push(call.with_result(ValueId::new(result)));
-        vec![ValueId::new(result)]
-    };
-    expected_block.body.push(InstrNode::new(Inst::Return { values: returns }));
-    let mut expected = Function::new(id, adapter.name.clone(), adapter.ty, BlockId::new(0))
-        .with_producer(Producer::TRust);
-    expected.calling_conv = CallingConv::Rust;
-    expected.linkage = Linkage::Internal;
-    expected.blocks = vec![expected_block];
-    let mut observed = adapter.clone();
-    observed.body_gate = None;
-    if observed != expected {
-        return Err(
-            "adapter body differs from the canonical typed construction/call/return protocol"
-                .into(),
-        );
-    }
     source_item(input, target)?;
     let body = module.function_by_id(target).ok_or("adapter source target disappeared")?;
     let source_sig = module.func_type(body.ty).ok_or("adapter source signature is missing")?;
     let logical: Vec<_> =
-        std::iter::once(Ty::Closure(closure)).chain(apparent.params.iter().cloned()).collect();
+        std::iter::once(if shape.borrowed_zero { Ty::Ptr } else { Ty::Closure(closure) })
+            .chain(apparent.params.iter().cloned())
+            .collect();
     if source_sig.params != logical
         || source_sig.returns != apparent.returns
         || source_sig.is_vararg
@@ -172,10 +112,18 @@ fn protocol(input: &NativeModuleInput<'_>, id: FuncId) -> Result<(ClosureTyId, F
         );
     }
     module.validate_closure_layouts().map_err(|e| format!("adapter observed frame: {e}"))?;
-    module
+    let frame = module
         .closure_layout_descriptor(closure)
         .map_err(|e| format!("adapter observed frame: {e}"))?
         .ok_or("adapter has no observed closure frame")?;
+    if shape.borrowed_zero
+        && (!declaration.captures.is_empty()
+            || frame.size != 0
+            || frame.align != 1
+            || !frame.capture_offsets.is_empty())
+    {
+        return Err("borrowed empty adapter lacks its actual zero capture frame".into());
+    }
     let owner = input.source_ids.iter().copied().any(|owner| {
         if source_item(input, owner).is_err() {
             return false;
@@ -192,7 +140,7 @@ fn protocol(input: &NativeModuleInput<'_>, id: FuncId) -> Result<(ClosureTyId, F
     if !owner {
         return Err("adapter has no independently conserved selected source constructor".into());
     }
-    Ok((closure, target))
+    Ok((closure, target, shape.borrowed_zero))
 }
 
 fn unsupported(place: &ParamPlace) -> bool {
@@ -212,7 +160,7 @@ pub(super) fn derive(
     input: &NativeModuleInput<'_>,
     id: FuncId,
 ) -> Result<Option<FnPlacement>, String> {
-    let (closure, target) = protocol(input, id)?;
+    let (closure, target, borrowed_zero) = protocol(input, id)?;
     let module = input.producer;
     let info = module.target_info.as_ref().ok_or("adapter ABI target is missing")?;
     if info.pointer_size != 8
@@ -237,6 +185,26 @@ pub(super) fn derive(
     let count = declaration.captures.len();
     if actual.params.len() != flat.params.len() + 1 - count {
         return Err("adapter source placement has the wrong logical parameter count".into());
+    }
+    if !borrowed_zero && count == 0 {
+        // The nominal, by-value empty environment is a logical source parameter,
+        // but the actual source ABI passes no bytes and consumes no register.
+        // Only that exact leading Ignore may disappear: all apparent arguments
+        // and the result must still match the independently selected source ABI.
+        let frame = module
+            .closure_layout_descriptor(closure)
+            .map_err(|e| format!("adapter frame: {e}"))?
+            .ok_or("adapter frame disappeared")?;
+        if frame.size != 0 || frame.align != 1 || !frame.capture_offsets.is_empty() {
+            return Err("owned empty adapter lacks its actual zero capture frame".into());
+        }
+        if actual.params[0] != ParamPlace::Ignore
+            || actual.params[1..] != flat.params
+            || actual.ret != flat.ret
+        {
+            return Err("owned empty adapter differs from the actual source ABI".into());
+        }
+        return Ok(Some(flat));
     }
     if matches!(actual.ret, ReturnPlace::Indirect)
         || actual.params.iter().any(unsupported)
@@ -267,6 +235,22 @@ pub(super) fn derive(
     size = size.div_ceil(align) * align;
     if frame.size != size || frame.align != align {
         return Err("adapter source frame differs from the native scalar carrier totals".into());
+    }
+    if borrowed_zero {
+        // The source's borrowed environment consumes a real pointer register;
+        // apparent arguments shift relative to the adapter's capture-free ABI.
+        // Compare the actual selected source ABI, never guess that shift from
+        // a closure label or silently accept stack/extension carriers.
+        let source = module.function_by_id(target).ok_or("source body disappeared")?;
+        let Some(expected_source) =
+            flat_placement(module.func_type(source.ty).ok_or("source signature disappeared")?)
+        else {
+            return Ok(None);
+        };
+        if actual.params != expected_source.params || actual.ret != expected_source.ret {
+            return Err("borrowed empty adapter differs from the actual source ABI".into());
+        }
+        return Ok(Some(flat));
     }
     match (&actual.params[0], declaration.captures.as_slice(), frame.capture_offsets.as_slice()) {
         (ParamPlace::Scalar(s), [ty], [0]) if size <= 8 => {

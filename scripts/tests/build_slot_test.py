@@ -179,6 +179,15 @@ gate.NCPU = gate.MEASURED_NCPU
 gate.load1 = lambda: 0.0
 gate.build_processes = lambda: []
 gate.QUIET_SECONDS = 0.0
+# The operator's real aterm ledger is a host probe too: these private pools
+# admit through the slot pool unless a test selects its own fixture aterm.
+if not os.environ.get("FIXTURE_LEDGER_DISCOVERY"):
+    gate.ledger_discovery = lambda env: None
+if os.environ.get("FIXTURE_LOAD1"):
+    gate.load1 = lambda: float(os.environ["FIXTURE_LOAD1"])
+for bound in ("LEDGER_PROBE_SECONDS", "LEDGER_ANSWER_GRACE"):
+    if os.environ.get("FIXTURE_" + bound):
+        setattr(gate, bound, float(os.environ["FIXTURE_" + bound]))
 gate.available_gib = lambda: float(os.environ.get("FIXTURE_AVAILABLE_GIB", "128"))
 if os.environ.get("FIXTURE_AVAILABLE_GIB_FILE"):
     def available_from_file():
@@ -2135,6 +2144,257 @@ class AdmissionLeaseTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.gate.DIR = self.temporary.name
 
+    def native_record(self, **changes):
+        required = {"worktree_bytes": None, "slots": 5, "needed": 1,
+                    "exclusive": False, "minimum_memory_bytes": 36 * 1024**3}
+        required.update(changes)
+        return {"native_admission_version": 1, "pid": os.getpid(), "requires": required}
+
+    def room(self, gib):
+        return self.gate.NativeMemoryObservation(round(gib * 1024**3))
+
+    def test_native_kernel_observer_prevents_a_legacy_memory_policy_convoy(self):
+        path, _ = self.held_ticket(self.native_record())
+        reply = subprocess.CompletedProcess([], 0, json.dumps({
+            "protocol": "native-resource-status-v1", "available_memory_bytes": 35 * 1024**3,
+        }).encode(), b"")
+        with mock.patch.object(self.gate.shutil, "which", side_effect=lambda name: "/selected/targo" if name == "targo" else None), \
+                mock.patch.object(self.gate, "bounded_native_query",
+                                  return_value=(reply.returncode, reply.stdout, reply.stderr)) as query:
+            available = self.gate.available_gib()
+        self.assertEqual(available.native_bytes, 35 * 1024**3)
+        self.assertEqual(query.call_args.args[0],
+                         ["/selected/targo", "--unverified", "resource", "status", "--json"])
+        self.assertEqual(query.call_args.kwargs["timeout"], 2)
+        self.assertEqual(query.call_args.kwargs["limit"], 65536)
+        self.assertFalse(self.gate.waiter_eligible(path, available))
+        with self.gate.AdmissionWaiter("younger32", slots=5, memory=32) as waiter:
+            acquired = waiter.attempt(lambda: self.gate.try_command_claim(None, 5, False, 1), available)
+            self.assertIsNotNone(acquired)
+            for _, fd in acquired:
+                os.close(fd)
+
+    def test_small_status_client_observes_memory_without_a_targo_dependency(self):
+        reply = json.dumps({"protocol": "native-resource-status-v1",
+                            "available_memory_bytes": 35 * 1024**3}).encode()
+        with mock.patch.object(self.gate.shutil, "which", return_value="/selected/trust-build-status") as which, \
+                mock.patch.object(self.gate, "bounded_native_query", return_value=(0, reply, b"")) as query:
+            available = self.gate.native_memory_observation()
+        which.assert_called_once_with("trust-build-status")
+        self.assertEqual(available.native_bytes, 35 * 1024**3)
+        self.assertEqual(query.call_args.args[0], ["/selected/trust-build-status", "--json"])
+        self.assertEqual(query.call_args.kwargs["timeout"], 2)
+        self.assertEqual(query.call_args.kwargs["limit"], 65536)
+
+    def test_failed_small_status_client_cannot_be_replaced_by_an_older_estimate(self):
+        for status, reply in [(1, b""), (0, b'{"protocol":"wrong"}'),
+                              (0, b'{"protocol":"native-resource-status-v1","available_memory_bytes":true}'),
+                              (0, b'{"protocol":"native-resource-status-v1","available_memory_bytes":null}')]:
+            with self.subTest(status=status, reply=reply), \
+                    mock.patch.object(self.gate.shutil, "which", return_value="/selected/trust-build-status") as which, \
+                    mock.patch.object(self.gate, "bounded_native_query", return_value=(status, reply, b"")) as query:
+                self.assertIsNone(self.gate.native_memory_observation())
+                which.assert_called_once_with("trust-build-status")
+                query.assert_called_once()
+
+    def test_legacy_memory_estimate_cannot_bypass_a_native_unknown_observation(self):
+        path, _ = self.held_ticket(self.native_record())
+        with mock.patch.object(self.gate, "try_shared_slots", side_effect=AssertionError("no claim")):
+            self.assertTrue(self.gate.waiter_eligible(path, 35))
+        with self.gate.AdmissionWaiter("borrower", slots=5) as waiter:
+            self.assertEqual(waiter.pending_reservation([(1, str(path))], 35), (5, []))
+
+    def test_unavailable_or_malformed_native_observer_grants_no_native_estimate(self):
+        samples = [None, True, -1, 2**64]
+        replies = [subprocess.CompletedProcess([], 0, json.dumps({
+            "protocol": "native-resource-status-v1", "available_memory_bytes": value,
+        }).encode(), b"") for value in samples]
+        replies.extend([subprocess.CompletedProcess([], 1, b"", b"unsupported"),
+                        subprocess.CompletedProcess([], 0, b'{"protocol":"unknown"}', b""),
+                        subprocess.CompletedProcess([], 0, b'{', b"")])
+        for reply in replies:
+            with self.subTest(reply=reply), \
+                    mock.patch.object(self.gate.shutil, "which", side_effect=lambda name: "/selected/targo" if name == "targo" else None), \
+                    mock.patch.object(self.gate, "bounded_native_query",
+                                      return_value=(reply.returncode, reply.stdout, reply.stderr)):
+                self.assertIsNone(self.gate.native_memory_observation())
+
+    def test_memory_observer_shim_cannot_leave_a_descendant_holding_borrowed_leases(self):
+        root = Path(self.temporary.name)
+        lock = root / "borrowed.lock"
+        original = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(original, fcntl.LOCK_EX)
+        release = root / "release-descendant"
+        ready = root / "descendant-holds-original"
+        self.addCleanup(release.touch)
+        program = root / "selected-targo"
+        descendant = ("from pathlib import Path\nimport os,time\n"
+                      f"root=Path({str(root)!r}); release=Path({str(release)!r})\n"
+                      f"Path({str(ready)!r}).write_text(str(os.fstat({original}).st_ino))\n"
+                      "while root.exists() and not release.exists():\n time.sleep(0.01)\n")
+        body = ("import json,subprocess,sys,time\nfrom pathlib import Path\n"
+                f"subprocess.Popen([sys.executable,'-c',{descendant!r}], pass_fds=({original},), "
+                "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                "deadline=time.monotonic()+1\n"
+                f"while not Path({str(ready)!r}).exists() and time.monotonic()<deadline: time.sleep(0.005)\n"
+                f"assert Path({str(ready)!r}).exists(), 'descendant must hold the original lease'\n"
+                "print(json.dumps({'protocol':'native-resource-status-v1',"
+                "'available_memory_bytes':35*1024**3}),flush=True)\n")
+        write_python_program(program, body)
+        try:
+            with mock.patch.object(self.gate.shutil, "which", side_effect=lambda name: str(program) if name == "targo" else None), \
+                    mock.patch.object(self.gate, "inherited_resource_fds", return_value=(original,)):
+                observed = self.gate.native_memory_observation()
+            self.assertIsNotNone(observed)
+            self.assertEqual(int(ready.read_text()), os.fstat(original).st_ino)
+        finally:
+            os.close(original)
+        probe = os.open(lock, os.O_RDWR)
+        self.addCleanup(os.close, probe)
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    self.fail("an observer descendant retained borrowed transport after parent exit")
+                time.sleep(0.005)
+
+    def held_ticket(self, record):
+        directory = Path(self.gate.DIR) / "admission"
+        launcher_directories(directory, mode=0o700)
+        path = directory / "wait-1"
+        held = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        os.write(held, json.dumps(record).encode())
+        return path, held
+
+    def test_native_memory_ineligible_ticket_leaves_a_younger_legacy_claim_room(self):
+        path, held = self.held_ticket(self.native_record())
+        original = path.read_bytes()
+        with self.gate.AdmissionWaiter("younger legacy", slots=5, memory=32) as waiter:
+            self.assertIsNone(waiter.attempt(lambda: True, self.room(36)))
+            acquired = waiter.attempt(lambda: self.gate.try_command_claim(None, 5, False, 1), self.room(35))
+            self.assertIsNotNone(acquired)
+            try:
+                slots = [(name, fd) for name, fd in acquired if Path(name).name.startswith("slot-")]
+                self.assertEqual(len(slots), 1)
+                self.assertTrue(stat.S_ISREG(os.fstat(slots[0][1]).st_mode))
+            finally:
+                for _, fd in acquired:
+                    os.close(fd)
+        self.assertEqual(path.read_bytes(), original)
+        with self.gate.AdmissionWaiter("later legacy", slots=5, memory=32) as waiter:
+            self.assertIsNone(waiter.attempt(lambda: True, self.room(36)))
+        self.assertEqual(path.read_bytes(), original)
+        self.assertGreater(os.fstat(held).st_nlink, 0)
+
+    def test_native_worktree_bytes_round_trip_and_busy_worktree_can_be_bypassed(self):
+        raw = os.fsencode(self.temporary.name) + b"/native-\xff.lock"
+        path, ticket = self.held_ticket(self.native_record(worktree_bytes=list(raw)))
+        self.assertEqual(os.fsencode(self.gate.read_admission_requirements(path)["worktree"]), raw)
+        # APFS refuses non-UTF8 filenames; byte-protocol roundtrip is separate
+        # from the real worktree lease exercised on this host's filesystem.
+        raw = os.fsencode(self.temporary.name) + b"/native.lock"
+        os.ftruncate(ticket, 0)
+        os.pwrite(ticket, json.dumps(self.native_record(worktree_bytes=list(raw))).encode(), 0)
+        original = path.read_bytes()
+        held = os.open(raw, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.assertFalse(self.gate.waiter_eligible(path, self.room(36)))
+        fcntl.flock(held, fcntl.LOCK_UN)
+        self.assertTrue(self.gate.waiter_eligible(path, self.room(36)))
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_native_exact_byte_memory_and_weighted_slot_requirements_survive(self):
+        path, _ = self.held_ticket(self.native_record(needed=2,
+                                                     minimum_memory_bytes=35 * 1024**3 + 1))
+        self.assertFalse(self.gate.waiter_eligible(path, self.room(35)))
+        self.assertEqual(self.gate.read_admission_requirements(path)["needed"], 2)
+        self.assertTrue(self.gate.waiter_eligible(path, self.room(35 + 1 / 1024**3)))
+
+    def test_original_protocols_allow_absent_optional_worktree_and_legacy_needed(self):
+        native = self.native_record()
+        del native["requires"]["worktree_bytes"]
+        legacy = {"requires": {"slots": 5, "memory": 36, "exclusive": False}}
+        for record in (native, legacy):
+            with self.subTest(record=record):
+                normalized = self.gate.admission_requirements(record)
+                self.assertIsNone(normalized["worktree"])
+                self.assertEqual(normalized["needed"], 1)
+                self.assertEqual(normalized["minimum_memory_bytes"], 36 * 1024**3)
+
+    def test_native_exclusive_priority_needs_memory_but_waits_for_slot_drain(self):
+        path, _ = self.held_ticket(self.native_record(exclusive=True))
+        self.assertFalse(self.gate.waiter_eligible(path, self.room(35), draining=True))
+        with mock.patch.object(self.gate, "try_shared_slots", side_effect=AssertionError("not shared")):
+            self.assertTrue(self.gate.waiter_eligible(path, self.room(36), draining=True))
+
+    def test_native_pending_reservation_keeps_actual_weighted_slot_leases(self):
+        path, _ = self.held_ticket(self.native_record(needed=2))
+        with self.gate.AdmissionWaiter("borrower", slots=5) as waiter:
+            reserved, protected = waiter.pending_reservation([(1, str(path))], self.room(36))
+            try:
+                self.assertEqual(reserved, 0)
+                self.assertEqual(len(protected), 2)
+                self.assertIsNone(self.gate.try_shared_slots(2, 1))
+            finally:
+                for _, fd, _ in protected:
+                    os.close(fd)
+            reserved, protected = waiter.pending_reservation([(1, str(path))], self.room(35))
+            self.assertEqual((reserved, protected), (0, []))
+
+    def test_unknown_or_malformed_native_records_remain_priority_barriers(self):
+        path, held = self.held_ticket(self.native_record())
+        records = []
+        for field, values in {
+            "minimum_memory_bytes": [None, -1, True, 1.5, 2**64],
+            "slots": [0, True, 65537], "needed": [0, True, 6],
+            "exclusive": [0, None],
+            "worktree_bytes": [[], [0], [47, 0], [47, -1], [47, 256], [47, True],
+                               list(b"relative"), list(b"/a/../b"), [47] * 32769],
+        }.items():
+            records.extend(self.native_record(**{field: value}) for value in values)
+        for version in (0, 2, True, "1"):
+            row = self.native_record(); row["native_admission_version"] = version; records.append(row)
+        for key in ("slots", "needed", "exclusive", "minimum_memory_bytes"):
+            row = self.native_record(); del row["requires"][key]; records.append(row)
+        row = self.native_record(); row["requires"]["memory"] = 0; records.append(row)
+        row = self.native_record(); row["legacy"] = True; records.append(row)
+        for record in records:
+            with self.subTest(record=record):
+                os.ftruncate(held, 0); os.pwrite(held, json.dumps(record).encode(), 0)
+                with mock.patch.object(self.gate, "try_shared_slots", side_effect=AssertionError("no claim")):
+                    self.assertTrue(self.gate.waiter_eligible(path, self.room(100)))
+        for raw in (b'{"native_admission_version":1,"native_admission_version":2}',
+                    b'{"requires":{"memory":0,"memory":36}}', b"[" * 1000,
+                    b" " * 65537,
+                    json.dumps(self.native_record()).encode("utf-16"),
+                    json.dumps(self.native_record()).encode("utf-32"),
+                    b'\xef\xbb\xbf' + json.dumps(self.native_record()).encode(),
+                    json.dumps(self.native_record()).replace(
+                        '"minimum_memory_bytes": 38654705664',
+                        '"minimum_memory_bytes": -0').encode()):
+            os.ftruncate(held, 0); os.pwrite(held, raw, 0)
+            self.assertTrue(self.gate.waiter_eligible(path, self.room(100)))
+
+    def test_queue_status_observes_native_requirements_without_editing_its_record(self):
+        path, _ = self.held_ticket(self.native_record(worktree_bytes=list(b"/native/worktree.lock")))
+        # A real registry exists before status takes its shared observation lease.
+        with self.gate.admission_registry():
+            pass
+        before = (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+        with mock.patch("builtins.print") as output:
+            self.gate.print_queued_status()
+        text = "\n".join(str(call.args[0]) for call in output.call_args_list)
+        self.assertIn("mem_gib=36.0", text)
+        self.assertIn('/native/worktree.lock', text)
+        self.assertIn("pool_slots=5", text)
+        self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns), before)
+
     def test_queue_lease_not_recorded_pid_proves_waiter_liveness(self):
         directory = Path(self.gate.DIR) / "admission"
         launcher_directories(directory, mode=0o700)
@@ -2872,6 +3132,7 @@ gate.NCPU = gate.MEASURED_NCPU or 4
 gate.available_gib = lambda: read("memory")
 gate.load1 = lambda: read("load")
 gate.build_processes = lambda: read("builds")
+gate.ledger_discovery = lambda env: None  # never the operator's real aterm ledger
 gate.QUIET_SECONDS = 0.12
 sleep = time.sleep
 gate.time.sleep = lambda seconds: sleep(min(seconds, 0.02))
@@ -3208,9 +3469,12 @@ pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=fixture_home)
 sys.argv = [script, *sys.argv[3:]]
 runpy.run_path(script, run_name='__main__')
 """
+        # Like the adoption registry, the account's aterm capacity ledger is
+        # host state: name no aterm, so the real CLI admits through this pool.
         proc = self.spawn([sys.executable, "-c", account, str(self.root), str(EXCLUSIVE_GATE),
                            "--exclusive", "--no-worktree-lock", "--wait-timeout", "0.15",
-                           "--", sys.executable, "-c", EXCLUSIVE_CHILD, str(marker)])
+                           "--", sys.executable, "-c", EXCLUSIVE_CHILD, str(marker)],
+                          dict(self.env, BUILD_SLOT_ATERM_CLI=str(self.root / "no-aterm")))
         self.assertEqual(proc.wait(timeout=15), 2)
         self.assertFalse(marker.exists())
         self.assertIn("admission wait timed out", self.output(proc))
@@ -3300,6 +3564,7 @@ runpy.run_path(script, run_name='__main__')
                     mock.patch.object(gate, "available_gib", return_value=16), \
                     mock.patch.object(gate, "load1", return_value=100), \
                     mock.patch.object(gate, "build_processes", return_value=[]), \
+                    mock.patch.object(gate, "ledger_discovery", return_value=None), \
                     mock.patch.object(gate.os, "open", side_effect=track_open), \
                     mock.patch.object(gate.os, "close", side_effect=track_close), \
                     mock.patch.object(gate.time, "monotonic", side_effect=[0, .1, .2, .3, .999999, 1.000001]), \
@@ -3311,6 +3576,698 @@ runpy.run_path(script, run_name='__main__')
             for fd in opened:
                 real_close(fd)
         self.assertFalse(any(self.held(i) for i in range(3)))
+
+
+# A fixture `aterm pkg claim` that keeps the verb's contract: it records what it
+# was asked, writes one admitted record to --status-fd, closes it and execs the
+# command with the grant, or exits 75 having started nothing. Per-request
+# behaviour comes from the requester's environment, never from build-slot's CLI.
+LEDGER_ATERM = r'''
+import fcntl, json, os, select, signal, sys, time
+from pathlib import Path
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+args = sys.argv[1:]
+trace = Path(os.environ["FIXTURE_LEDGER_TRACE"])
+def record(row):
+    with trace.open("a") as stream:
+        stream.write(json.dumps(row) + "\n")
+if args[:2] != ["pkg", "claim"]:
+    record({"unexpected": args}); raise SystemExit(79)
+if args[2:] == ["--capabilities"]:
+    record({"capabilities": True})
+    answer = os.environ.get("FIXTURE_LEDGER_ANSWER")
+    if answer == "older":
+        print("atpkg: unknown verb 'claim'", file=sys.stderr); raise SystemExit(2)
+    if answer == "broken":
+        print("atpkg: the capacity ledger could not be read", file=sys.stderr); raise SystemExit(1)
+    if answer == "slow":
+        time.sleep(30)
+    print("aterm-claim-exec-v1"); raise SystemExit(0)
+split = args.index("--")
+words, program = args[2:split], args[split + 1:]
+flags = {}
+index = 0
+while index < len(words):
+    if words[index] in ("--alone", "--no-wait"):
+        flags[words[index][2:]] = True; index += 1
+    else:
+        flags[words[index][2:]] = words[index + 1]; index += 2
+status = int(flags["status-fd"])
+record({"pid": os.getpid(), "flags": flags, "program": program,
+        "jobs": os.environ.get("CARGO_BUILD_JOBS"), "held": os.environ.get("BUILD_SLOT_HELD")})
+# The contract: a waiter whose status reader closed leaves the ledger at once.
+watch = select.poll()
+watch.register(status, select.POLLHUP | select.POLLERR)
+def leave(why):
+    record({"left": os.getpid(), "why": why}); raise SystemExit(75)
+lock = int(flags["flock-fd"]) if "flock-fd" in flags else None
+def worktree_taken():
+    # Taken in the look that admits, never held while waiting.
+    if lock is None:
+        return True
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+release = os.environ.get("FIXTURE_LEDGER_RELEASE")
+if release:
+    Path(release + ".waiting").touch()
+ends = (None if "wait-ms" not in flags or os.environ.get("FIXTURE_LEDGER_IGNORE_WAIT")
+        else time.monotonic() + int(flags["wait-ms"]) / 1000)
+hard = time.monotonic() + 60
+while True:
+    if watch.poll(0):
+        leave("status reader closed")
+    if os.environ.get("FIXTURE_LEDGER_REFUSE") or ("no-wait" in flags and os.environ.get("FIXTURE_LEDGER_FULL")):
+        leave("no room")
+    if (not release or Path(release).exists()) and worktree_taken():
+        break
+    if "no-wait" in flags:
+        leave("no room")
+    if ends is not None and time.monotonic() >= ends:
+        leave("wait-ms")
+    if time.monotonic() >= hard:
+        leave("fixture bound")
+    time.sleep(0.01)
+grant = int(os.environ.get("FIXTURE_LEDGER_GRANT", "3"))
+if not os.environ.get("FIXTURE_LEDGER_OVERGRANT"):
+    grant = min(grant, int(flags["cores"]))  # a ledger grants at most what was asked for
+marker = "1794952731202-%d-1" % os.getpid()
+memory = int(flags["mem-bytes"]) if "mem-bytes" in flags else 16 << 30  # by key: here the cold figure
+event = {"v": 1, "event": "admitted", "cores": grant, "mem_bytes": memory,
+         "rank": flags["rank"], "marker": marker}
+os.write(status, (json.dumps(event) + "\n").encode())
+os.close(status)
+environment = dict(os.environ, ATERM_CAPACITY_COVER=marker, CARGO_BUILD_JOBS=str(grant),
+                   TARGO_CALLER_JOBS=str(grant), TARGO_PLANNED_JOBS=str(grant))
+os.execve(program[0], program, environment)
+'''
+
+LEDGER_CHILD = r'''
+import json, os, sys
+from pathlib import Path
+marker = Path(sys.argv[1])
+pending = marker.with_suffix(".pending")
+pending.write_text(json.dumps({"pid": os.getpid(), **{key: os.environ.get(key) for key in (
+    "CARGO_BUILD_JOBS", "TARGO_CALLER_JOBS", "TARGO_PLANNED_JOBS", "ATERM_CAPACITY_COVER",
+    "BUILD_SLOT_HELD", "BUILD_SLOT_CPU_SOURCE", "BUILD_SLOT_CPU_PROTOCOL", "BUILD_SLOT_EXCLUSIVE")}}))
+pending.replace(marker)
+release = os.environ.get("FIXTURE_CHILD_RELEASE")
+if release:
+    import time
+    deadline = time.monotonic() + 30
+    while not Path(release).exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+raise SystemExit(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
+'''
+
+
+class LedgerAdmissionTests(unittest.TestCase):
+    """build-slot as one claim in a fixture aterm ledger: it holds no slot.
+
+    The private pool, loader and children are PrivateAdmissionTests'; the only
+    aterm is LEDGER_ATERM, selected through BUILD_SLOT_ATERM_CLI.
+    """
+
+    def setUp(self):
+        isolate_resource_environment(self)
+        self.temporary = tempfile.TemporaryDirectory(prefix="build-slot-ledger-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.pool = self.root / "pool"
+        self.trace = self.root / "ledger-trace.jsonl"
+        self.aterm = self.root / "tool bin" / "aterm"
+        self.aterm.parent.mkdir()
+        write_python_program(self.aterm, LEDGER_ATERM)
+        self.processes = []
+        self.serial = 0
+        self.addCleanup(self.close_processes)
+
+    def close_processes(self):
+        # Only this test's gates; each forwards TERM to its own fixture group.
+        for process in self.processes:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+
+    def environment(self, overrides=None, *, ledger=True):
+        environment = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith(("GIT_", "BUILD_SLOT", "BUILD_SLOTS", "FIXTURE_", "ATERM_"))
+            and key not in ("CARGO_BUILD_JOBS", "TARGO_PLANNED_JOBS", "TARGO_CALLER_JOBS")
+        }
+        environment.update(BUILD_SLOT_DIR=str(self.pool), FIXTURE_USER_HOME=str(self.root / "home"),
+                           FIXTURE_GATE_REEXEC=WRAPPER, FIXTURE_LEDGER_TRACE=str(self.trace))
+        if ledger:
+            environment.update(FIXTURE_LEDGER_DISCOVERY="1", BUILD_SLOT_ATERM_CLI=str(self.aterm))
+        environment.update(overrides or {})
+        return environment
+
+    def spawn(self, *options, env=None, ledger=True, code=0, pass_fds=()):
+        self.serial += 1
+        marker = self.root / f"child-{self.serial}.json"
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-B", "-c", WRAPPER, str(SCRIPT), *options, "--",
+             sys.executable, "-I", "-B", "-c", LEDGER_CHILD, str(marker), str(code)],
+            cwd=self.root, env=self.environment(env, ledger=ledger), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            pass_fds=pass_fds)
+        self.processes.append(process)
+        return process, marker
+
+    def run_gate(self, *options, env=None, ledger=True, code=0, pass_fds=()):
+        process, marker = self.spawn(*options, env=env, ledger=ledger, code=code, pass_fds=pass_fds)
+        stdout, stderr = process.communicate(timeout=30)
+        return process.returncode, stdout.decode(), stderr.decode(), marker
+
+    def rows(self):
+        if not self.trace.exists():
+            return []
+        rows = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertFalse([row for row in rows if "unexpected" in row], rows)
+        return rows
+
+    def claims(self):
+        return [row for row in self.rows() if "flags" in row]
+
+    def left(self, pid):
+        """Why the fixture verb `pid` left the ledger without admitting, if it did."""
+        return [row["why"] for row in self.rows() if row.get("left") == pid]
+
+    def wait_file(self, path, process=None, *alternatives):
+        """Until `path` (or an alternative) exists; the first that did."""
+        deadline = time.monotonic() + 15
+        while True:
+            for candidate in (path, *alternatives):
+                if candidate.exists():
+                    return candidate
+            if process is not None and process.poll() is not None:
+                self.fail(f"gate exited before {path.name}: {process.communicate()}")
+            self.assertLess(time.monotonic(), deadline, f"{path.name} did not appear")
+            time.sleep(0.01)
+
+    def held_slots(self):
+        held = []
+        for path in sorted(self.pool.glob("slot-*")) if self.pool.exists() else []:
+            fd = os.open(path, os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    held.append(path.name)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        return held
+
+    def lock_is_free(self, path):
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(descriptor)
+        return True
+
+    def test_ledger_wait_holds_no_slot_and_a_peer_runs(self):
+        # The incident: one request waits in the ledger (here, on the fixture's
+        # release file). It must hold no build-slot capacity while it waits, so
+        # a peer whose claim the ledger admits runs at once beside it. (The slot
+        # pool instead lends the first every free slot and runs its command.)
+        release, child_release = self.root / "first.release", self.root / "first-child.release"
+        first, first_marker = self.spawn(env={"FIXTURE_LEDGER_RELEASE": str(release),
+                                              "FIXTURE_CHILD_RELEASE": str(child_release)})
+        self.wait_file(Path(str(release) + ".waiting"), first, first_marker)
+        code, _, stderr, marker = self.run_gate("--wait-timeout", "5")
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(marker.exists())
+        self.assertEqual(self.held_slots(), [])
+        self.assertFalse(first_marker.exists(), "the waiting request started nothing")
+        release.touch()
+        child_release.touch()
+        _, stderr = first.communicate(timeout=30)
+        self.assertEqual(first.returncode, 0, stderr)
+        self.assertTrue(first_marker.exists())
+        self.assertEqual(self.held_slots(), [])
+
+    def test_child_runs_under_cover_marker_and_ledger_grant(self):
+        child_release = self.root / "child.release"
+        process, marker = self.spawn(env={"FIXTURE_CHILD_RELEASE": str(child_release),
+                                          "CARGO_BUILD_JOBS": "5"})
+        self.wait_file(marker, process)
+        seen = json.loads(marker.read_text())
+        # The ledger's grant, not the caller's 5 or a borrowed slot share.
+        self.assertEqual((seen["CARGO_BUILD_JOBS"], seen["TARGO_CALLER_JOBS"], seen["TARGO_PLANNED_JOBS"]),
+                         ("3", "3", "3"))
+        self.assertRegex(seen["ATERM_CAPACITY_COVER"] or "", r"^1794952731202-\d+-1$")
+        self.assertEqual((seen["BUILD_SLOT_HELD"], seen["BUILD_SLOT_CPU_SOURCE"], seen["BUILD_SLOT_CPU_PROTOCOL"]),
+                         ("1", "ledger-grant", "1"))
+        self.assertEqual(self.held_slots(), [], "no slot flock is held while the command runs")
+        claim, = self.claims()
+        # One pid all the way down: the verb execs the command in its own PID.
+        self.assertEqual(seen["pid"], claim["pid"])
+        self.assertEqual(claim["flags"]["cores"], "5", "the caller's cap bounds what is asked for")
+        # No --mem-gb and no BUILD_SLOT_MEM_GB: the ledger sizes memory by the key's
+        # measured peak, never by the pool's 8 GiB admission floor.
+        self.assertNotIn("mem-bytes", claim["flags"])
+        self.assertEqual(claim["flags"]["rank"], "ordinary")
+        self.assertRegex(claim["flags"]["key"], r"^build-slot:python[0-9.]*:[0-9a-f]{16}$")
+        self.assertNotIn("wait-ms", claim["flags"])
+        self.assertNotIn("no-wait", claim["flags"])
+        self.assertNotIn("alone", claim["flags"])
+        self.assertEqual(claim["program"], [sys.executable, "-I", "-B", "-c", LEDGER_CHILD, str(marker), "0"])
+        child_release.touch()
+        _, stderr = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 0, stderr)
+
+    def test_an_uncapped_claim_asks_one_share_and_wide_asks_the_host(self):
+        # Review finding 2: the ledger grants up to what is free and holds the
+        # grant for the whole run, so an uncapped test or push asking for the
+        # host would block every session's targo. The fixture host has 28 CPUs
+        # and a default pool of 4 slots: one share is 7.
+        for options, cores in (((), "7"), (("--wide",), "28"), (("--cpus", "2"), "2"),
+                               (("--slots", "2"), "14")):
+            with self.subTest(options=options):
+                self.trace.unlink(missing_ok=True)
+                code, _, stderr, marker = self.run_gate(*options)
+                self.assertEqual(code, 0, stderr)
+                self.assertTrue(marker.exists())
+                claim, = self.claims()
+                self.assertEqual(claim["flags"]["cores"], cores)
+        for options in (("--wide", "--cpus", "2"), ("--wide", "--exclusive")):
+            with self.subTest(options=options):
+                self.trace.unlink(missing_ok=True)
+                code, _, stderr, marker = self.run_gate(*options)
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("--wide asks for the host's cores itself", stderr)
+                self.assertFalse(marker.exists())
+                self.assertEqual(self.claims(), [])
+
+    def test_the_default_key_names_the_program_and_checkout_not_its_arguments(self):
+        # Review finding 7: a key per argv never gathers a measured peak.
+        for code in (0, 3):
+            returned, _, stderr, _marker = self.run_gate(code=code)
+            self.assertEqual(returned, code, stderr)
+        first, second = self.claims()
+        self.assertNotEqual(first["program"], second["program"])
+        self.assertEqual(first["flags"]["key"], second["flags"]["key"])
+
+    def test_release_rank_and_key_reach_the_claim(self):
+        code, _, stderr, marker = self.run_gate("--rank", "release", "--claim-key",
+                                                "trust-train:locked-dependency-prewarm",
+                                                "--cpus", "1", "--mem-gb", "0")
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(marker.exists())
+        claim, = self.claims()
+        self.assertEqual((claim["flags"]["rank"], claim["flags"]["key"]),
+                         ("release", "trust-train:locked-dependency-prewarm"))
+        # A fetch-only step claims one core and no memory, so no ALONE claim stops it.
+        self.assertEqual((claim["flags"]["cores"], claim["flags"]["mem-bytes"]), ("1", "0"))
+
+    def test_ledger_wait_timeout_starts_nothing(self):
+        code, _, stderr, marker = self.run_gate("--wait-timeout", "2.5",
+                                                env={"FIXTURE_LEDGER_REFUSE": "1"})
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("no command was started", stderr)
+        self.assertFalse(marker.exists())
+        claim, = self.claims()
+        self.assertGreater(int(claim["flags"]["wait-ms"]), 0)
+        self.assertLessEqual(int(claim["flags"]["wait-ms"]), 2500)
+        self.assertEqual(self.held_slots(), [])
+
+    def test_a_verb_that_never_answers_is_stopped_at_the_wait_bound(self):
+        # Review finding 8: --wait-timeout must not depend on the verb honouring
+        # --wait-ms. Past the bound and its grace, build-slot stops the verb.
+        code, _, stderr, marker = self.run_gate(
+            "--wait-timeout", "0.5",
+            env={"FIXTURE_LEDGER_RELEASE": str(self.root / "never.release"),
+                 "FIXTURE_LEDGER_IGNORE_WAIT": "1", "FIXTURE_LEDGER_ANSWER_GRACE": "0.3"})
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("admission wait timed out; no command was started", stderr)
+        self.assertFalse(marker.exists())
+        claim, = self.claims()
+        with self.assertRaises(ProcessLookupError):
+            os.kill(claim["pid"], 0)  # stopped and reaped, not left waiting in the ledger
+
+    def test_a_killed_build_slot_leaves_no_waiter_in_the_ledger(self):
+        # Review finding 8: the verb runs in its own session, so a SIGKILLed
+        # build-slot cannot stop it; the closed status reader must.
+        release = self.root / "orphan.release"
+        process, marker = self.spawn(env={"FIXTURE_LEDGER_RELEASE": str(release)})
+        self.wait_file(Path(str(release) + ".waiting"), process, marker)
+        claim, = self.claims()
+        process.kill()  # this test's own gate, not its verb's group
+        process.communicate(timeout=10)
+        deadline = time.monotonic() + 15
+        while not self.left(claim["pid"]):
+            self.assertLess(time.monotonic(), deadline, "the orphaned claim kept waiting")
+            time.sleep(0.01)
+        self.assertEqual(self.left(claim["pid"]), ["status reader closed"])
+        release.touch()
+        time.sleep(0.2)
+        self.assertFalse(marker.exists(), "an orphaned claim starts nothing")
+
+    def test_exclusive_is_one_alone_claim_then_build_slots_own_quiet_wait(self):
+        # An older copy's job holds a slot. build-slot drains nothing itself: the
+        # ledger's ALONE claim (which counts held pool slots) decides, and under
+        # it build-slot's own quiet-machine wait runs before the command.
+        launcher_directories(self.pool)
+        holder = os.open(self.pool / "slot-0", os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        code, _, stderr, marker = self.run_gate("--exclusive", "--wait-timeout", "3")
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("draining", stderr)
+        self.assertIn("build-slot: quiet for 0s", stderr)
+        seen = json.loads(marker.read_text())
+        self.assertEqual(seen["BUILD_SLOT_EXCLUSIVE"], "1")
+        claim, = self.claims()
+        self.assertTrue(claim["flags"].get("alone"), claim)
+        self.assertNotIn("quiet", claim["flags"])
+        self.assertEqual(claim["flags"]["cores"], "28", "an exclusive claim asks for the host")
+        self.assertIn("--_ledger-quiet", claim["program"])
+        self.assertEqual(seen["pid"], claim["pid"], "the quiet wait execs the command in the claim's PID")
+        self.assertEqual(self.held_slots(), ["slot-0"], "only the older copy's own slot")
+
+    def test_exclusive_keeps_the_pools_quiet_threshold_under_its_claim(self):
+        # Review finding 6: aterm's own quiet level is 2.0 per core; build-slot's
+        # benchmark guard is load1 <= 0.35 * CPUs. A loaded host times the wait
+        # out under the claim and the command never starts.
+        code, _, stderr, marker = self.run_gate("--exclusive", "--wait-timeout", "1",
+                                                env={"FIXTURE_LOAD1": "50"})
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("waiting: load1 50 unavailable or above 0.35 * 28 CPUs", stderr)
+        self.assertIn("admission wait timed out; no command was started", stderr)
+        self.assertFalse(marker.exists())
+        claim, = self.claims()
+        self.assertTrue(claim["flags"].get("alone"), claim)
+
+    def test_execution_start_follows_ledger_admission(self):
+        for options in ((), ("--exclusive",)):
+            with self.subTest(options=options):
+                self.trace.unlink(missing_ok=True)
+                release = self.root / f"admit{len(options)}.release"
+                reader, writer = os.pipe()
+                self.addCleanup(os.close, reader)
+                os.set_blocking(writer, False)
+                try:
+                    process, marker = self.spawn(*options, "--execution-start-fd", str(writer),
+                                                 env={"FIXTURE_LEDGER_RELEASE": str(release),
+                                                      "FIXTURE_CHILD_RELEASE": str(release)},
+                                                 pass_fds=(writer,))
+                finally:
+                    os.close(writer)
+                self.wait_file(Path(str(release) + ".waiting"), process, marker)
+                # The verb is waiting: nothing has started, so no start is reported.
+                self.assertEqual(select.select([reader], [], [], 0.3)[0], [])
+                before_us = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+                release.touch()
+                self.assertTrue(select.select([reader], [], [], 15)[0])
+                message = os.read(reader, 18)
+                _, stderr = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(len(message), 17)
+                claim, = self.claims()
+                self.assertEqual(message[:9], b"S" + claim["pid"].to_bytes(8, "big"))
+                self.assertEqual(json.loads(marker.read_text())["pid"], claim["pid"])
+                self.assertGreaterEqual(int.from_bytes(message[9:], "big"), before_us)
+
+    def test_memory_attempt_uses_one_ledger_look_at_its_arrival(self):
+        # Clean's heavy_gate holds memory and runs one attempt; a full ledger
+        # answers that one look with 75, so heavy_gate releases and retries. The
+        # look carries the coordinator's arrival, so retries keep their place.
+        for full, expected_code, expected_reply in ((True, 75, b"W"), (False, 0, b"WR")):
+            with self.subTest(full=full):
+                self.trace.unlink(missing_ok=True)
+                reader, writer = os.pipe()
+                try:
+                    code, _, stderr, marker = self.run_gate(
+                        "--_memory-attempt", str(writer), "1", "--_memory-since-ms", "1794952731000",
+                        env={"HEAVY_GATE_HELD": "1:fixture", **({"FIXTURE_LEDGER_FULL": "1"} if full else {})},
+                        pass_fds=(writer,))
+                finally:
+                    os.close(writer)
+                try:
+                    reply = os.read(reader, 3)
+                finally:
+                    os.close(reader)
+                self.assertEqual((code, reply), (expected_code, expected_reply), stderr)
+                self.assertEqual(marker.exists(), not full)
+                claim, = self.claims()
+                self.assertTrue(claim["flags"].get("no-wait"), claim)
+                self.assertEqual(claim["flags"]["since-ms"], "1794952731000")
+                self.assertEqual(self.held_slots(), [])
+
+    def test_an_invalid_admission_record_stops_the_command(self):
+        # A grant above what was asked for breaks the verb's contract: the
+        # command it already exec'd is stopped and nothing is reported as run.
+        code, _, stderr, _marker = self.run_gate(
+            "--cpus", "2", env={"FIXTURE_LEDGER_GRANT": "9", "FIXTURE_LEDGER_OVERGRANT": "1",
+                                "FIXTURE_CHILD_RELEASE": str(self.root / "never.release")})
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("invalid admission record (grant 9 is not 1 to the 2 cores asked for)", stderr)
+        self.assertIn("its command was stopped", stderr)
+
+    def test_an_interrupted_ledger_wait_starts_nothing(self):
+        release = self.root / "interrupt.release"
+        process, marker = self.spawn(env={"FIXTURE_LEDGER_RELEASE": str(release),
+                                          "FIXTURE_CHILD_RELEASE": str(release)})
+        self.wait_file(Path(str(release) + ".waiting"), process, marker)
+        process.terminate()  # this test's own gate; it forwards TERM to its verb
+        _, stderr = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
+        release.touch()
+        self.assertFalse(marker.exists(), "an interrupted claim starts nothing")
+
+    def test_the_worktree_lock_comes_with_admission_and_stays_with_the_command(self):
+        # Review finding 9: a claim waiting in the ledger holds no worktree lock.
+        # The verb takes it in the look that admits, and the command keeps it.
+        lock = self.root / "worktree.lock"
+        release, child_release = self.root / "worktree.release", self.root / "worktree-child.release"
+        first, first_marker = self.spawn(env={"FIXTURE_WORKTREE_LOCK": str(lock),
+                                              "FIXTURE_LEDGER_RELEASE": str(release),
+                                              "FIXTURE_CHILD_RELEASE": str(child_release)})
+        self.wait_file(Path(str(release) + ".waiting"), first, first_marker)
+        self.assertTrue(self.lock_is_free(lock), "a waiting claim held the worktree")
+        release.touch()
+        self.wait_file(first_marker, first)
+        self.assertFalse(self.lock_is_free(lock), "the admitted command does not hold its worktree")
+        deadline = time.monotonic() + 15
+        while not lock.read_text():  # build-slot stamps the holder once it reads the record
+            self.assertLess(time.monotonic(), deadline, "the worktree holder was never stamped")
+            time.sleep(0.01)
+        self.assertEqual(json.loads(lock.read_text())["pid"], json.loads(first_marker.read_text())["pid"])
+        code, _, stderr, second_marker = self.run_gate(
+            "--wait-timeout", "1", env={"FIXTURE_WORKTREE_LOCK": str(lock)})
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("another build-slot job runs in this worktree", stderr)
+        self.assertIn("no command was started", stderr)
+        self.assertFalse(second_marker.exists())
+        second, = [claim for claim in self.claims() if str(second_marker) in claim["program"]]
+        self.assertIn("flock-fd", second["flags"])
+        self.assertEqual(self.left(second["pid"]), ["wait-ms"])
+        first.kill()  # the supervisor dies; its command keeps the worktree lock
+        first.wait(timeout=10)
+        self.assertFalse(self.lock_is_free(lock))
+        child_release.touch()
+        deadline = time.monotonic() + 15
+        while not self.lock_is_free(lock):
+            self.assertLess(time.monotonic(), deadline, "the command never released its worktree")
+            time.sleep(0.01)
+
+    def test_a_busy_worktree_retries_a_memory_attempt_without_asking_aterm(self):
+        lock = self.root / "busy.lock"
+        holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        reader, writer = os.pipe()
+        try:
+            code, _, stderr, marker = self.run_gate(
+                "--_memory-attempt", str(writer), "1",
+                env={"HEAVY_GATE_HELD": "1:fixture", "FIXTURE_WORKTREE_LOCK": str(lock)},
+                pass_fds=(writer,))
+        finally:
+            os.close(writer)
+        try:
+            reply = os.read(reader, 3)
+        finally:
+            os.close(reader)
+        self.assertEqual((code, reply), (75, b"W"), stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.claims(), [])
+
+    def test_a_nested_cpus_request_narrows_to_a_small_ledger_grant(self):
+        # Review finding 3: under the pool an uncapped parent held at least one
+        # share (7 here), so callers' nested --cpus fit; a ledger grant can be 2.
+        grant = {"BUILD_SLOT_HELD": "1", "CARGO_BUILD_JOBS": "2", "TARGO_PLANNED_JOBS": "2",
+                 "TARGO_CALLER_JOBS": "2"}
+        code, _, stderr, marker = self.run_gate("--cpus", "4", env={**grant, "BUILD_SLOT_CPU_SOURCE": "ledger-grant"})
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("--cpus 4 narrowed to the parent's ledger grant of 2", stderr)
+        self.assertEqual(json.loads(marker.read_text())["CARGO_BUILD_JOBS"], "2")
+        self.assertFalse(self.trace.exists(), "a nested command never consults aterm")
+        # A pool parent's budget still refuses enlargement, as before.
+        code, _, stderr, marker = self.run_gate("--cpus", "4",
+                                                env={**grant, "BUILD_SLOT_CPU_SOURCE": "caller-or-fixed-share"})
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("a nested command cannot enlarge its parent's CPU budget", stderr)
+        self.assertFalse(marker.exists())
+
+    def test_capabilities_names_the_claim_words_before_reading_anything(self):
+        # The train asks this before passing --rank/--claim-key/--wide; an older
+        # copy refuses it as an unknown option and starts nothing.
+        result = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "--capabilities"],
+                                cwd=self.root, env=self.environment(ledger=False), stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=30)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"build-slot-claim-v1\n", b""))
+        self.assertFalse(self.pool.exists())
+        self.assertFalse(self.trace.exists())
+
+    def test_status_names_the_admission_authority(self):
+        for answer, line in ((None, "admission: fresh commands claim in aterm's capacity ledger; "
+                                    "`aterm pkg capacity` shows them"),
+                             ("older", "admission: fresh commands take this pool (aterm capacity ledger "
+                                       "unavailable: `aterm pkg claim --capabilities` exited 2"),
+                             ("broken", "admission: unknown, so fresh commands are refused")):
+            with self.subTest(answer=answer):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", "-c", WRAPPER, str(SCRIPT), "status"], cwd=self.root,
+                    env=self.environment({"FIXTURE_LEDGER_ANSWER": answer} if answer else None),
+                    capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(line, result.stdout)
+
+    def test_missing_capability_is_named_once_and_the_pool_admits(self):
+        for name, environment, reason in (
+                ("older", {"FIXTURE_LEDGER_ANSWER": "older"}, "this aterm lacks aterm-claim-exec-v1"),
+                ("absent", {"BUILD_SLOT_ATERM_CLI": str(self.root / "no-aterm")},
+                 "BUILD_SLOT_ATERM_CLI names no file: no aterm")):
+            with self.subTest(name=name):
+                code, _, stderr, marker = self.run_gate(env=environment)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(stderr.count("aterm capacity ledger unavailable"), 1, stderr)
+                self.assertIn(reason, stderr)
+                self.assertEqual(json.loads(marker.read_text())["BUILD_SLOT_CPU_SOURCE"], "available-slots")
+
+    def test_an_unknown_authority_refuses_instead_of_taking_the_pool(self):
+        # Review finding 4: only an absent aterm or an unknown verb (exit 2)
+        # selects the pool. A slow, failing or odd answer must not move this
+        # call to the pool while the next one claims in the ledger.
+        not_executable = self.root / "plain-file"
+        not_executable.write_text("")
+        for name, environment, reason in (
+                ("broken", {"FIXTURE_LEDGER_ANSWER": "broken"}, "exited 1"),
+                ("slow", {"FIXTURE_LEDGER_ANSWER": "slow", "FIXTURE_LEDGER_PROBE_SECONDS": "0.5"}, "timed out"),
+                ("not executable", {"BUILD_SLOT_ATERM_CLI": str(not_executable)}, "not an executable file"),
+                ("relative", {"BUILD_SLOT_ATERM_CLI": "aterm"}, "not an absolute path")):
+            with self.subTest(name=name):
+                self.trace.unlink(missing_ok=True)
+                code, _, stderr, marker = self.run_gate(env=environment)
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("which authority admits here is unknown", stderr)
+                self.assertIn(reason, stderr)
+                self.assertIn("no command was started", stderr)
+                self.assertFalse(marker.exists())
+                self.assertEqual(self.held_slots(), [])
+                self.assertEqual(self.claims(), [])
+
+    def test_adopt_refuses_where_the_ledger_admits(self):
+        # Review finding 4: an adopted slot is a pool record the ledger cannot see.
+        job = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=self.root)
+        self.addCleanup(job.wait)
+        self.addCleanup(job.kill)
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", WRAPPER, str(SCRIPT), "adopt", str(job.pid)],
+                                cwd=self.root, env=self.environment(), capture_output=True, text=True,
+                                timeout=60)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("adopt records a slot in the build-slot pool", result.stderr)
+        adopted = self.root / "home" / ".cache" / "build-slot" / "adopted"
+        self.assertEqual(sorted(adopted.iterdir()) if adopted.exists() else [], [])
+        self.assertEqual(self.held_slots(), [])
+
+    # Preservation guards: these hold on the slot pool before and after the ledger.
+
+    def test_absent_or_older_aterm_keeps_the_slot_pool(self):
+        for name, environment in (("older", {"FIXTURE_LEDGER_ANSWER": "older"}),
+                                  ("absent", {"BUILD_SLOT_ATERM_CLI": str(self.root / "no-aterm")})):
+            with self.subTest(name=name):
+                self.trace.unlink(missing_ok=True)
+                child_release = self.root / f"{name}.release"
+                process, marker = self.spawn(env={**environment, "FIXTURE_CHILD_RELEASE": str(child_release)})
+                self.wait_file(marker, process)
+                seen = json.loads(marker.read_text())
+                self.assertIsNone(seen["ATERM_CAPACITY_COVER"])
+                self.assertEqual(seen["BUILD_SLOT_HELD"], "1")
+                # The uncapped job borrows the free slots of the default pool.
+                self.assertEqual(seen["CARGO_BUILD_JOBS"], "28")
+                self.assertTrue(self.held_slots(), "the slot pool admitted it")
+                child_release.touch()
+                _, stderr = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(self.claims(), [], "the fixture ledger was never asked to claim")
+
+    def test_wide_changes_nothing_on_the_slot_pool(self):
+        code, _, stderr, marker = self.run_gate("--wide", env={"FIXTURE_LEDGER_ANSWER": "older"})
+        self.assertEqual(code, 0, stderr)
+        seen = json.loads(marker.read_text())
+        self.assertEqual((seen["CARGO_BUILD_JOBS"], seen["BUILD_SLOT_CPU_SOURCE"]), ("28", "available-slots"))
+
+    def test_nested_admission_never_queries_aterm(self):
+        code, _, stderr, marker = self.run_gate(env={"BUILD_SLOT_HELD": "1", "CARGO_BUILD_JOBS": "4"})
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(marker.read_text())["CARGO_BUILD_JOBS"], "4")
+        self.assertFalse(self.trace.exists(), "a nested command never consults aterm")
+        self.assertFalse(self.pool.exists())
+
+
+class RealLedgerVerbTests(unittest.TestCase):
+    """build-slot against this host's real `aterm pkg claim`, once aterm ships it.
+
+    Until the verb exists (an aterm without it answers exit 2) this skips, and
+    no test reaches the operator's ledger. Once it exists this is the
+    integration check of the contract the fixture above stands in for.
+    """
+
+    def test_the_real_verb_admits_one_core_and_no_memory(self):
+        aterm = shutil.which("aterm")
+        if aterm is None:
+            self.skipTest("no aterm on PATH")
+        try:
+            probe = subprocess.run([aterm, "pkg", "claim", "--capabilities"], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.skipTest("aterm did not answer the capability probe within 60 s")
+        if probe.returncode != 0 or probe.stdout != b"aterm-claim-exec-v1\n":
+            self.skipTest(f"this aterm has no aterm-claim-exec-v1 (exit {probe.returncode})")
+        isolate_resource_environment(self)
+        with tempfile.TemporaryDirectory(prefix="build-slot-real-ledger-") as temporary:
+            marker = Path(temporary) / "child.json"
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith(("BUILD_SLOT", "BUILD_SLOTS", "ATERM_CAPACITY_COVER"))
+                           and key not in ("CARGO_BUILD_JOBS", "TARGO_PLANNED_JOBS", "TARGO_CALLER_JOBS")}
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", str(SCRIPT), "--cpus", "1", "--mem-gb", "0", "--no-worktree-lock",
+                 "--claim-key", "build-slot:integration-test", "--wait-timeout", "120", "--",
+                 sys.executable, "-I", "-B", "-c", LEDGER_CHILD, str(marker)],
+                cwd=temporary, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=300)
+            if result.returncode == 2 and "admission wait timed out" in result.stderr:
+                self.skipTest("the real ledger had no core free for 120 s")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertRegex(result.stderr, r"build-slot: aterm (admitted|covered) the command with 1 cores")
+            seen = json.loads(marker.read_text())
+            self.assertEqual((seen["CARGO_BUILD_JOBS"], seen["TARGO_CALLER_JOBS"], seen["TARGO_PLANNED_JOBS"]),
+                             ("1", "1", "1"))
+            self.assertTrue(seen["ATERM_CAPACITY_COVER"])
+            self.assertEqual(seen["BUILD_SLOT_CPU_SOURCE"], "ledger-grant")
+
 
 if __name__ == "__main__":
     unittest.main()

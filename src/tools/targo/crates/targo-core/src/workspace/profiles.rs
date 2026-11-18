@@ -43,6 +43,17 @@ use std::hash::Hash;
 use std::ops::RangeInclusive;
 use std::{cmp, fmt, hash};
 
+/// Trust: DC-12e. Whether the requested profile compiles a workspace member's
+/// unit incrementally (`Profiles::requested_incremental`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestedIncremental {
+    /// Whether it does, with every setting applied.
+    pub compiles: bool,
+    /// Whether the profile's hard-coded root (`dev` or `release`) does, with
+    /// no setting applied.
+    pub by_default: bool,
+}
+
 /// Collection of all profiles.
 ///
 /// To get a specific [`Profile`], you usually create this and call [`get_profile`] then.
@@ -424,6 +435,25 @@ impl Profiles {
         maker.get_profile(
             None, /*is_member*/ true, /*is_for_host*/ false, None,
         )
+    }
+
+    /// Trust: DC-12e. Whether the requested profile compiles a workspace
+    /// member's unit incrementally, as `get_profile` resolves it for one no
+    /// `package` override names: the global override (`CARGO_INCREMENTAL`,
+    /// `build.incremental`, or off in CI) where there is one, else the
+    /// profile's own `incremental`, from the manifest, the config and the
+    /// profiles it inherits. Beside it, what the profile's hard-coded root
+    /// (`dev` or `release`) says with none of those.
+    pub fn requested_incremental(&self) -> RequestedIncremental {
+        let profile_name = self.definitions.requested_profile;
+        let maker = self.definitions.get_profile_maker(&profile_name).unwrap();
+        let own = maker.get_profile(
+            None, /*is_member*/ true, /*is_for_host*/ false, None,
+        );
+        RequestedIncremental {
+            compiles: self.incremental.unwrap_or(own.incremental),
+            by_default: maker.default.incremental,
+        }
     }
 
     /// Gets the directory name for a profile, like `debug` or `release`.

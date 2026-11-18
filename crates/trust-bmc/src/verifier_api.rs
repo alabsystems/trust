@@ -1156,6 +1156,15 @@ impl FreshExactDirectChcPdrReceipt {
                     .to_string(),
             );
         }
+        // A row's digest and reconstructed CHC do not include every sibling
+        // declaration. The standalone entry must reconcile the current whole
+        // question; the batch entry below retains its once-checked opaque seal.
+        if !self.bundle_seal.matches_bundle(bundle) {
+            return Err(
+                "fresh exact-direct receipt bundle binding differs from its exact sealed snapshot"
+                    .to_string(),
+            );
+        }
         if !fresh_exact_direct_completion_is_timely(self.dispatch_deadline, self.completed_at) {
             return Err(
                 "fresh exact-direct receipt completed after its dispatch deadline".to_string()
@@ -15321,6 +15330,85 @@ mod tests {
             !shared_seal.matches_bundle(&mutated),
             "a seal must not reconcile a post-dispatch contract mutation"
         );
+    }
+
+    #[cfg(feature = "trust-mc-native-solver")]
+    #[test]
+    fn fresh_exact_direct_receipt_rejects_changed_sibling_entry_declarations() {
+        let obligation_id = native_typed_chc_obligation_id(97, 0);
+        let contract_id = "contract-complete-current-question";
+        let mut obligation =
+            obligation_with_contract(ObligationKind::LoopInvariant, &obligation_id, contract_id);
+        add_typed_body_aware_vc_formula_value(&mut obligation, false);
+        let mut bundle = bundle_with(vec![obligation]);
+        for (id, kind) in
+            [("entry-requires", ContractKind::Requires), ("entry-assumes", ContractKind::Assumes)]
+        {
+            bundle.contracts.push(TrustContract {
+                contract_id: id.to_string(),
+                kind,
+                predicate: ContractPredicate::TrustExpr { text: "true".to_string() },
+                source: SourceLocation::default(),
+                metadata: Vec::new(),
+            });
+        }
+        push_typed_chc_contract(
+            &mut bundle,
+            cyclic_safe_typed_chc_contract(contract_id, &obligation_id, &obligation_id),
+        );
+        bundle.validate().expect("complete original question validates");
+        let obligation = &bundle.obligations[0];
+        let original_digest = bundle
+            .canonical_obligation_semantic_digest_sha256(obligation)
+            .expect("original selected row has a semantic digest");
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let dispatch = adapter
+            .exact_direct_chc_pdr_evidence_with_fresh_receipt(&bundle, obligation, None)
+            .expect("original exact dispatch validates")
+            .expect("original carries exact direct input");
+        assert_eq!(dispatch.evidence.status, EvidenceStatus::Proved);
+        let receipt = dispatch.receipt.expect("actual live solve retains its receipt");
+        let original_seal = receipt.bundle_seal();
+        assert!(receipt.still_authorizes(&bundle, obligation).is_ok());
+
+        for id in ["entry-requires", "entry-assumes"] {
+            for remove in [false, true] {
+                let mut changed = bundle.clone();
+                if remove {
+                    changed.contracts.retain(|contract| contract.contract_id != id);
+                } else {
+                    changed
+                        .contracts
+                        .iter_mut()
+                        .find(|contract| contract.contract_id == id)
+                        .expect("original entry declaration exists")
+                        .predicate = ContractPredicate::TrustExpr { text: "false".to_string() };
+                }
+                changed.validate().expect("changed question remains a valid public bundle");
+                assert_eq!(changed.bundle_id, bundle.bundle_id);
+                assert_eq!(changed.subject, bundle.subject);
+                assert_eq!(changed.obligations[0], *obligation);
+                assert_eq!(
+                    changed.canonical_obligation_semantic_digest_sha256(obligation).unwrap(),
+                    original_digest,
+                    "the selected-row digest must not stand in for the whole entry inventory"
+                );
+                let reason = receipt
+                    .still_authorizes(&changed, obligation)
+                    .expect_err("a changed sibling declaration cannot reuse the old receipt");
+                assert!(
+                    reason.contains("exact sealed snapshot"),
+                    "{id}, remove={remove}: {reason}"
+                );
+                assert!(!original_seal.matches_bundle(&changed));
+                receipt
+                    .still_authorizes_under_exact_bundle_seal(&original_seal, obligation)
+                    .expect("the untouched original question retains its local batch proof");
+            }
+        }
+        assert!(receipt.still_authorizes(&bundle, obligation).is_ok());
     }
 
     #[cfg(feature = "trust-mc-native-solver")]

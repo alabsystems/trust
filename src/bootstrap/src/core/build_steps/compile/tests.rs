@@ -162,11 +162,10 @@ mod initial_sysroot_custody {
     fn fixture(ctx: &TestCtx) -> Session {
         let mut session = Session::new(ctx.config("build").create_config());
         session.config.set_dry_run(DryRun::Disabled);
-        // Trust: a real stage-0 Sysroot asks for the LLVM build status, which hashes
-        // `<src>/src/llvm-project` (llvm.rs OwnSourceGeneration). Give that walk this
-        // fixture's own empty tree: a unit test never hashes this checkout's sources.
+        // Trust: installer source aliases stay within this fixture. Importing
+        // the initial SDK needs no current-source LLVM tree or provider.
         session.config.src = ctx.dir().join("fixture source");
-        fs::create_dir_all(session.config.src.join("src/llvm-project")).unwrap();
+        fs::create_dir_all(&session.config.src).unwrap();
         let sdk = ctx.dir().join("external initial SDK");
         let lib = sdk.join("lib/rustlib").join(session.host_target).join("lib");
         fs::create_dir_all(&lib).unwrap();
@@ -197,6 +196,33 @@ mod initial_sysroot_custody {
         let compiler = Compiler::new(0, builder.host_target);
         StdLink::from_std(Std::new(compiler, compiler.host), compiler).run(builder);
         local_sysroot_dir(builder, compiler)
+    }
+
+    #[test]
+    fn stage0_sysroot_keeps_the_original_seed_llvm_without_resolving_current_llvm() {
+        let ctx = TestCtx::new();
+        let mut session = fixture(&ctx);
+        session.config.llvm_ci_mode = crate::core::config::LlvmCiMode::Download;
+        let relative = Path::new("lib/rustlib").join(session.host_target).join("lib");
+        for path in [PathBuf::from("lib/libLLVM-seed.dylib"), relative.join("libLLVM-seed.dylib")] {
+            fs::write(session.initial_sysroot.join(path), b"original seed LLVM").unwrap();
+        }
+        let original = snapshot(&session.initial_sysroot);
+        let builder = Builder::new(&session);
+        let destination = install(&builder);
+        for path in [PathBuf::from("lib/libLLVM-seed.dylib"), relative.join("libLLVM-seed.dylib")] {
+            let source = session.initial_sysroot.join(&path);
+            let imported = destination.join(path);
+            assert_eq!(fs::read(&imported).unwrap(), b"original seed LLVM");
+            assert_ne!(fs::metadata(source).unwrap().ino(), fs::metadata(imported).unwrap().ino());
+        }
+        assert_eq!(snapshot(&session.initial_sysroot), original, "original seed remains an input");
+        assert!(!destination.join(relative).join("librustc_ast-fixture.rmeta").exists());
+        assert!(
+            !builder.step_cache().contains::<llvm::LlvmFromCi>(),
+            "stage0 installation must not acquire the current source's LLVM provider"
+        );
+        assert!(!builder.step_cache().contains::<llvm::Llvm>());
     }
 
     #[test]

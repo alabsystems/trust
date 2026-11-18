@@ -101,7 +101,7 @@ pub(crate) mod names {
 /// `reflect_formula`) splices, and the `Eq` lemmas that chain the steps.
 /// `reflection_lemmas_cover_every_spliced_bvf_lemma` FAILS if the reflection
 /// starts citing a `bvf_*` lemma this list does not name.
-pub(crate) const REFLECTION_LEMMAS: [&str; 19] = [
+pub(crate) const REFLECTION_LEMMAS: [&str; 20] = [
     "Clean.BVC.bvf_add_cong",
     "Clean.BVC.bvf_add_zero_id",
     "Clean.BVC.bvf_and_cong",
@@ -115,6 +115,7 @@ pub(crate) const REFLECTION_LEMMAS: [&str; 19] = [
     "Clean.BVC.bvf_or_cong",
     "Clean.BVC.bvf_or_cong2",
     "Clean.BVC.bvf_or_zero_id",
+    "Clean.BVC.bvf_sdiv_cong",
     "Clean.BVC.bvf_shl_cong",
     "Clean.BVC.bvf_sub_cong",
     "Clean.BVC.bvf_xor_cong",
@@ -564,7 +565,7 @@ fn register(env: &mut Environment) -> Result<(), String> {
 /// fields, so distinct `(name, w, k)` give distinct constants. Keep the
 /// whole spelling in one string component: parsing dotted numeric pieces
 /// would collapse distinct raw Formula identities such as `X.01.a` and `X.1.a`.
-fn bit_name(name: &str, w: u32, k: u32) -> Name {
+pub(super) fn bit_name(name: &str, w: u32, k: u32) -> Name {
     Name::anon().str(format!("BVC_LEAFBIT_{name}_{w}_{k}"))
 }
 

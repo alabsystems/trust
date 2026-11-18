@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Trust clean-certification gate (advisory-lane kernel-Certified self-test).
 #
-# The superiority gate proves SAFE code is statically discharged (0 runtime
-# checks). THIS gate proves the STRONGER property for the obligation classes the
-# clean theorem prover can kernel-certify: clean's `Certified` tier actually
-# FIRES on real compiled programs when advisory verification is requested.
+# The superiority gate checks static discharge (0 runtime checks). This gate
+# checks that advisory compilation reports Clean's stronger `Certified` tier
+# for the designated safe obligations.
 #
 # A `Certified` obligation was re-proved AND re-checked by the clean CIC kernel
 # (`TypeChecker::check_type`, `infer_only = false`) with ZERO trust in the SMT
@@ -13,6 +12,10 @@
 #
 # The judgment is PER OBLIGATION, read from the compiler's own
 # `-Ztrust-verify-output=json` rows (`results[].proof_evidence.strength.assurance`).
+# Both lanes require exit 0 and the complete function inventory and summaries.
+# The named fixture body must carry its own bounds obligation. All reported
+# bounds rows remain subject to the lane's certification checks.
+# The gate tests compiler disclosures and does not independently replay them.
 # Every fixture below exists for its SLICE BOUNDS obligation (kind `slice`,
 # `SliceBoundsCheck`, id `…:bounds_check:N`):
 #
@@ -95,22 +98,29 @@ trap 'rm -rf "$TMPDIR_GATE"' EXIT
 mkdir -p "$TMPDIR_GATE/home" "$TMPDIR_GATE/tmp" "$TMPDIR_GATE/work" \
   || cannot_run "could not populate $TMPDIR_GATE"
 
-# compile_fixture <fixture.rs> <output-file>: advisory verify with JSON rows,
-# stdout+stderr to the file; returns trustc's exit status. The environment is
+# compile_fixture <fixture.rs> <output-prefix>: advisory verify with JSON rows,
+# stdout and stderr in separate files; returns trustc's exit status. The environment is
 # fixed, not inherited.
 compile_fixture() {
+  local name="${1##*/}"
+  name="${name%.rs}"
   env -i PATH="$CLEAN_PATH" HOME="$TMPDIR_GATE/home" TMPDIR="$TMPDIR_GATE/tmp" \
     LC_ALL=C LANG=C TZ=UTC \
-    "$TRUSTC" --edition 2021 --crate-type lib -Z trust-policy=advisory \
+    "$TRUSTC" --edition 2021 --crate-type lib --crate-name "$name" -Z trust-policy=advisory \
     -Z trust-verify-output=json "$1" \
-    -o "$TMPDIR_GATE/work/$(basename "$1").rlib" >"$2" 2>&1
+    -o "$TMPDIR_GATE/work/$name.rs.rlib" >"$2.stdout" 2>"$2.stderr"
 }
 
-# judge_rows <proved|mutant> <output-file> <rc> -> "PASS <detail>" | "FAIL <detail>"
+# judge_rows <library-dir> <proved|mutant> <output-prefix> <rc> <fixture-name>
 JUDGE_PY='
-import json, sys
+from pathlib import Path
+import sys
 
-lane, path, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
+library, lane, output, status, fixture = sys.argv[1:]
+sys.path.insert(0, library)
+from trust_program_wire import WireError, inspect_wire
+
+rc = int(status)
 BOUNDS_TYPED = {"SliceBoundsCheck", "IndexOutOfBounds"}
 BOUNDS_KIND = {"slice", "index"}
 
@@ -129,78 +139,70 @@ def is_bounds(row):
             or typed_name(row) in BOUNDS_TYPED
             or row.get("kind") in BOUNDS_KIND)
 
-def assurances(node):
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key == "assurance":
-                yield value
-            else:
-                yield from assurances(value)
-    elif isinstance(node, list):
-        for value in node:
-            yield from assurances(value)
-
 def certified(row):
-    return "Certified" in set(assurances(row))
+    evidence = row.get("proof_evidence")
+    strength = evidence.get("strength") if isinstance(evidence, dict) else None
+    return isinstance(strength, dict) and strength.get("assurance") == "Certified"
 
 def label(row):
     return "%s(%s)" % (":".join(str(row.get("obligation_id", "?")).split(":")[-2:]), row.get("outcome"))
 
-rows, functions = [], 0
-with open(path, encoding="utf-8", errors="replace") as handle:
-    for line in handle:
-        if not line.startswith("TRUST_JSON:"):
-            continue
-        try:
-            record = json.loads(line[len("TRUST_JSON:"):])
-        except ValueError:
-            print("FAIL unparseable TRUST_JSON record")
-            sys.exit(0)
-        if record.get("type") != "function_result":
-            continue
-        functions += 1
-        results = record.get("results")
-        if not isinstance(results, list):
-            print("FAIL function_result without a results list")
-            sys.exit(0)
-        rows.extend(r for r in results if isinstance(r, dict))
+if rc != 0:
+    print(f"FAIL compile exited {rc}")
+    sys.exit(0)
+fixture_function = f"{fixture}::{fixture}"
+try:
+    report = inspect_wire(Path(output + ".stderr").read_text(encoding="utf-8"),
+                          Path(output + ".stdout").read_text(encoding="utf-8"),
+                          crate_name=fixture, session="", required_functions=[fixture_function])
+except (OSError, UnicodeError, WireError, RecursionError) as error:
+    print(f"FAIL invalid verification wire: {error}")
+    sys.exit(0)
 
-if functions == 0:
-    print("FAIL no verification summary (no function_result row; compile error?)")
-    sys.exit(0)
+functions = report["function_results"]
+rows = [row for function in functions.values() for row in function["results"]]
 bounds = [r for r in rows if is_bounds(r)]
-cert_bounds = [r for r in bounds if certified(r)]
-other_cert = sum(1 for r in rows if certified(r) and not is_bounds(r))
-if not bounds:
-    print("FAIL no slice bounds obligation among %d row(s): the obligation this fixture exists for is gone or renamed" % len(rows))
+fixture_bounds = [r for r in functions[fixture_function]["results"] if is_bounds(r)]
+if not fixture_bounds:
+    print(f"FAIL no slice bounds obligation in the fixture function {fixture_function}")
     sys.exit(0)
+certified_rows = [r for r in rows if certified(r)]
+inconsistent = [r for r in certified_rows
+                if r.get("outcome") != "proved" or r["proof_evidence"].get("status") != "proved"]
+if inconsistent:
+    print("FAIL inconsistent Certified outcome or proof status for %s"
+          % ", ".join(label(r) for r in inconsistent))
+    sys.exit(0)
+cert_bounds = [r for r in certified_rows if is_bounds(r)]
+other_cert = len(certified_rows) - len(cert_bounds)
 if lane == "proved":
-    weak = [r for r in bounds if not (certified(r) and r.get("outcome") == "proved")]
-    if rc != 0:
-        print("FAIL compile exited %d" % rc)
-    elif weak:
+    weak = [r for r in bounds if not certified(r)]
+    if weak:
         print("FAIL NOT clean-certified: bounds row(s) %s lack Certified assurance"
               % ", ".join(label(r) for r in weak))
     else:
-        print("PASS CLEAN-CERTIFIED: %d bounds obligation(s) kernel-re-checked (zero-trust)" % len(cert_bounds))
+        print("PASS CLEAN-CERTIFIED: %d bounds obligation(s) reported proved with Certified assurance" % len(cert_bounds))
 else:
-    unproved = [r for r in bounds if r.get("outcome") != "proved"]
+    unproved = [r for r in fixture_bounds if r.get("outcome") != "proved"]
     if cert_bounds:
         print("FAIL FALSE CERTIFIED: clean certified the unsafe bounds obligation(s) %s"
               % ", ".join(label(r) for r in cert_bounds))
     elif not unproved:
-        print("FAIL bounds obligation(s) %s proved without certification: the mutation is not visible"
-              % ", ".join(label(r) for r in bounds))
+        print("FAIL fixture bounds obligation(s) %s proved without certification: the mutation is not visible"
+              % ", ".join(label(r) for r in fixture_bounds))
     else:
         print("PASS sound: clean refused to certify the buggy bounds obligation(s) %s"
               " (%d other row(s) Certified)" % (", ".join(label(r) for r in unproved), other_cert))
 '
 
 judge() {
-  local lane=$1 fixture=$2 out="$TMPDIR_GATE/compile.out" rc
+  local lane=$1 fixture=$2 out="$TMPDIR_GATE/compile" rc name
+  name="${fixture##*/}"
+  name="${name%.rs}"
   compile_fixture "$fixture" "$out"
   rc=$?
-  "$PYTHON3" -I -c "$JUDGE_PY" "$lane" "$out" "$rc" 2>&1 || printf 'FAIL the JSON judge crashed\n'
+  "$PYTHON3" -I -B -c "$JUDGE_PY" "$REPO_ROOT/scripts/lib" "$lane" "$out" "$rc" "$name" 2>&1 \
+    || printf 'FAIL the JSON judge crashed\n'
 }
 
 # Warm ay + every certifiable fixture once (absorb debug-ay cold start, which can
@@ -212,11 +214,11 @@ first_silent=''
 for name in "${CERTIFIABLE[@]}"; do
   f="$SUP/proved/$name.rs"
   [ -e "$f" ] || continue
-  compile_fixture "$f" "$TMPDIR_GATE/warm.out"
-  if LC_ALL=C grep -aq '^TRUST_JSON:.*"type": *"function_result"' "$TMPDIR_GATE/warm.out"; then
+  if compile_fixture "$f" "$TMPDIR_GATE/warm" &&
+    LC_ALL=C grep -aq '^TRUST_JSON:.*"type": *"function_result"' "$TMPDIR_GATE/warm.stderr"; then
     rows_seen=$((rows_seen + 1))
   elif [ -z "$first_silent" ]; then
-    first_silent="$name: $(LC_ALL=C grep -a -m1 '^error' "$TMPDIR_GATE/warm.out" || true)"
+    first_silent="$name: $(LC_ALL=C grep -a -m1 '^error' "$TMPDIR_GATE/warm.stderr" || true)"
   fi
 done
 if [ "$rows_seen" -eq 0 ]; then
@@ -255,9 +257,9 @@ for name in "${CERTIFIABLE[@]}"; do
 done
 
 if [ "$failed" -eq 0 ]; then
-  echo "CLEAN CERTIFICATION GATE: GREEN — clean kernel-certifies safe code, never certifies unsafe code"
+  echo "CLEAN CERTIFICATION GATE: GREEN — complete reports certify safe fixture bounds and disclose unproved mutant bounds"
   exit 0
 else
-  echo "CLEAN CERTIFICATION GATE: RED — certification regressed, or a false Certified was minted"
+  echo "CLEAN CERTIFICATION GATE: RED — a fixture failed evidence or certification checks"
   exit 1
 fi

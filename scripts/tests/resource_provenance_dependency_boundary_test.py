@@ -1,8 +1,31 @@
-#!/usr/bin/env python3
+#!/bin/sh
+""":"
+for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+        exec "$candidate" "$0" "$@"
+    fi
+done
+echo "resource_provenance_dependency_boundary_test.py requires Python 3.11+ (tomllib)" >&2
+exit 2
+":"""
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 # Copyright 2026 Andrew Yates
+import os as _floor_os
+import shutil as _floor_shutil
+import sys as _floor_sys
 
-"""Keep source/build guards below Git transport in every committed native graph.
+# Trust: python floor, second half (PYTHON-FLOOR-RED-1). `python3 resource_provenance_dependency_boundary_test.py`
+# reads the sh block above as a string, so an old `python3` (3.9 on macOS
+# CommandLineTools) re-execs here.
+if __name__ == "__main__" and _floor_sys.version_info < (3, 11):
+    for _floor_candidate in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _floor_path = _floor_shutil.which(_floor_candidate)
+        if _floor_path:
+            _floor_argv = [_floor_path, _floor_os.path.abspath(__file__), *_floor_sys.argv[1:]]
+            _floor_os.execv(_floor_path, _floor_argv)
+    _floor_sys.exit("resource_provenance_dependency_boundary_test.py requires Python 3.11+ (tomllib); none found on PATH")
+__doc__ = """Keep source/build guards below Git transport in every committed native graph.
 
 Run with Python >=3.11. Native locked metadata separately checks that these
 committed graphs resolve; this regression checks the boundary across all of them.

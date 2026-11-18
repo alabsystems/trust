@@ -2,8 +2,7 @@
 //! file guards create no Root, materialization, parser or closure authority.
 use std::ffi::CString;
 use std::fs::Metadata;
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd};
-use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+use std::os::fd::{BorrowedFd, FromRawFd};
 
 use trust_resource_controller::bootstrap_graph::configuration::{self, Timestamp};
 use trust_resource_controller::bootstrap_graph::{ConfigurationAttachment, transport};

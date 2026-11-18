@@ -18,6 +18,12 @@ HELPER = REPO_ROOT / "scripts" / "fetch_trust_stage0_payloads.py"
 PAYLOAD_REL = "dist/2026-05-04/trustc-1.96.0-trust-aarch64-test.tar.xz"
 
 
+# A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces (atpkg's python
+# lives under `Application Support/`): exec splits it and the fake never runs. This sh/python
+# polyglot execs the interpreter quoted and keeps argv[0] as the fake's own path.
+PYTHON_SHEBANG = f'#!/bin/sh\n""":"\nexec "{sys.executable}" "$0" "$@"\n":"""\n'
+
+
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -154,7 +160,7 @@ def test_internal_release_uses_owner_routed_transport_and_installs_only_verified
             tools.mkdir()
             agh = tools / "agh"
             agh.write_text(
-                f"#!{sys.executable}\n"
+                PYTHON_SHEBANG +
                 "import sys\nfrom pathlib import Path\n"
                 "a = sys.argv[1:]\n"
                 "assert a[:4] == ['release', 'download', 'example/trust', 'seed-tag']\n"

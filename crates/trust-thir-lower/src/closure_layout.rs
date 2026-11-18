@@ -298,6 +298,28 @@ mod tests {
     }
 
     #[test]
+    fn equal_frame_images_keep_distinct_concrete_source_origins() {
+        let mut source = fixture([0, 8]);
+        source.closure_layouts[0].origin = Some(trust_ir::ty::TypeOrigin::Clean {
+            decl: "First.Closure".into(),
+            env_digest: trust_ir::ProofDigest::sha256([1; 32]),
+        });
+        let mut other = source.closure_layouts[0].clone();
+        other.origin = Some(trust_ir::ty::TypeOrigin::Clean {
+            decl: "Second.Closure".into(),
+            env_digest: trust_ir::ProofDigest::sha256([1; 32]),
+        });
+        let mut destination = source.clone();
+        let mut interner = Interner::default();
+        let same = interner.intern(&mut destination,
+            source.closure_types[0].clone(), Some(&source.closure_layouts[0])).unwrap();
+        let distinct = interner.intern(&mut destination,
+            source.closure_types[0].clone(), Some(&other)).unwrap();
+        assert_eq!(same, ClosureTyId::new(0));
+        assert_ne!(same, distinct);
+    }
+
+    #[test]
     fn relocates_and_coalesces_identical_frames() {
         let source = fixture([8, 0]);
         let mut destination = fixture([0, 8]);

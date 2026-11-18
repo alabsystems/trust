@@ -26,6 +26,7 @@ PRODUCER = ROOT / "scripts/two_language_subject_index.py"
 sys.path.insert(0, str(TESTS))
 
 from completion_gates_g3_test import REV, RUN, GateRoot  # noqa: E402
+from lean_island_census_test import bind_inventory_text, decoded, encode, fixture as island_fixture  # noqa: E402
 from trust_ir_producer_census_test import census_v2, mutate_census  # noqa: E402
 from trust_ir_producer_scorecard_completion_test import compiler_census  # noqa: E402
 
@@ -243,6 +244,12 @@ class SubjectIndexProducerTests(unittest.TestCase):
         census["declarations"].append(copy.deepcopy(census["declarations"][0]))
         self.f.g.artifact("lean_body_census", census)
         self.assert_producer_refuses("duplicate Lean body census declaration")
+
+    def test_unknown_lean_census_kind_is_refused(self) -> None:
+        census = self.f.g.docs["lean_body_census"]
+        census["declarations"][0]["kind"] = "unmeasured"
+        self.f.g.artifact("lean_body_census", census)
+        self.assert_producer_refuses("unknown declaration kind")
 
     def test_two_bodies_with_one_identity_refused_by_producer(self) -> None:
         # Two printed defs that differ ONLY by crate disambiguator strip to one
@@ -553,12 +560,66 @@ class SubjectIndexProducerTests(unittest.TestCase):
             self.assertIn("FILE=CENSUS:EXIT", stderr)
             self.assertFalse((self.f.g.root / OUT).exists())
 
-    def test_proof_only_declarations_are_not_indexed(self) -> None:
-        # `bsum` is listed proof-only: it is neither a body nor unlisted.
+    def test_a_computational_candidate_cannot_be_hidden_as_proof_only(self) -> None:
         rc, report = self.lean_with_island(["wdec", "wsum"], proof_only=("bsum",))
+        self.assertEqual(rc, 3)
         lean = {row["source_body"] for row in report["rows"] if row["language"] == "lean"}
         self.assertEqual(lean, {"wdec", "wsum"})
+        self.assertEqual(report["reconciliation_error_counts"],
+                         {"lean.census-kernel-kind-mismatch": 1, "rust.compiler-census-absent": 1})
+        self.assertEqual(report["reconciliation_errors"]["lean.census-kernel-kind-mismatch"],
+                         ["inputs/l.lean bsum: census proof-only, kernel computational-candidate"])
+
+    @staticmethod
+    def island_with_proof_only() -> tuple[bytes, str]:
+        # Simulated wire fixture with one definition and one theorem.
+        records = island_fixture()
+        theorem = "theorem beta : True := True.intro"
+        bind_inventory_text(records, 1, theorem)
+        check = records[2]
+        roster = check["kernel_roster"]
+        payload = {"unit": 1, "bytes": len(theorem.encode()), "sha256": digest(theorem.encode())}
+        check["consumed_inputs"][1] = roster["inputs"][1] = payload
+        roster["source_declarations"][1]["end"] = payload["bytes"]
+        roster["declarations"][1].update(constant_kind="Theorem", kernel_classification={"kind": "proof-only"})
+        return encode(records), records[-1]["loaded_sources"][0]["source_map_checksum_sha256"]
+
+    def test_proof_only_declarations_are_not_indexed(self) -> None:
+        island, admitted_sha = self.island_with_proof_only()
+        _, report = self.lean_with_island(["alpha"], proof_only=("beta",), island=island, admitted_sha=admitted_sha)
+        lean = {row["source_body"]: row["paired_by"] for row in report["rows"] if row["language"] == "lean"}
+        self.assertEqual(lean, {"alpha": "kernel-identity"})
         self.assertEqual(report["reconciliation_error_counts"], {"rust.compiler-census-absent": 1})
+
+    def test_a_kernel_proof_only_row_cannot_pair_as_a_computational_body(self) -> None:
+        island, admitted_sha = self.island_with_proof_only()
+        rc, report = self.lean_with_island(["alpha", "beta"], island=island, admitted_sha=admitted_sha)
+        self.assertEqual(rc, 3)
+        lean = {row["source_body"]: row["paired_by"] for row in report["rows"] if row["language"] == "lean"}
+        self.assertEqual(lean, {"alpha": "kernel-identity", "beta": "printed-path"})
+        self.assertEqual(report["reconciliation_error_counts"],
+                         {"lean.census-kernel-kind-mismatch": 1, "rust.compiler-census-absent": 1})
+        self.assertEqual(report["reconciliation_errors"]["lean.census-kernel-kind-mismatch"],
+                         ["inputs/l.lean beta: census computational, kernel proof-only"])
+
+    def test_inconclusive_kernel_classifications_stay_visible(self) -> None:
+        # Rechain a diagnostic mutation over the capture, leaving its original bytes intact.
+        records = decoded(self.ISLAND.read_bytes())
+        classifications = {"bsum": {"kind": "primitive-candidate"},
+                           "wdec": {"kind": "unknown", "reason": "classification unsupported"}}
+        for event in records:
+            for declaration in event.get("kernel_roster", {}).get("declarations", []):
+                name = declaration["name"]
+                if name in classifications:
+                    declaration["kernel_classification"] = classifications[name]
+        rc, report = self.lean_with_island(["bsum", "wdec", "wsum"], island=encode(records))
+        self.assertEqual(rc, 3)
+        lean = {row["source_body"]: row["paired_by"] for row in report["rows"] if row["language"] == "lean"}
+        self.assertEqual(lean, {"bsum": "printed-path", "wdec": "printed-path", "wsum": "kernel-identity"})
+        self.assertEqual(report["reconciliation_errors"]["lean.kernel-classification-inconclusive"], [
+            "inputs/l.lean bsum: census computational, kernel primitive-candidate",
+            "inputs/l.lean wdec: census computational, kernel unknown",
+        ])
 
     def test_unusable_island_census_is_a_reconciliation_error(self) -> None:
         # The real transcript without its completion footer.

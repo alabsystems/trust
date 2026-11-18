@@ -3093,7 +3093,8 @@ def pinned_stage0_identity(
 CARGO_HOME_INPUT_TREES = ("registry/index", "registry/cache", "git/db")
 
 
-def cargo_home_inputs(source: Path | None, destination: Path) -> dict[str, object]:
+def cargo_home_inputs(source: Path | None, destination: Path, *,
+                      trees: tuple[str, ...] = CARGO_HOME_INPUT_TREES, run=None) -> dict[str, object]:
     """Fill the cut's ONE private cargo home from `source`, a cargo home that a
     networked build of this commit filled, and bind what it was given by content.
 
@@ -3110,33 +3111,46 @@ def cargo_home_inputs(source: Path | None, destination: Path) -> dict[str, objec
     cache the cut was given. Every run of the cut uses this one cargo home, so
     its paths (git checkouts are not remapped in debuginfo) are the same in both
     builds of the double compile.
+
+    ``trees`` selects which of CARGO_HOME_INPUT_TREES are copied: the dependency
+    preparation takes only the registry trees of its input home and reads the input's
+    Git databases as object sources, so no ancestor-only body enters its home. ``run``,
+    when given, runs each tree's copy as one bounded item: run(label, copy, target).
     """
     if destination.exists() or destination.is_symlink():
         fail(f"private cargo home already exists: {destination}")
+    if not set(trees) <= set(CARGO_HOME_INPUT_TREES):
+        fail(f"cargo home input trees must be among {CARGO_HOME_INPUT_TREES}: {trees}")
     destination.mkdir(mode=0o700, parents=True)
-    trees: dict[str, object] = {}
+    copied: dict[str, object] = {}
     resolved: Path | None = None
     if source is not None:
         resolved = canonical_directory(source, "cargo home input")
-        for relative in CARGO_HOME_INPUT_TREES:
+        for relative in trees:
             tree = resolved / relative
             if not tree.exists() and not tree.is_symlink():
-                trees[relative] = None
+                copied[relative] = None
                 continue
             if tree.is_symlink() or not tree.is_dir():
                 fail(f"cargo home input {relative} must be a non-symlink directory: {tree}")
-            given = tree_records(tree, f"cargo home input {relative}")
             target = destination / relative
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            clone_tree(tree, target)
-            if tree_records(target, f"private cargo home {relative}") != given:
-                fail(f"the private copy of cargo home input {relative} is not the input")
-            trees[relative] = {"entries": len(given), "sha256": records_sha256(given)}
-    serialized = json.dumps(trees, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+            def copy(tree=tree, target=target, relative=relative):
+                given = tree_records(tree, f"cargo home input {relative}")
+                clone_tree(tree, target)
+                if tree_records(target, f"private cargo home {relative}") != given:
+                    fail(f"the private copy of cargo home input {relative} is not the input")
+                return given
+
+            given = (run(f"the copy of cargo home input {relative} into {destination}", copy, target)
+                     if run is not None else copy())
+            copied[relative] = {"entries": len(given), "sha256": records_sha256(given)}
+    serialized = json.dumps(copied, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return {
         "schema": "trust-cargo-home-inputs-v1",
         "source": str(resolved) if resolved is not None else None,
-        "trees": trees,
+        "trees": copied,
         "fingerprint": hashlib.sha256(serialized).hexdigest(),
     }
 

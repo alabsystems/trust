@@ -108,7 +108,7 @@ pub(super) fn request(
     // sequential runner would not consult it. A plan's own `[harness]`
     // table is the policy of its run.
     let plan = options.compile_opts.build_config.test_plan.as_deref();
-    let policy = HarnessPolicy::load(ws, plan)?;
+    let policy = HarnessPolicy::load(ws, plan, options.child_supervision)?;
     // A plan states its lane's pool (`[run] test-jobs`); the configuration's
     // stands over it.
     let configured = ws.gctx().build_config()?.test_jobs;
@@ -152,6 +152,10 @@ pub(super) fn request(
     anyhow::ensure!(
         plan.is_none() || !retained,
         "a test plan cannot run under retained verified execution"
+    );
+    anyhow::ensure!(
+        !retained || policy.supervision().is_none(),
+        "retained execution cannot silently omit configured native process activity supervision"
     );
     anyhow::ensure!(
         crate::is_targo_invocation()
@@ -578,18 +582,22 @@ pub(crate) fn execute(
     watch: Option<&plan_judge::Watch>,
     scope: &cargo_util::StreamingProcessScope,
     sink: OutputSink,
+    supervision: Option<cargo_util::ChildSupervision>,
 ) -> CargoResult<()> {
     let mut command = command.clone();
     command.supervised_by(scope);
     let result = if required.is_some() || watch.is_some() {
-        execute_judged(&command, required, watch, sink)
+        execute_judged(&command, required, watch, sink, supervision)
     } else {
         command
             .exec_with_streaming_limits(
                 &mut |line| sink.write(TestOutputStream::Stdout, line),
                 &mut |line| sink.write(TestOutputStream::Stderr, line),
                 false,
-                harness_output_limits(),
+                match supervision {
+                    Some(policy) => harness_output_limits().with_child_supervision(policy),
+                    None => harness_output_limits(),
+                },
             )
             .map(drop)
     };

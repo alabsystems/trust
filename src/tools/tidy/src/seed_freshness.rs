@@ -17,7 +17,7 @@ use std::process::Command;
 use crate::diagnostics::TidyCtx;
 
 pub fn check(root_path: &Path, tidy_ctx: TidyCtx) {
-    let mut check = tidy_ctx.start_check("seed_freshness");
+    let check = tidy_ctx.start_check("seed_freshness");
 
     let script = root_path.join("scripts/check_seed_freshness.py");
     if !script.is_file() {

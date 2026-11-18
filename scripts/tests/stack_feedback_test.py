@@ -25,6 +25,12 @@ STACK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(STACK)
 
 
+# A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces (atpkg's python
+# lives under `Application Support/`): exec splits it and the fake never runs. This sh/python
+# polyglot execs the interpreter quoted and keeps argv[0] as the fake's own path.
+PYTHON_SHEBANG = f'#!/bin/sh\n""":"\nexec "{sys.executable}" "$0" "$@"\n":"""\n'
+
+
 def executable(path, body):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
@@ -54,7 +60,8 @@ target_root = pathlib.Path(__import__('os').environ['CARGO_TARGET_DIR'])
 target_root.mkdir(parents=True,exist_ok=True)
 for name in ('ay_refutation_step_realbody','ay_refutation_loop_realbody'):
     path = target_root/name
-    body = '#!'+sys.executable+'\nimport sys\n'
+    # sh/python polyglot: a shebang cannot carry an interpreter path with spaces.
+    body = '#!/bin/sh\n""":"\nexec "'+sys.executable+'" "$0" "$@"\n":"""\nimport sys\n'
     if NATIVE_MUTATION:
         body += 'from pathlib import Path\n'
         condition = '"--list" in sys.argv' if NATIVE_MUTATION == 'inventory' else '"--list" not in sys.argv'
@@ -110,7 +117,7 @@ class FeedbackTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("// fixed stand-in proof source\n")
         gate = self.ay / "scripts/ci/trust_verification_ratchet_gate.sh"
-        executable(gate, f"#!/bin/sh\nexec {sys.executable} - <<'PY'\n{RATCHET}\nPY\n")
+        executable(gate, f"#!/bin/sh\nexec \"{sys.executable}\" - <<'PY'\n{RATCHET}\nPY\n")
         accounting = self.ay / "scripts/trust_ratchet_accounting.py"
         accounting.write_text("def accounting(b,c): return {'obligations_removed_unattributed': 0}\n"
                               "def regressions(a,b,c): return []\n")
@@ -146,7 +153,7 @@ class FeedbackTests(unittest.TestCase):
                    "XDG_STATE_HOME": str(self.base / "private-state")}
         inherited = {**context, **routing}
         observed = self.base / "admission-context.json"
-        executable(self.slot, f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+        executable(self.slot, PYTHON_SHEBANG + f"import json, os, pathlib, sys\n"
                    f"pathlib.Path({str(observed)!r}).write_text(json.dumps("
                    f"{{key: os.environ.get(key) for key in {tuple(inherited)!r}}}))\n"
                    "assert sys.argv[1] == '--'\n"
@@ -171,7 +178,7 @@ class FeedbackTests(unittest.TestCase):
         cli = self.base / "application/aterm"
         executable(cli, "#!/bin/sh\nexit 0\n")
         observed = self.base / "admission-cli.json"
-        executable(self.slot, f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+        executable(self.slot, PYTHON_SHEBANG + f"import json, os, pathlib, sys\n"
                    f"pathlib.Path({str(observed)!r}).write_text(json.dumps("
                    "{key: os.environ.get(key) for key in ('PATH', 'BUILD_SLOT_ATERM_CLI')}))\n"
                    "assert sys.argv[1] == '--'\n"
@@ -196,7 +203,7 @@ class FeedbackTests(unittest.TestCase):
         cli = self.base / "application/explicit-aterm"
         executable(cli, "#!/bin/sh\nexit 0\n")
         observed = self.base / "explicit-admission-cli.json"
-        executable(self.slot, f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+        executable(self.slot, PYTHON_SHEBANG + f"import json, os, pathlib, sys\n"
                    f"pathlib.Path({str(observed)!r}).write_text(json.dumps("
                    "{key: os.environ.get(key) for key in ('PATH', 'BUILD_SLOT_ATERM_CLI')}))\n"
                    "assert sys.argv[1] == '--'\n"
@@ -260,7 +267,7 @@ class FeedbackTests(unittest.TestCase):
                 "    duplicate=path.with_name(path.name+'-duplicate')\n"
                 "    duplicate.write_bytes(path.read_bytes());duplicate.chmod(0o755)\n"
                 "    print(json.dumps({'reason':'compiler-artifact','target':{'name':name},'executable':str(duplicate)}))")
-        executable(root / "bin/targo", f"#!{sys.executable}\nMETADATA_FAIL={metadata_fail!r}\nTEST_FAIL={test_fail!r}\n"
+        executable(root / "bin/targo", PYTHON_SHEBANG + f"METADATA_FAIL={metadata_fail!r}\nTEST_FAIL={test_fail!r}\n"
                    f"NATIVE_MUTATION={native_mutation!r}\n"
                    f"EXTRA_PACKAGES={json.dumps(extra_packages)!r}\n" + program)
         executable(root / "libexec/helper", "#!/bin/sh\nexit 0\n")
@@ -507,6 +514,54 @@ class FeedbackTests(unittest.TestCase):
         with self.assertRaisesRegex(STACK.Refused, "source is dirty"):
             runner.check_inputs()
 
+    def test_ignored_intermediate_link_cannot_change_frozen_source(self):
+        (self.ay / ".gitignore").write_text("ignored/\n")
+        for name in ("first.rs", "second.rs"):
+            (self.ay / name).write_text(name)
+        (self.ay / "ignored").mkdir()
+        hop = self.ay / "ignored/hop"
+        hop.symlink_to("../first.rs")
+        selected = self.ay / "linked.rs"
+        selected.symlink_to("ignored/hop")
+        self.commit(self.ay)
+        runner = STACK.Feedback(self.args)
+        runner.preflight()
+        self.assertEqual(selected.read_text(), "first.rs")
+        hop.unlink()
+        hop.symlink_to("../second.rs")
+        self.assertEqual(selected.read_text(), "second.rs")
+        self.assertEqual(self.git(self.ay, "status", "--porcelain"), "")
+        with self.assertRaisesRegex(STACK.Refused, "frozen source changed: ay"):
+            runner.check_inputs()
+
+    def test_excluded_link_hop_cannot_change_frozen_dependency(self):
+        root = self.base / "registry-package"
+        (root / ".git").mkdir(parents=True)
+        manifest = root / "Cargo.toml"
+        manifest.write_text('[package]\nname="fixture-dependency"\nversion="0.1.0"\n')
+        for name in ("first.rs", "second.rs"):
+            (root / name).write_text(name)
+        hop = root / ".git/hop"
+        hop.symlink_to("../first.rs")
+        selected = root / "linked.rs"
+        selected.symlink_to(".git/hop")
+        package = {"id": "fixture-dependency 0.1.0", "name": "fixture-dependency", "version": "0.1.0",
+                   "source": "registry+https://github.com/rust-lang/crates.io-index", "manifest_path": str(manifest)}
+        self.make_toolchain("a" * 40, extra_packages=[package])
+        runner = STACK.Feedback(self.args)
+        runner.preflight()
+        runner.metadata("control", "ay")
+        runner.check_inputs()
+        self.assertEqual(selected.read_text(), "first.rs")
+        before = runner.dependencies[str(root)]["sha256"]
+        hop.unlink()
+        hop.symlink_to("../second.rs")
+        self.assertEqual(selected.read_text(), "second.rs")
+        with self.subTest("between phases"), self.assertRaisesRegex(STACK.Refused, "dependency source bytes changed"):
+            runner.check_inputs()
+        with self.subTest("complete content digest"):
+            self.assertNotEqual(STACK.dependency_identity(root), before)
+
     def test_ignored_path_package_under_source_root_is_refused(self):
         (self.ay / ".gitignore").write_text("ignored-package/\n")
         self.commit(self.ay)
@@ -688,7 +743,7 @@ data['obligation_ledger']['vcgen_truncated_functions']=1
 data['obligation_ledger']['vcgen_truncated_function_names']=['truncated_function']
 data['strict_lane']['verdict_census_matches_advisory']=False
 (out/'current.json').write_text""")
-        executable(gate, f"#!/bin/sh\nexec {sys.executable} - <<'PY'\n{incomplete}\nPY\n")
+        executable(gate, f"#!/bin/sh\nexec \"{sys.executable}\" - <<'PY'\n{incomplete}\nPY\n")
         self.commit(self.ay)
         self.assertEqual(STACK.Feedback(self.args).run(), 1)
         data = self.result()
@@ -733,8 +788,7 @@ data['strict_lane']['verdict_census_matches_advisory']=False
         state = self.args.out / "timeout.process.json"
         # Match build-slot's separate session and lease lifetime, without using
         # the machine-wide pool for a tiny stand-in regression.
-        executable(self.slot, f'''#!{sys.executable}
-import fcntl,json,os,pathlib,subprocess,sys
+        executable(self.slot, PYTHON_SHEBANG + f'''import fcntl,json,os,pathlib,subprocess,sys
 with open({str(lease)!r},'w') as lease:
     fcntl.flock(lease,fcntl.LOCK_EX)
     child=subprocess.Popen(sys.argv[2:],start_new_session=True)
@@ -788,7 +842,7 @@ sys.exit(rc)
         self.assertIn("owned workload retained", Path(phase["stdout"]).read_text())
 
     def test_timeout_before_admission_cannot_launch_a_workload_later(self):
-        executable(self.slot, f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
+        executable(self.slot, PYTHON_SHEBANG + "import time\ntime.sleep(60)\n")
         self.args.timeout = 1
         marker = self.base / "must-not-launch"
         runner = STACK.Feedback(self.args)

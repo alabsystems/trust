@@ -54,8 +54,8 @@ fn capture_width(ty: &IrTy) -> Result<u32, String> {
     }
 }
 
-/// The original-transition census admits only the observed nominal one-field
-/// thin-pointer carrier. The environment stays a Closure value, including its
+/// The original-transition census admits an observed empty frame or the nominal
+/// one-field thin-pointer carrier. The environment stays a Closure value, including its
 /// opaque/known code identity; this check never substitutes Ptr for that type.
 /// Source/codegen declarations, apparent signatures and observed frames must
 /// agree independently. Numeric width or a helper/symbol name is insufficient.
@@ -84,21 +84,30 @@ pub(super) fn original_nominal(
         .closure_layout_descriptor(nominal)
         .map_err(|e| format!("codegen closure frame: {e}"))?
         .ok_or("codegen closure has no observed frame")?;
-    if declaration.captures != [IrTy::Ptr]
-        || actual.captures != declaration.captures
+    if actual.captures != declaration.captures
         || signature != actual_signature
         || signature.is_vararg
         || signature.abi.is_some()
-        || !signature.params.is_empty()
-        || signature.returns != [IrTy::Ptr]
-        || frame.size != 8
-        || frame.align != 8
-        || frame.capture_offsets != [0]
         || actual_frame.size != frame.size
         || actual_frame.align != frame.align
         || actual_frame.capture_offsets != frame.capture_offsets
+        || actual_frame.origin != frame.origin
     {
         return Err("original nominal closure declaration/signature/observed frame differs from the supported complete carrier".into());
+    }
+    // An empty environment adds no capture formula or memory observation.
+    // Its code identity remains opaque/known under the existing direct-edge
+    // rules; the complete original census still checks every scalar operation.
+    let empty = declaration.captures.is_empty()
+        && frame.size == 0 && frame.align == 1 && frame.capture_offsets.is_empty()
+        && signature.returns.len() <= 1
+        && signature.params.iter().chain(&signature.returns)
+            .all(|ty| source_memory::width(ty).is_ok());
+    let pointer = declaration.captures == [IrTy::Ptr]
+        && signature.params.is_empty() && signature.returns == [IrTy::Ptr]
+        && frame.size == 8 && frame.align == 8 && frame.capture_offsets == [0];
+    if !empty && !pointer {
+        return Err("original nominal closure is outside the observed empty/pointer carrier".into());
     }
     Ok(())
 }
@@ -122,7 +131,10 @@ pub(super) fn original_projection(
         return Err("original projection is not a nominal closure value".into());
     };
     original_nominal(source, codegen, nominal)?;
-    if field != 0 || *ty != IrTy::Ptr {
+    if field != 0 || *ty != IrTy::Ptr
+        || source.closure_type(nominal)
+            .and_then(|declaration| declaration.captures.get(field as usize)) != Some(ty)
+    {
         return Err("original projection differs from the exact nominal capture field/type".into());
     }
     Ok(())
@@ -160,7 +172,7 @@ pub(super) fn direct_call_boundary(
     Ok(())
 }
 
-/// Qualify a scalar/pair environment against its observed physical frame.
+/// Qualify an ignored/scalar/pair environment against its observed physical frame.
 /// P is in logical capture order. Its register order must instead follow the
 /// recorded offsets: reversing source fields cannot reverse the ABI words.
 /// Packed fields, padding-only words, extensions and stack carriers remain
@@ -181,6 +193,9 @@ pub(super) fn placement(
         .map_err(|e| format!("closure frame: {e}"))?
         .ok_or("closure ABI has no observed frame")?;
     let slots = match place {
+        // The logical nominal environment survives an empty physical ABI.
+        // Its exact frame is checked below; no incoming code identity is minted.
+        ParamPlace::Ignore if closure.captures.is_empty() => vec![],
         ParamPlace::Scalar(slot) if closure.captures.len() == 1 => vec![*slot],
         ParamPlace::Pair(a, b) if closure.captures.len() == 2 => vec![*a, *b],
         _ => {
@@ -208,6 +223,7 @@ pub(super) fn placement(
         return Err("closure frame totals disagree with the native scalar carrier".into());
     }
     match slots.as_slice() {
+        [] if frame.capture_offsets.is_empty() && size == 0 && align == 1 => {}
         [_] if frame.capture_offsets == [0] && size <= 8 => {}
         [a, b] if size > 8 && size <= 16 => {
             let (first, second) = match frame.capture_offsets.as_slice() {
@@ -229,6 +245,29 @@ pub(super) fn placement(
 }
 
 impl ClosureValue {
+    /// A typed local store retains this value, not a scalar encoding of its
+    /// environment. The cell's immutable module has independently supplied
+    /// its unique storage target and complete declared capture types.
+    pub(super) fn check_local_storage(
+        &self,
+        nominal: ClosureTyId,
+        target: FuncId,
+        captures: &[IrTy],
+    ) -> Result<(), String> {
+        if self.nominal != nominal || self.target != TargetIdentity::Known(target) {
+            return Err("nominal local store has a different or unknown closure target/type".into());
+        }
+        if self.captures.len() != captures.len() {
+            return Err("nominal local store has a different capture count".into());
+        }
+        for (actual, declared) in self.captures.iter().zip(captures) {
+            if actual.ty != *declared || actual.value.width != capture_width(declared)? {
+                return Err("nominal local store has a different capture type/width".into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn incoming(
         module: &Module,
         nominal: ClosureTyId,

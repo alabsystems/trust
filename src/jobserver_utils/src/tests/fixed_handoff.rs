@@ -72,6 +72,8 @@ fn fixed_courier_crosses_unaware_descendants_with_original_rights() {
         .unwrap();
     original.try_lock().unwrap();
     let mut packet = tempfile::tempfile().unwrap();
+    // As `private_packet` makes it: Linux's O_TMPFILE file takes its mode from the umask.
+    packet.set_permissions(std::fs::Permissions::from_mode(0o600)).unwrap();
     packet.write_all(b"fixed packet DATA only").unwrap();
     let mut cursor = packet.try_clone().unwrap();
     let before = cursor.stream_position().unwrap();
@@ -108,6 +110,7 @@ fn fixed_role_rejects_missing_or_unsafe_files_without_becoming_cpu_or_gnu() {
         .unwrap();
     let packet = || {
         let mut f = tempfile::tempfile().unwrap();
+        f.set_permissions(std::fs::Permissions::from_mode(0o600)).unwrap();
         f.write_all(b"packet DATA").unwrap();
         f
     };

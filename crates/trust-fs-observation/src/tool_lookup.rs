@@ -19,6 +19,15 @@
 //! subcommands, loaded libraries and execution-time system policy are outside
 //! this readset. Parent matching is conditional on unchanged compiler identity
 //! and semantic command profile, not a proof of child-environment derivation.
+//!
+//! One narrowing is admitted: a consumer may take records from a compiler run
+//! under a per-action MAC sandbox (Targo's confined units) and re-observe them
+//! unconfined. The sandbox only removes access, so its policy can only turn a
+//! candidate the consumer reaches into one the record names denied or
+//! missing; `ToolInputs::check_current` then finds the records differ and
+//! yields nothing. Records therefore stand only where the confined and the
+//! unconfined view agree, and the consumer must bind the policy itself (Targo
+//! does through the confined command's digest in the unit fingerprint).
 
 use std::ffi::OsStr;
 #[cfg(unix)]
@@ -133,10 +142,9 @@ impl Context {
         // Header reads and access checks belong to the original window too.
         // No after-the-fact window can replace those initial stamps.
         let after = observation::observe_attempt(Path::new("/"), &paths, false).result?;
-        ensure!(
-            window.covers(&after),
-            "tool namespace changed during admission"
-        );
+        window
+            .check_covers(&after)
+            .context("tool namespace changed during admission")?;
         ensure!(
             after.into_snapshot() == filesystem,
             "tool content changed during admission"
@@ -247,10 +255,9 @@ impl Pending {
         // read and access/credential query. A replacement window here could
         // accept content or namespace changes restored during those reads.
         let after = observation::observe_attempt(Path::new("/"), &paths, false).result?;
-        ensure!(
-            self.window.covers(&after),
-            "tool namespace changed during execution"
-        );
+        self.window
+            .check_covers(&after)
+            .context("tool namespace changed during execution")?;
         ensure!(
             after.into_snapshot() == self.record.filesystem,
             "tool content changed during execution"
@@ -861,7 +868,8 @@ mod tests {
             let pending = context.begin().unwrap();
             native(&tool, 2);
             native(&tool, 1);
-            assert!(pending.finish().is_err());
+            let error = pending.finish().unwrap_err();
+            assert!(format!("{error:#}").contains(&tool.display().to_string()));
             let pending = context.begin().unwrap();
             let moved = root.join("moved");
             fs::rename(&tool, &moved).unwrap();

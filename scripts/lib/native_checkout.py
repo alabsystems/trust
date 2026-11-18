@@ -33,6 +33,10 @@ NATIVE_SOURCE = "src/tools/targo/crates/targo-core/src/ops/checkout_inputs/mod.r
 _RETAINED_FAILURES = []  # unknown retirement retains its original handles; never reused
 
 
+# The native reader's working directory: the filesystem root, inside no checkout.
+READER_CWD = "/"
+
+
 class Unavailable(RuntimeError):
     """Discard every native observation in the current pass; run the original."""
 
@@ -271,8 +275,13 @@ class Reader:
                     or not landing_targo.exit_observation_available()):
                 raise Unavailable("native reader profile cannot be established")
             program.bookend()
+            # The reader names every root it reads as an absolute path, so it
+            # needs no working directory. It runs from READER_CWD, never from
+            # the caller's: the build-tree lock counts a targo process whose
+            # cwd is inside a tree as that tree's writer, so a reader started
+            # from the checkout held it against every x.py leg of the same run.
             self.child = subprocess.Popen([str(program.executable), "source-check", "--tracked-inputs"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.errors, env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.errors, env=env, cwd=READER_CWD,
                 start_new_session=True, pass_fds=landing_targo.resource_fds(env), bufsize=0)
             self.owned = owned_group(self.child)
             os.set_blocking(self.child.stdin.fileno(), False)

@@ -3,6 +3,67 @@ use std::fs::File;
 
 use super::*;
 
+#[test]
+fn retained_jobserver_originals_do_not_import_reused_ambient_slots() {
+    const CHILD: &str = "TJS_RETAINED_ORIGINALS_CHILD";
+    const TEST: &str =
+        "handoff::tests::retained_jobserver_originals_do_not_import_reused_ambient_slots";
+    if std::env::var_os(CHILD).is_some() {
+        let value = std::env::var_os(super::super::DESCENDANT_HANDOFF_ENV).unwrap();
+        let ad = Advertisement::parse(&value).unwrap();
+        let flags = flags(ad.pair);
+        assert!(recover(&value, OsStr::new(&flags)).is_err());
+        assert!(retain_originals(&value, OsStr::new("--jobserver-auth=1,2")).is_err());
+        let original = retain_originals(&value, OsStr::new(&flags)).unwrap();
+        for fd in original.iter() {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: read-only query on the independently owned returned right.
+            assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) }, 0);
+            // SAFETY: successful fstat initialized the complete value.
+            assert_eq!(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT, libc::S_IFIFO);
+        }
+        for fd in ad.pair {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: read-only query; the parent deliberately mapped /dev/null here.
+            assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
+            // SAFETY: successful fstat initialized the complete value.
+            assert_eq!(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT, libc::S_IFCHR);
+        }
+        println!("RETAINED_ORIGINALS_COMPLETE");
+        return;
+    }
+    let endpoint = Arc::new(Endpoint::new(Arc::new(pipe()), &std::env::temp_dir()).unwrap());
+    let ad = Advertisement::parse(&endpoint.advertisement).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["--exact", TEST, "--nocapture"]).env(CHILD, "1");
+    endpoint.configure(&mut child);
+    use std::os::unix::process::CommandExt;
+    // SAFETY: only async-signal-safe operations touch the fork child's copies.
+    unsafe {
+        child.pre_exec(move || {
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+            if null < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for fd in ad.pair {
+                if libc::dup2(null, fd) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if !ad.pair.contains(&null) {
+                libc::close(null);
+            }
+            Ok(())
+        });
+    }
+    child.stdout(std::process::Stdio::piped());
+    let mut owner = HeldOwner { child: child.spawn().unwrap(), folder: PathBuf::new() };
+    assert!(owner.ended().expect("retained-original child exceeded its deadline").success());
+    let mut output = String::new();
+    owner.child.stdout.take().unwrap().take(8192).read_to_string(&mut output).unwrap();
+    assert!(output.contains("RETAINED_ORIGINALS_COMPLETE"), "{output}");
+}
+
 pub(super) fn cpu_file() -> (PathBuf, OwnedFd) {
     let path = std::env::temp_dir().join(format!("tjs-cpu-{}", hex(&random().unwrap()[..8])));
     let mut file = std::fs::OpenOptions::new()
@@ -1224,6 +1285,11 @@ fn assert_live(folder: &std::path::Path) {
     );
     let probe = open_folder(folder).unwrap();
     assert!(matches!(try_liveness_lock(probe.as_fd()), Ok(false)), "the owner's lock is not held");
+    let marker = std::fs::OpenOptions::new().read(true).write(true).open(folder.join("l")).unwrap();
+    assert!(
+        matches!(try_liveness_lock(marker.as_fd()), Ok(false)),
+        "the marker is not held locked"
+    );
 }
 
 /// A folder no process owns: mode 0700, the socket an endpoint leaves, and
@@ -1311,6 +1377,62 @@ fn a_folder_whose_owner_was_killed_while_removing_it_goes_too() {
         "the folder that held the marker alone stayed"
     );
     drop(endpoint);
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
+fn a_folder_whose_marker_is_held_locked_stays_while_it_is() {
+    let base = short_base("marklock");
+    // As an owner under another kernel that reports this one's identity, over
+    // NFS: the folder's lock is that kernel's alone and free here, while the
+    // marker's lock is the server's.
+    let held = ownerless_folder(&base, "tjs-00000000000000dd", plain_marker);
+    let marker = std::fs::OpenOptions::new().read(true).write(true).open(held.join("l")).unwrap();
+    assert!(matches!(try_liveness_lock(marker.as_fd()), Ok(true)));
+    let endpoint = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    let mut both = vec![held.clone(), endpoint._directory.path.clone()];
+    both.sort();
+    assert_eq!(entries(&base), both, "the folder whose marker is held locked was removed");
+    drop(marker);
+    let next = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    let mut live = vec![endpoint._directory.path.clone(), next._directory.path.clone()];
+    live.sort();
+    assert_eq!(entries(&base), live, "the folder stayed once its marker was free");
+    drop((endpoint, next));
+    assert_eq!(entries(&base), Vec::<PathBuf>::new());
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
+fn a_folder_its_remover_cannot_empty_keeps_its_marker_until_a_sweep_can() {
+    let base = short_base("full");
+    let endpoint = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    let folder = endpoint._directory.path.clone();
+    // An entry the remover did not make: an NFS client turns the unlink of a
+    // socket still bound, as an owner's exit handler unlinks it, into a rename
+    // to `.nfs…`, which goes only once that socket is closed.
+    let stray = folder.join(".nfs000000000008000c00000004");
+    std::fs::write(&stray, b"").unwrap();
+    drop(endpoint);
+    assert_eq!(
+        entries(&folder),
+        [stray.clone(), folder.join("l")],
+        "the folder its owner could not remove lost its marker"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(folder.join("l")).unwrap()),
+        String::from_utf8_lossy(&own_record(&folder)),
+        "the marker made again does not say where the lock was"
+    );
+    std::fs::remove_file(&stray).unwrap();
+    let next = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    assert_eq!(
+        entries(&base),
+        std::slice::from_ref(&next._directory.path),
+        "the emptied folder stayed"
+    );
+    drop(next);
+    assert_eq!(entries(&base), Vec::<PathBuf>::new());
     std::fs::remove_dir(base).unwrap();
 }
 

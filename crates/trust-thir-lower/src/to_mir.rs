@@ -16414,6 +16414,10 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                             trust_ir::ty::EnumTagEncoding::SingleInhabited { .. } => {
                                                 Some("SingleInhabited")
                                             }
+                                            // Trust: nor does the DirectWithUninhabited encoding.
+                                            trust_ir::ty::EnumTagEncoding::DirectWithUninhabited {
+                                                ..
+                                            } => Some("DirectWithUninhabited"),
                                         };
                                         if let Some(enc) = enc {
                                             why.push(format!(

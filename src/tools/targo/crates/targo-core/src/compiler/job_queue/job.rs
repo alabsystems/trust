@@ -2,9 +2,11 @@
 
 use std::fmt;
 use std::mem;
+use std::sync::Arc;
 
 use super::JobState;
 use crate::compiler::fingerprint::DirtyReason;
+use crate::compiler::unit_source::UnitSource;
 use crate::util::CargoResult;
 
 /// Represents a unit of [`Work`] with a [`Freshness`] for caller
@@ -94,10 +96,27 @@ impl Job {
 
     /// Recheck a planned dirty unit after acquiring its build lock. Another
     /// process may have completed it while this job was queued or waiting.
-    pub fn recheck_after_lock(&mut self, fresh_work: Work, force: bool) {
+    ///
+    /// Trust (DC-24a): where the build names a unit source and the miss
+    /// carries a key, ask the source once, here on the worker, and take what
+    /// it staged where the check then passes.
+    pub(crate) fn recheck_after_lock(
+        &mut self,
+        fresh_work: Work,
+        force: bool,
+        source: Option<Arc<UnitSource>>,
+    ) {
         let dirty_work = mem::replace(&mut self.work, Work::noop());
         self.work = Work::new(move |state| {
-            if state.recheck_freshness(force)? {
+            let recheck = state.recheck_freshness(force, false)?;
+            let taken = recheck.fresh
+                || match (&source, &recheck.miss) {
+                    (Some(source), Some(miss)) => {
+                        crate::compiler::unit_source::offer(state, source, miss, force)?
+                    }
+                    _ => false,
+                };
+            if taken {
                 fresh_work.call(state)
             } else {
                 dirty_work.call(state)

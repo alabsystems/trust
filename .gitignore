@@ -202,6 +202,8 @@ trustdoc-ice-*.txt
 /bootstrap/trust-stage0/dist/**/*.tar
 /bootstrap/trust-stage0/dist/**/*.tar.gz
 /bootstrap/trust-stage0/dist/**/*.tar.xz
+# The key inputs a validated seed records for atpkg's `trust-stage0` tree (DC-16c).
+/bootstrap/trust-stage0/dist/**/.trust-stage0-tree-key
 
 ## SOTA reference implementations (local clones, not committed)
 refs/

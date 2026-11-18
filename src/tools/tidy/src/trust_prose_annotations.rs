@@ -36,8 +36,7 @@ pub fn check(tests_path: &Path, tidy_ctx: TidyCtx) {
     // to pass a narrow path. Walking all of `tests` would reject legitimate
     // rustdoc fixtures whose diagnostic annotations belong on doc comments.
     let trust_ui_path = tests_path.join(TRUST_UI_SUBDIR);
-    let mut check =
-        tidy_ctx.start_check(CheckId::new("trust_prose_annotations").path(&trust_ui_path));
+    let check = tidy_ctx.start_check(CheckId::new("trust_prose_annotations").path(&trust_ui_path));
 
     walk(
         &trust_ui_path,

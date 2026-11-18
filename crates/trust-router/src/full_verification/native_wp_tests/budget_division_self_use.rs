@@ -2,6 +2,7 @@
 //! The original normal compile reported these five authored clauses Unknown.
 //! These controls run their complete caller/callee through Root routing and
 //! independent native WP replay. No source/ABI, SDK, CIC or grade promotion.
+//! Current untrusted envelopes are derived separately; captured bytes stay exact.
 use super::*;
 use crate::full_verification::native_trust_ir::NativeTrustIrEvidenceIndex;
 
@@ -135,7 +136,7 @@ fn capture(index: usize) -> (TrustContractBundle, Vec<TrustObligation>, NativeVe
     }
     let public: TrustContractBundle = serde_json::from_str(capture.bytes[1]).unwrap();
     let all: Vec<TrustObligation> = serde_json::from_str(capture.bytes[2]).unwrap();
-    let native: NativeVerificationBundle = serde_json::from_str(capture.bytes[0]).unwrap();
+    let native = derived_current_native_input(capture.bytes[0]);
     native.validate().unwrap();
     assert_eq!(public.obligations.len(), capture.proofs);
     assert_eq!(all.len(), capture.proofs);

@@ -1029,6 +1029,12 @@ impl Execs {
 
     pub fn env<T: AsRef<OsStr>>(&mut self, key: &str, val: T) -> &mut Self {
         if let Some(ref mut p) = self.process_builder {
+            // A test-authored scheduler advertisement is the subject under
+            // test, including malformed/refused inputs. Do not mask it with
+            // the default fixture's retained-original scheduler overlay.
+            if fixture_scheduler_input(key) {
+                p.clear_jobserver();
+            }
             p.env(key, val);
         }
         self
@@ -1036,6 +1042,9 @@ impl Execs {
 
     pub fn env_remove(&mut self, key: &str) -> &mut Self {
         if let Some(ref mut p) = self.process_builder {
+            if fixture_scheduler_input(key) {
+                p.clear_jobserver();
+            }
             p.env_remove(key);
         }
         self
@@ -1383,7 +1392,9 @@ struct RustcInfo {
 
 impl RustcInfo {
     fn new() -> RustcInfo {
-        let output = ProcessBuilder::new("rustc")
+        let mut command = ProcessBuilder::new("rustc");
+        retain_original_scheduler(&mut command);
+        let output = command
             .arg("-vV")
             .exec_with_output()
             .expect("rustc should exec");
@@ -1438,7 +1449,31 @@ pub fn process<T: AsRef<OsStr>>(bin: T) -> ProcessBuilder {
 fn _process(t: &OsStr) -> ProcessBuilder {
     let mut p = ProcessBuilder::new(t);
     p.cwd(&paths::root()).test_env();
+    retain_original_scheduler(&mut p);
     p
+}
+
+fn retain_original_scheduler(command: &mut ProcessBuilder) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(original) = cargo_util::Jobserver::retain_authenticated_env_handoff()
+        .expect("fixture child requires valid original scheduler transport")
+    {
+        command.inherit_jobserver(&original);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = command;
+}
+
+fn fixture_scheduler_input(key: &str) -> bool {
+    matches!(
+        key,
+        "CARGO_MAKEFLAGS"
+            | "TARGO_MAKEFLAGS"
+            | "MAKEFLAGS"
+            | "MFLAGS"
+            | "CARGO_JOBSERVER_HANDOFF"
+            | "TARGO_JOBSERVER_HANDOFF"
+    )
 }
 
 /// Enable nightly features for testing

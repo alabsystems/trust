@@ -112,7 +112,7 @@ impl Options {
             required_bins: Vec::new(),
             limit: 1,
             retained: false,
-            policy: super::harness_policy::HarnessPolicy::load(workspace, None)?,
+            policy: super::harness_policy::HarnessPolicy::load(workspace, None, None)?,
             weight_refusal: Some("native workload requires its original one-credit phase"),
             workload: Some(self),
         })

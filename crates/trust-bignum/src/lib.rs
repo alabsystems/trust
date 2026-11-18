@@ -74,8 +74,10 @@ extern crate alloc;
 extern crate std;
 
 mod arith;
+mod bits;
 mod decimal;
 mod divmod;
+mod power;
 // I6 / TRUST.md item 9: the five PINNED `trust_bignum_nat_*` C-ABI entry points
 // of the `Nat` trusted handle runtime (the fifth, `_drop`, is the RELEASE entry
 // point ratified in trust-ir `SPEC_RATIFICATIONS` §7 on 2026-09-17). PRIVATE as a Rust module on purpose —

@@ -13,6 +13,7 @@ def _trust_preflight_config_args(argv, invocation_cwd):
     import os
 
     config = None
+    build_dir = None
     overrides = []
     i = 0
     while i < len(argv):
@@ -25,6 +26,12 @@ def _trust_preflight_config_args(argv, invocation_cwd):
             continue
         if arg.startswith("--config="):
             config = arg.split("=", 1)[1]
+        elif arg == "--build-dir" and i + 1 < len(argv):
+            build_dir = argv[i + 1]
+            i += 2
+            continue
+        elif arg.startswith("--build-dir="):
+            build_dir = arg.split("=", 1)[1]
         elif arg == "--set" and i + 1 < len(argv):
             overrides.append(argv[i + 1])
             i += 2
@@ -40,6 +47,8 @@ def _trust_preflight_config_args(argv, invocation_cwd):
         forwarded.extend(["--bootstrap-toml", config])
     for override in overrides:
         forwarded.extend(["--set", override])
+    if build_dir is not None:
+        forwarded.extend(["--build-dir", build_dir])
     return forwarded
 
 

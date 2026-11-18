@@ -1,4 +1,5 @@
-//! Fresh compiler capture of the complete signed-min body and its authored bound.
+//! Archived compiler capture of the complete signed-min body and its authored bound.
+//! Current untrusted envelopes are derived without changing the captured bytes.
 //!
 //! Producer: source 5751de080bb3f83056200c7433d135790204c5f0, normal Bootstrap
 //! stage1 compiler/frontend/daemon, TB1/v2 identity 14f3e31b2fc41dc47f0e841c28fd313e31aefe64.
@@ -41,7 +42,7 @@ fn capture() -> (TrustContractBundle, Vec<TrustObligation>, NativeVerificationBu
     }
     let public: TrustContractBundle = serde_json::from_str(PUBLIC).unwrap();
     let all_requested: Vec<TrustObligation> = serde_json::from_str(REQUESTED).unwrap();
-    let native: NativeVerificationBundle = serde_json::from_str(NATIVE).unwrap();
+    let native = derived_current_native_input(NATIVE);
     native.validate().unwrap();
     assert_eq!(public.obligations.len(), 3);
     assert_eq!(all_requested.len(), 3);

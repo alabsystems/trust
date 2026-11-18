@@ -39,14 +39,15 @@
 //!   compiler makes.
 //!
 //! THE EXCLUSION. Every Cargo build holds its profile's `.cargo-build-lock`
-//! while it compiles, exclusively unless it runs with `-Zfine-grain-locking`,
+//! while it compiles, exclusively unless it runs with fine-grain locking
+//! (`-Zfine-grain-locking` or `build.shared-dependency-cache`),
 //! and the compiler makes, uses and finalizes a crate folder only while the
 //! build that runs it compiles. So while this build holds that lock
 //! exclusively, no other build can have a compile in the profile, nor a unit
 //! compiled and its receipt not yet kept: nothing can start a session in a
 //! folder between the trim's look at it and its removal, and no folder is an
 //! unreceipted one of a build still running. Where the lock is shared
-//! (`-Zfine-grain-locking`), borrowed from a retained original (a continued
+//! (fine-grain locking), borrowed from a retained original (a continued
 //! build) or not taken, another build may be doing both, so the profile is
 //! left as it is (`Left::Shared`); a later build that holds it exclusively
 //! trims it. A build that predates the lock (an older Cargo) takes the
@@ -492,6 +493,7 @@ fn in_use(folder: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::compiler::build_receipt::{Receipt, Root, Selection, Told, UnitUsed};
+    use crate::workspace::profiles::RequestedIncremental;
 
     /// The crate whose units the tests build.
     const CRATE: &str = "receipt_member";
@@ -519,6 +521,10 @@ mod tests {
     fn selection(package: &str) -> Selection {
         Selection {
             compile_time_deps_only: false,
+            incremental: RequestedIncremental {
+                compiles: true,
+                by_default: true,
+            },
             profile: "dev".to_owned(),
             roots: BTreeSet::from([Root {
                 args: Vec::new(),
@@ -1014,7 +1020,7 @@ mod tests {
         };
         let all = [main, branch, "receipt_member-3var000000000", unrelated];
         // Yet a build that does not hold the profile's lock exclusively
-        // (`-Zfine-grain-locking`, a borrowed lock) leaves the profile: another
+        // (fine-grain locking, a borrowed lock) leaves the profile: another
         // build may be compiling in it, or have compiled a unit there whose
         // receipt it has not kept yet.
         let (_, trimmed) = build_holding(dir, "receipt-member", main_fresh(), &[]);

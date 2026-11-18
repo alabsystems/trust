@@ -102,6 +102,8 @@ pub struct BuildRunner<'a, 'gctx> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fixed_gnu: Option<super::resource_gnu_fixed::FixedGnuBridge>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fixed_output_claim: Option<Arc<trust_build_tree::admission::InheritedFixedClaim>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) resource_runtime: Option<Arc<super::resource_runtime::ResourceRuntime>>,
     /// "Primary" packages are the ones the user selected on the command-line
     /// with `-p` flags. If no flags are specified, then it is the defaults
@@ -136,6 +138,10 @@ pub struct BuildRunner<'a, 'gctx> {
     pub lock_manager: Arc<LockManager>,
     // Trust: original executor decisions plus the reserved rebuild closure.
     pub(super) lease_forces: Option<HashMap<Unit, bool>>,
+    /// Trust (DC-24a): the force each unit of the selected graph was asked
+    /// for (the executor's, or `--force` for a root), before the lease adds
+    /// its writers. A staged unit's check uses it.
+    pub(super) requested_forces: Option<HashMap<Unit, bool>>,
     // Trust: compilation leases retire independently from the test action
     // owners and jobserver that continue to live in this runner.
     compilation_cache_lease: Option<CacheLock<'gctx>>,
@@ -213,6 +219,34 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             Arc<super::resource_runtime::ResourceRuntime>,
         >,
     ) -> CargoResult<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let fixed_output_claim = if let Some(claim) = bcx.gctx.fixed_admission()? {
+            if claim.has_original_output_member()? {
+                // Cwd membership cannot answer for --manifest-path or a
+                // workspace-selected root package. Check the ACTUAL selected
+                // source manifests, independently of output selection.
+                for manifest in std::iter::once(bcx.ws.root_manifest())
+                    .chain(bcx.roots.iter().map(|unit| unit.pkg.manifest_path()))
+                {
+                    Self::check_fixed_source_manifest(claim, manifest)?;
+                }
+            }
+            if claim.original_output_cwd()?.is_some() {
+                // Both resolved output selections are prepared through the
+                // original member FD BEFORE ordinary Layout can create files.
+                // The SAME claim Arc retains them through compiler quiescence;
+                // Existing queue checks and the post-retirement bookend
+                // revalidate the same retained original target population.
+                claim
+                    .retain_original_output_directory(&bcx.ws.target_dir().into_path_unlocked())?;
+                claim.retain_original_output_directory(&bcx.ws.build_dir().into_path_unlocked())?;
+                Some(claim.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut compilation = Compilation::new(bcx)?;
         let verified_rustdoc_launcher = compilation.verified_rustdoc_launcher();
 
@@ -316,6 +350,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             fixed_gnu,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
+            fixed_output_claim,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             resource_runtime,
             primary_packages: HashSet::default(),
             files: None,
@@ -326,6 +362,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             unused_dep_state: UnusedDepState::new(bcx),
             lock_manager: Arc::new(LockManager::new()),
             lease_forces: None,
+            requested_forces: None,
             compilation_cache_lease: None,
             compilation_lease_state: CompilationLeaseState::Active,
             // Trust: DC-12a, set by the job queue as it finishes compilation.
@@ -344,6 +381,46 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             continued_inputs: None,
         })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn check_fixed_source_manifest(
+        claim: &trust_build_tree::admission::InheritedFixedClaim,
+        manifest: &Path,
+    ) -> CargoResult<()> {
+        let source = manifest
+            .parent()
+            .context("selected source manifest has no parent")?;
+        let metadata = std::fs::symlink_metadata(manifest)?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "fixed output continuation requires its actual ordinary source manifest"
+        );
+        if let Some(directory) = claim.retain_existing_output_source_directory(source)? {
+            claim.check_output_source_file(
+                &directory,
+                manifest
+                    .file_name()
+                    .context("selected source manifest has no filename")?,
+            )?;
+            return Ok(());
+        }
+        // Resolve THIS selected workspace/package, not the frontend's cwd.
+        // An outside source is eligible only under its exact already-held
+        // original worktree. Dependency source/currency keeps its existing
+        // source-input owner; this check manufactures no source seal.
+        let repository = git2::Repository::discover(source)
+            .context("selected source is outside its original output member and worktree")?;
+        let workdir = repository
+            .workdir()
+            .context("selected source worktree has no physical root")?;
+        anyhow::ensure!(
+            source.canonicalize()?.starts_with(workdir.canonicalize()?),
+            "selected source is outside its actual original worktree mapping"
+        );
+        let worktree = repository.path().canonicalize()?.join("build-slot.lock");
+        claim.check_nested(claim.budget()?, Some(&worktree), false)?;
+        Ok(())
     }
 
     pub(super) fn native_resources(&self) -> bool {
@@ -618,7 +695,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         // selected unit read locks must precede that first observation; locking
         // a child only when compile() later visits it leaves fresh parents stale
         // if its previous producer finishes while this graph waits for the lock.
-        if self.bcx.gctx.cli_unstable().fine_grain_locking {
+        if self.bcx.fine_grain_locking {
             let leases = Arc::clone(&self.lock_manager);
             leases.lock_selected_graph(self, exec.as_ref())?;
         }
@@ -665,6 +742,9 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn check_fixed_gnu(&self) -> CargoResult<()> {
+        if let Some(original) = &self.fixed_output_claim {
+            original.check_current()?;
+        }
         if let Some(bridge) = &self.fixed_gnu {
             bridge.check()?;
         }
@@ -679,6 +759,11 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 "inherited GNU credits remain outstanding after actual worker join"
             );
             bridge.check()?;
+        }
+        // A failed name/target bookend cannot prevent returning actual GNU
+        // credits first. Success is unavailable until original targets agree.
+        if let Some(original) = &self.fixed_output_claim {
+            original.check_current()?;
         }
         Ok(())
     }
@@ -894,8 +979,11 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             .roots
             .iter()
             .map(|unit| {
-                let mut features: Vec<String> =
-                    unit.features.iter().map(|feature| feature.to_string()).collect();
+                let mut features: Vec<String> = unit
+                    .features
+                    .iter()
+                    .map(|feature| feature.to_string())
+                    .collect();
                 features.sort();
                 features.dedup();
                 let flags: &[String] = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
@@ -932,6 +1020,9 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         };
         Some(Selection {
             compile_time_deps_only: bcx.build_config.compile_time_deps_only,
+            // Trust: DC-12e. A build with incremental compilation off is not
+            // the same selection as one with it on.
+            incremental: bcx.profiles.requested_incremental(),
             profile: bcx.build_config.requested_profile.to_string(),
             roots,
             workspace: bcx.ws.root().to_str()?.to_owned(),
@@ -1088,11 +1179,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         for unit in units_with_build_script {
             for dep in &self.bcx.unit_graph[unit] {
                 if dep.unit.mode.is_run_custom_build() {
-                    let out_dir = if self.bcx.gctx.cli_unstable().build_dir_new_layout {
-                        self.files().out_dir_new_layout(&dep.unit)
-                    } else {
-                        self.files().build_script_out_dir(&dep.unit)
-                    };
+                    let out_dir = custom_build::script_out_dir(self, &dep.unit);
                     let script_meta = self.get_run_build_script_metadata(&dep.unit);
                     self.compilation
                         .extra_env
@@ -1402,12 +1489,14 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         let continued = self.continued_outputs.as_ref();
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let continued = None;
+        // Trust (DC-17a): the build directory lock is shared only under the
+        // build's fine-grain locking, given by its flag or by the cache key.
         let layouts = layouts::PreparedLayouts::acquire(
             self.bcx.ws,
             &self.bcx.all_kinds,
             &dest,
             must_take_artifact_dir_lock,
-            self.workload_outputs,
+            self.workload_outputs || !self.bcx.fine_grain_locking,
             continued,
         )?;
         let host_layout = layouts.host;
@@ -1422,7 +1511,178 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
 
         let files = CompilationFiles::new(self, host_layout, targets)?;
         self.files = Some(files);
+        self.plan_member_slots()?;
         Ok(())
+    }
+
+    /// Trust (DC-18b): names each shared member's store slot, dependencies
+    /// first, by what it is built from, its prepared command included
+    /// (`CompilationFiles::member_slot_name`). The command names the slot,
+    /// so it is prepared once in a planning directory beside the slots of
+    /// its package (the same directories above it, which its sandbox profile
+    /// lists), with the slot read as a token; that directory is then removed.
+    fn plan_member_slots(&mut self) -> CargoResult<()> {
+        let bcx = self.bcx;
+        if bcx.shared_member_units.is_empty() {
+            return Ok(());
+        }
+        let platform = bcx
+            .action_platform
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("shared member has no platform identity"))?
+            .digest()
+            .to_string();
+        let compiler: String = bcx
+            .rustc()
+            .full_content_identity(false)
+            .ok_or_else(|| anyhow::anyhow!("shared member has no compiler content identity"))?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut members: Vec<&Unit> = bcx.shared_member_units.iter().collect();
+        members.sort();
+        let mut order = Vec::new();
+        let mut seen = HashSet::default();
+        let mut pending: Vec<(&Unit, bool)> = members
+            .into_iter()
+            .rev()
+            .map(|unit| (unit, false))
+            .collect();
+        while let Some((unit, expanded)) = pending.pop() {
+            if expanded {
+                order.push(unit.clone());
+                continue;
+            }
+            if !seen.insert(unit.clone()) {
+                continue;
+            }
+            pending.push((unit, true));
+            for dep in &bcx.unit_graph[unit] {
+                if bcx.shared_member(&dep.unit) && !seen.contains(&dep.unit) {
+                    pending.push((&dep.unit, false));
+                }
+            }
+        }
+        for unit in &order {
+            let planned = self
+                .files()
+                .member_slot(unit)
+                .ok_or_else(|| anyhow::anyhow!("shared member has no planned slot"))?
+                .dir
+                .clone();
+            // A member whose keyed inputs cannot be read whole (a link in its
+            // `OUT_DIR`, say) is private for this process.
+            let inputs = match self.member_inputs(unit) {
+                Ok(inputs) => inputs.map(Arc::new),
+                Err(error) => {
+                    tracing::debug!("member inputs cannot be read: {error:#}");
+                    return Err(bcx.shared_eligibility.recorder(unit)?.refuse_for_now(
+                        crate::util::log_message::SharedDependencyExclusion::MemberInputsMoved,
+                    ));
+                }
+            };
+            // Trust (DC-18c): a member whose script has not run in this
+            // checkout, or whose proc macro is not built, cannot be named
+            // yet, nor can a member that depends on it. Its slot waits, under
+            // a name of this process's, which its job refuses and the attempt
+            // removes; the build is then planned again with the inputs there.
+            let waiting = inputs.as_ref().is_some_and(|inputs| !inputs.complete())
+                || bcx.unit_graph[unit].iter().any(|dep| {
+                    bcx.shared_member(&dep.unit)
+                        && self
+                            .files()
+                            .member_slot(&dep.unit)
+                            .is_some_and(|slot| slot.waiting)
+                });
+            let named = (|| -> CargoResult<compilation_files::MemberSlot> {
+                let (command, ..) = super::prepare_rustc(self, unit)?;
+                let command = super::action_command::CommandInputs::capture_relocated(
+                    &command,
+                    bcx.ws.root(),
+                    &planned,
+                )?
+                .digest()
+                .to_string();
+                let name = self.files().member_slot_name(
+                    unit,
+                    bcx,
+                    (&platform, &compiler),
+                    &command,
+                    inputs.as_deref().map(|inputs| inputs.digest()),
+                )?;
+                let parent = planned
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("a planned slot has no parent"))?;
+                let dir = if waiting {
+                    let dir = parent.join(format!(
+                        ".waiting-{}-{}",
+                        std::process::id(),
+                        compiler::shared_dependencies::member_key(unit)
+                    ));
+                    compiler::shared_dependencies::waiting_slot(dir.clone());
+                    dir
+                } else {
+                    parent.join(name)
+                };
+                Ok(compilation_files::MemberSlot {
+                    dir,
+                    command,
+                    inputs,
+                    waiting,
+                })
+            })();
+            // The planning directory held nothing but the empty directories
+            // the command's preparation made.
+            if let Err(error) = std::fs::remove_dir_all(&planned)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::debug!("could not remove {}: {error}", planned.display());
+            }
+            let named = named?;
+            self.files.as_mut().unwrap().name_member_slot(unit, named);
+        }
+        Ok(())
+    }
+
+    /// Trust (DC-18c): what a shared member is keyed on in this checkout,
+    /// read as it is now: the stdout of every build-script run whose output
+    /// is laid over its command, its own scripts' `OUT_DIR`, and the library
+    /// of each proc macro it loads. `None` for a member with none.
+    fn member_inputs(
+        &self,
+        unit: &Unit,
+    ) -> CargoResult<Option<compiler::shared_dependencies::MemberInputs>> {
+        let mut scripts = Vec::new();
+        for script in compiler::shared_dependencies::overlay_scripts(&self.bcx.unit_graph, unit) {
+            let own = script.pkg.package_id() == unit.pkg.package_id();
+            scripts.push((
+                format!("{}:{}", script.pkg.name(), self.files().unit_hash(&script)),
+                custom_build::script_stdout(self, &script),
+                own.then(|| custom_build::script_out_dir(self, &script)),
+            ));
+        }
+        let mut macros = Vec::new();
+        for dep in &self.bcx.unit_graph[unit] {
+            if self.bcx.keyed_dependency(unit, &dep.unit) && dep.unit.target.proc_macro() {
+                for output in self.outputs(&dep.unit)?.iter() {
+                    // The library `--extern` names (`extern_args`).
+                    if output.flavor == FileFlavor::Linkable {
+                        macros.push((
+                            format!(
+                                "{}:{}",
+                                dep.extern_crate_name,
+                                self.files().unit_hash(&dep.unit)
+                            ),
+                            output.path.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        if scripts.is_empty() && macros.is_empty() {
+            return Ok(None);
+        }
+        compiler::shared_dependencies::MemberInputs::capture(scripts, macros).map(Some)
     }
 
     /// Prepare this context, ensuring that all filesystem directories are in

@@ -10,9 +10,37 @@ machine is never driven to load 100 with no free memory, where every build crawl
     build-slot --wait-timeout 180 -- targo --unverified test -p ay-dpll
     build-slot --exclusive --wait-timeout 1800 -- <quiet-window command>
     build-slot adopt <existing-direct-job-pid>
+    build-slot --rank release --claim-key trust-train:mint --wide -- <command>
     build-slot status
 
-What it does:
+One admission authority on aterm hosts (not yet in effect on any host):
+  * When this host's aterm answers `aterm pkg claim --capabilities` with
+    aterm-claim-exec-v1 (found as BUILD_SLOT_ATERM_CLI, else `aterm` on PATH),
+    a fresh admission is exactly one claim in aterm's capacity ledger, held for
+    the command's whole process tree. No slot, FIFO ticket, epoch fence or
+    borrowed share is taken, so nothing is held while that claim waits, and the
+    targo builds it covers claim nothing again. The command gets the ledger's
+    core grant as CARGO_BUILD_JOBS, TARGO_PLANNED_JOBS and TARGO_CALLER_JOBS.
+    No released aterm has that verb yet (2026-11-17), so every host still
+    admits through the slot pool below; docs/BUILD_SLOT.md has the contract.
+  * --rank ordinary|release (default ordinary) and --claim-key K name the
+    claim's rank and the key whose measured peak sizes its memory claim
+    (default: one key per program and checkout). --cpus N asks for N cores;
+    --wide asks for the host's; otherwise the claim asks for one pool share.
+    --mem-gb (or BUILD_SLOT_MEM_GB) is the memory claimed; without either the
+    ledger sizes it from the key's measured peak. --exclusive is one ALONE
+    claim under which build-slot's own quiet-machine wait runs before the
+    command. --wait-timeout bounds the whole ledger wait. The verb takes the
+    per-worktree lock together with its admission, so a waiting claim holds
+    neither capacity nor the worktree.
+  * Where aterm is absent or answers that it has no such verb (exit 2), the
+    slot pool below admits, after one stderr line saying why. Any other answer
+    (a timeout, another exit, another reply) refuses: the authority is unknown,
+    and nothing is started. `adopt` refuses where the ledger admits.
+    `status` names the authority. `build-slot --capabilities` answers
+    build-slot-claim-v1: this copy takes --rank, --claim-key and --wide.
+
+The slot pool, where the ledger is unavailable:
   * At most --slots heavy jobs run at once, machine-wide. The default is one per 6
     CPUs, overridable with BUILD_SLOTS.
   * A job starts only while at least --mem-gb GiB is available (free + inactive +
@@ -42,7 +70,8 @@ What it does:
     immediately; old CPU-first callers therefore cannot form a mixed-order deadlock.
   * --cpus N atomically reserves the matching shared slots and grants N CPUs.
     Smaller explicit caller caps are retained; adopted jobs cannot be resized.
-    An exclusive command defaults to the whole host CPU budget.
+    An exclusive command defaults to the whole host CPU budget. --wide is the
+    uncapped default here: borrowing below.
   * The child gets CARGO_BUILD_JOBS bounded by its share of the CPUs. A smaller
     positive caller request is preserved; a larger one is capped, and malformed
     requests refuse before admission.
@@ -86,6 +115,7 @@ The exit status is the command's own; 128+N if it was killed by signal N.
 """
 import errno
 import fcntl
+import hashlib
 import importlib.util
 import json
 import math
@@ -93,6 +123,7 @@ import os
 import pwd
 
 import re
+import select
 import shutil
 import signal
 import stat
@@ -109,10 +140,34 @@ MEASURED_NCPU = os.cpu_count()
 NCPU = MEASURED_NCPU or 4
 QUIET_LOAD_FRACTION = 0.35
 QUIET_SECONDS = 10.0
+# What this copy answers to `--capabilities`: it takes --rank, --claim-key and --wide.
+CLAIM_WORDS_PROTOCOL = "build-slot-claim-v1"
+# What an aterm whose capacity ledger can hold build-slot's one claim answers.
+LEDGER_CLAIM_PROTOCOL = "aterm-claim-exec-v1"
+RANKS = ("ordinary", "release")
+CLAIM_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
+# The bound on `aterm pkg claim --capabilities`. Under a load of 96 on 36 cores a
+# process start can take seconds; past this the authority is unknown and refuses.
+LEDGER_PROBE_SECONDS = 30.0
+# How long past its --wait-ms the verb has to answer before build-slot stops it.
+LEDGER_ANSWER_GRACE = 30.0
+# How long a stopped verb's group has to exit after TERM before KILL.
+LEDGER_STOP_GRACE = 10.0
+# Clean's heavy_gate retries a coordinated attempt that found no room: first after
+# 0.1 s, doubling to this, so a busy machine is not asked ten times a second.
+MEMORY_RETRY_MAX = 2.0
 
 
 class AdmissionTimeout(Exception):
     pass
+
+
+class LedgerUnavailable(Exception):
+    """No aterm here, or one without the verb: the slot pool admits (one stderr line)."""
+
+
+class LedgerRefused(Exception):
+    """aterm answered the probe otherwise: which authority admits is unknown, so nothing starts."""
 
 
 class AdmissionUnavailable(Exception):
@@ -199,6 +254,10 @@ def coordinate_memory(options, wrapper):
     reexec = _REEXEC or [sys.executable, "-I", "-B", os.path.abspath(__file__)]
     interrupted = None
     child = None
+    # The pool orders attempts by this registry arrival; aterm's ledger by the
+    # wall-clock arrival, so a retried look keeps its place among the claims.
+    since_ms = time.time_ns() // 1_000_000
+    delay = 0.1
     with admission_registry() as directory:
         live = [int(name[5:]) for name in os.listdir(directory)
                 if name.startswith("wait-") and name[5:].isdigit()]
@@ -220,7 +279,7 @@ def coordinate_memory(options, wrapper):
                 if interrupted is not None:
                     return 128 + interrupted
                 command = [*prefix, "--", *reexec, "--_memory-attempt", str(writer), str(arrival),
-                           *options, "--", *payload]
+                           "--_memory-since-ms", str(since_ms), *options, "--", *payload]
                 child = subprocess.Popen(
                     command, start_new_session=True,
                     pass_fds=sorted({writer, *inherited_resource_fds(os.environ)}))
@@ -250,8 +309,11 @@ def coordinate_memory(options, wrapper):
                 return 2
             if rc != 75 or marker != b"W":
                 return 128 - rc if rc < 0 else rc
-            # heavy_gate has already released memory before this retry.
-            time.sleep(0.1)
+            # heavy_gate has already released memory before this retry. Each
+            # attempt starts heavy_gate, build-slot and (on a ledger host) two
+            # aterm processes, so a long wait backs off to MEMORY_RETRY_MAX.
+            time.sleep(delay)
+            delay = min(MEMORY_RETRY_MAX, delay * 2)
         return 128 + interrupted
     finally:
         for sig, handler in previous.items():
@@ -267,40 +329,52 @@ class CpuBridgeUnavailable(ValueError):
     pass
 
 
-def worker_command(cmd):
-    """Return the mandatory native invocation for the exact supported shape."""
-    if not cmd or os.path.basename(cmd[0]) != "targo":
+def worker_invocation(cmd):
+    """Split only a direct Targo or its exact native, unplaced shim front."""
+    if not cmd:
         return None
-    args = list(cmd[1:])
+    front = (os.path.basename(cmd[0]) == "atpkg"
+             and (list(cmd[1:2]) == ["__build_admit"]
+                  or list(cmd[1:3]) == ["--private-state-root", "__build_admit"]))
+    if front:
+        if (len(cmd) < 6
+                or list(cmd[1:5]) != ["__build_admit", "--shim", "targo", "-"]
+                or not os.path.isabs(cmd[5])
+                or os.path.basename(cmd[5]) != "targo"):
+            raise CpuBridgeUnavailable("unsupported native Targo shim-front shape; no command was started")
+        prefix, args = list(cmd[:6]), list(cmd[6:])
+    elif os.path.basename(cmd[0]) == "targo":
+        prefix, args = list(cmd[:1]), list(cmd[1:])
+    else:
+        return None
     if args[:1] == ["--resource-worker-v2"]:
         args = args[1:]
-    if (len(args) < 2 or args[0] != "--unverified"
-            or args[1] not in ("build", "check", "test")
-            or "--resource-worker-v2" in args):
+    # Targo's native parser owns the whole invocation, including globals,
+    # aliases and harness data. A second spelling parser here silently routed
+    # valid global-config compile commands into fixed admission. Query the
+    # original words; only its strict reply decides support or refusal.
+    return prefix, args
+
+
+def worker_command(cmd):
+    """Install one mandatory worker flag after the same supported native front."""
+    invocation = worker_invocation(cmd)
+    if invocation is None:
         return None
-    return [cmd[0], "--resource-worker-v2", *args]
+    prefix, args = invocation
+    return [*prefix, "--resource-worker-v2", *args]
 
 
-def worker_capability(cmd, observation=None):
-    """True=supported, False=explicitly unsupported; failed discovery refuses.
-
-    Probe only the selected Targo entrypoint; never unwrap or parse a shim.
-    An absent/invalid reply is not evidence authorizing fixed admission.
-    The optional observer retains the exact completed probe for SDK surface
-    receipts. It changes neither decoding nor admission and grants no resources.
-    """
-    native = worker_command(cmd)
-    if native is None:
-        return False
-    program = shutil.which(cmd[0])
-    if not program:
-        raise CpuBridgeUnavailable("selected Targo capability program is unavailable")
+def bounded_native_query(query, *, timeout=2, limit=8192, observation=None,
+                         purpose="capability discovery"):
+    """Bound both streams and retain the original child group through its reap."""
+    program = query[0]
     # An invalid transport is a refusal, never a reason to downgrade to fixed
     # admission after the selected frontend's capability could not be queried.
     passed = inherited_resource_fds(os.environ)
     observe_exit = original_child_exit_observer()
     if observe_exit is None:
-        raise CpuBridgeUnavailable("capability discovery cannot retain its original child group")
+        raise CpuBridgeUnavailable("native discovery cannot retain its original child group")
     child = None
     reaped = False
     output = bytearray()
@@ -310,22 +384,11 @@ def worker_capability(cmd, observation=None):
         detail = diagnostic.decode("utf-8", errors="replace")
         reply = output.decode("utf-8", errors="replace")
         return CpuBridgeUnavailable(
-            f"selected Targo {program!r} capability discovery {reason}; "
+            f"selected Targo {program!r} {purpose} {reason}; "
             f"stdout={reply!r}; stderr={detail!r}; no command was started")
 
-    def capability_object(pairs):
-        value = {}
-        for key, entry in pairs:
-            if key in value:
-                raise ValueError("duplicate capability response field")
-            value[key] = entry
-        return value
-
     try:
-        # Every command must prove its configured compiler cohort before
-        # native epoch admission; a Targo/platform-only response is insufficient.
-        query = [program, "--resource-capabilities", "--", *native[2:]]
-        end = time.monotonic() + 2
+        end = time.monotonic() + timeout
         child = subprocess.Popen(query, start_new_session=True,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, pass_fds=passed)
@@ -340,12 +403,12 @@ def worker_capability(cmd, observation=None):
                 if label in eof:
                     continue
                 try:
-                    part = os.read(stream.fileno(), min(4096, 8193 - len(buffer)))
+                    part = os.read(stream.fileno(), min(4096, limit + 1 - len(buffer)))
                 except BlockingIOError:
                     continue
                 if part:
                     buffer.extend(part)
-                    if len(buffer) > 8192:
+                    if len(buffer) > limit:
                         raise refused(f"exceeded its {label} bound")
                 else:
                     eof.add(label)
@@ -358,25 +421,7 @@ def worker_capability(cmd, observation=None):
                 reaped = True
                 if observation is not None:
                     observation(query, child.returncode, bytes(output), bytes(diagnostic))
-                if child.returncode != 0:
-                    raise refused(f"exited with status {child.returncode}")
-                value = json.loads(output, object_pairs_hook=capability_object)
-                if (isinstance(value, dict)
-                        and set(value) == {"version", "cpu_workers", "supports_invocation", "runtime_refusal"}
-                        and type(value["version"]) is int and value["version"] == 3
-                        and value["cpu_workers"] is True
-                        and value["supports_invocation"] is True
-                        and isinstance(value["runtime_refusal"], str)
-                        and value["runtime_refusal"]):
-                    raise CpuBridgeUnavailable(value["runtime_refusal"])
-                if (not isinstance(value, dict)
-                        or set(value) != {"version", "cpu_workers", "supports_invocation"}
-                        or type(value["version"]) is not int or value["version"] != 3
-                        or type(value["cpu_workers"]) is not bool
-                        or type(value["supports_invocation"]) is not bool
-                        or (value["supports_invocation"] and not value["cpu_workers"])):
-                    raise refused("returned an invalid capability response")
-                return value["cpu_workers"] and value["supports_invocation"]
+                return child.returncode, bytes(output), bytes(diagnostic)
             time.sleep(0.01)
         raise refused("timed out")
     except CpuBridgeUnavailable:
@@ -390,6 +435,62 @@ def worker_capability(cmd, observation=None):
                 child.wait()
             child.stdout.close()
             child.stderr.close()
+
+def worker_capability(cmd, observation=None):
+    """Query the selected invocation through its bounded original-group owner."""
+    invocation = worker_invocation(cmd)
+    if invocation is None:
+        return False
+    prefix, args = invocation
+    program = shutil.which(cmd[0])
+    if not program:
+        raise CpuBridgeUnavailable("selected Targo capability program is unavailable")
+    # The qualified front retains trust.lock selection and cache observation.
+    # Never query its SDK target directly or move its prefix behind the query.
+    query = [program, *prefix[1:], "--resource-capabilities", "--", *args]
+    status, output, diagnostic = bounded_native_query(query, observation=observation)
+
+    def refused(reason):
+        return CpuBridgeUnavailable(
+            f"selected Targo {program!r} capability discovery {reason}; "
+            f"stdout={output.decode('utf-8', errors='replace')!r}; "
+            f"stderr={diagnostic.decode('utf-8', errors='replace')!r}; no command was started")
+
+    def capability_object(pairs):
+        value = {}
+        for key, entry in pairs:
+            if key in value:
+                raise ValueError("duplicate capability response field")
+            value[key] = entry
+        return value
+
+    try:
+        if status != 0:
+            raise refused(f"exited with status {status}")
+        value = json.loads(output, object_pairs_hook=capability_object)
+        if (isinstance(value, dict)
+                and set(value) == {"version", "cpu_workers", "supports_invocation", "runtime_refusal"}
+                and type(value["version"]) is int and value["version"] == 3
+                and value["cpu_workers"] is True
+                and value["supports_invocation"] is True
+                and isinstance(value["runtime_refusal"], str)
+                and value["runtime_refusal"]):
+            raise CpuBridgeUnavailable(value["runtime_refusal"])
+        if (not isinstance(value, dict)
+                or set(value) != {"version", "cpu_workers", "supports_invocation"}
+                or type(value["version"]) is not int or value["version"] != 3
+                or type(value["cpu_workers"]) is not bool
+                or type(value["supports_invocation"]) is not bool
+                or (value["supports_invocation"] and not value["cpu_workers"])):
+            raise refused("returned an invalid capability response")
+        supported = value["cpu_workers"] and value["supports_invocation"]
+        if len(prefix) > 1 and not supported:
+            raise refused("does not support this native shim-front invocation")
+        return supported
+    except CpuBridgeUnavailable:
+        raise
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        raise refused(f"failed ({type(error).__name__}: {error})") from error
 
 
 def cpu_capacity_directory():
@@ -784,15 +885,454 @@ def resource_command(cmd, env):
         return unavailable("runner unavailable")
     # Resolve @self through aterm's authenticated control context: inherited
     # session-id strings can be stale after adoption or a live app handoff.
-    # Job labels contain no command arguments, which may carry credentials.
+    print("build-slot: routing admitted job through aterm resource-run", file=sys.stderr, flush=True)
+    return [runner, "resource-run", "--session", "@self", "--job", job_label(cmd), "--", *cmd]
+
+
+def job_label(cmd):
+    """Display metadata for aterm: no command arguments, which may carry credentials."""
     label = f"{os.path.basename(os.getcwd()) or '/'}: {os.path.basename(cmd[0])}"
     # Native paths may contain arbitrary bytes or controls, and both basenames
     # can exceed the host's 200-byte UTF-8 label limit. Normalize only display
-    # metadata; the exact command below keeps every original argument.
+    # metadata; the exact command keeps every original argument.
     label = "".join(char if char.isprintable() else "?" for char in label).strip()
-    label = label.encode("utf-8")[:200].decode("utf-8", errors="ignore")
-    print("build-slot: routing admitted job through aterm resource-run", file=sys.stderr, flush=True)
-    return [runner, "resource-run", "--session", "@self", "--job", label, "--", *cmd]
+    return label.encode("utf-8")[:200].decode("utf-8", errors="ignore")
+
+
+def ledger_discovery(env):
+    """The aterm whose capacity ledger admits fresh work here.
+
+    Found as resource_command finds aterm, but in or outside an aterm session:
+    the ledger is the account's, and the targo builds a job starts claim in it
+    wherever they run. Only two answers select the slot pool (LedgerUnavailable):
+    no aterm at all, and an aterm without the verb, which refuses `claim` as an
+    unknown verb with exit 2 and acts on nothing. Every other answer (a timeout,
+    another exit, another reply) leaves the authority unknown (LedgerRefused):
+    under load the authority must not change from one call to the next.
+    """
+    if "BUILD_SLOT_ATERM_CLI" in env:
+        cli = env["BUILD_SLOT_ATERM_CLI"]
+        if not os.path.isabs(cli):
+            raise LedgerRefused("BUILD_SLOT_ATERM_CLI is not an absolute path")
+        if not os.path.lexists(cli):
+            raise LedgerUnavailable("BUILD_SLOT_ATERM_CLI names no file: no aterm")
+        if not os.path.isfile(cli) or not os.access(cli, os.X_OK):
+            raise LedgerRefused("BUILD_SLOT_ATERM_CLI is not an executable file")
+    else:
+        cli = shutil.which("aterm", path=env.get("PATH"))
+        if cli is None:
+            raise LedgerUnavailable("aterm executable absent")
+    try:
+        status, output, _ = bounded_native_query(
+            [cli, "pkg", "claim", "--capabilities"], timeout=LEDGER_PROBE_SECONDS, limit=4096,
+            purpose="capacity ledger discovery")
+    except CpuBridgeUnavailable as error:
+        raise LedgerRefused(f"`aterm pkg claim --capabilities` did not answer: {error}") from error
+    if status == 2:
+        raise LedgerUnavailable(f"`aterm pkg claim --capabilities` exited 2: "
+                                f"this aterm lacks {LEDGER_CLAIM_PROTOCOL}")
+    expected = LEDGER_CLAIM_PROTOCOL.encode()
+    if status != 0 or output not in (expected, expected + b"\n"):
+        raise LedgerRefused(f"`aterm pkg claim --capabilities` exited {status} and answered "
+                            f"{output[:80].decode('utf-8', errors='replace')!r}, "
+                            f"not {LEDGER_CLAIM_PROTOCOL}")
+    return cli
+
+
+def admission_ledger():
+    """The ledger CLI for a fresh admission; None after one stderr line; LedgerRefused propagates."""
+    try:
+        return ledger_discovery(os.environ)
+    except LedgerUnavailable as missing:
+        print(f"build-slot: aterm capacity ledger unavailable ({missing}); "
+              "admitting through the build-slot pool", file=sys.stderr, flush=True)
+        return None
+
+
+def print_admission_authority():
+    """`status`'s last line: which authority admits a fresh build-slot command here."""
+    try:
+        ledger = ledger_discovery(os.environ)
+    except LedgerUnavailable as missing:
+        print(f"admission: fresh commands take this pool (aterm capacity ledger unavailable: {missing})")
+        return
+    except (LedgerRefused, NamespaceError) as unknown:
+        print(f"admission: unknown, so fresh commands are refused ({unknown})")
+        return
+    if ledger is None:
+        print("admission: fresh commands take this pool")
+    else:
+        print("admission: fresh commands claim in aterm's capacity ledger; `aterm pkg capacity` "
+              "shows them. Slots here are held only by older build-slot copies, adopted jobs "
+              "and native slot users, which that ledger counts as held cores")
+
+
+def checkout_directory():
+    """The worktree a claim builds in, for the ledger's view and memory book."""
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return os.getcwd()
+    path = top.stdout.strip()
+    return os.path.realpath(path) if top.returncode == 0 and os.path.isabs(path) else os.getcwd()
+
+
+def default_claim_key(cmd, checkout):
+    """One stable book key per program and checkout, never per argument list.
+
+    aterm sizes a claim that names no memory from the measured peak booked under
+    its key. A key that changed with every argv would never gather that history,
+    and every such claim would stay at the ledger's cold figure.
+    """
+    digest = hashlib.sha256(os.fsencode(checkout)).hexdigest()
+    name = re.sub(r"[^A-Za-z0-9._+-]", "_", os.path.basename(cmd[0]))[:64] or "command"
+    return f"build-slot:{name}:{digest[:16]}"
+
+
+def ledger_argv(cli, *, label, key, checkout, rank, memory_bytes, cores, alone,
+                worktree_fd, wait_ms, once, since_ms, status_fd):
+    """The verb's words for one covering claim; the command follows its `--`."""
+    argv = [cli, "pkg", "claim", "--what", label, "--key", key, "--checkout", checkout,
+            "--rank", rank, "--cores", str(cores)]
+    if memory_bytes is not None:
+        argv += ["--mem-bytes", str(memory_bytes)]
+    if alone:
+        # No other claim or held pool slot beside it; build-slot's own quiet
+        # wait then runs under the claim before the command (ledger_quiet_exec).
+        argv.append("--alone")
+    if worktree_fd is not None:
+        # The worktree lock is taken in the same look that admits, never held
+        # while the claim waits, and kept by the command across its exec.
+        argv += ["--flock-fd", str(worktree_fd)]
+    if once:
+        argv.append("--no-wait")
+        if since_ms is not None:
+            argv += ["--since-ms", str(since_ms)]
+    elif wait_ms is not None:
+        argv += ["--wait-ms", str(wait_ms)]
+    return [*argv, "--status-fd", str(status_fd), "--"]
+
+
+def ledger_event(raw, cores):
+    """The verb's one admission record; anything else is a protocol refusal."""
+    record = decode_admission_record(raw)
+    event = record.get("event")
+    keys = ({"v", "event", "cores", "mem_bytes", "rank", "marker"} if event == "admitted"
+            else {"v", "event", "cores", "marker"} if event == "covered" else None)
+    if keys is None or set(record) != keys:
+        raise ValueError("not an admitted or covered record")
+    if type(record["v"]) is not int or record["v"] != 1:
+        raise ValueError("unsupported record version")
+    if type(record["cores"]) is not int or not 1 <= record["cores"] <= cores:
+        raise ValueError(f"grant {record['cores']!r} is not 1 to the {cores} cores asked for")
+    if not isinstance(record["marker"], str) or not record["marker"]:
+        raise ValueError("no cover marker")
+    if event == "admitted" and (type(record["mem_bytes"]) is not int or record["mem_bytes"] < 0
+                                or record["rank"] not in RANKS):
+        raise ValueError("invalid memory or rank")
+    return record
+
+
+def wait_until_quiet(mem_gib, check_deadline, wait, say):
+    """Exclusive admission's host readiness: measured memory, a quiet load and no compiler
+    for QUIET_SECONDS. The pool runs it holding every slot; the ledger under its ALONE claim."""
+    quiet_since = None
+    while True:
+        check_deadline()
+        avail, load, builds = available_gib(), load1(), build_processes()
+        reason = None
+        if avail is None or not math.isfinite(avail) or avail < mem_gib:
+            reason = ("mem", f"memory {avail} GiB unavailable or below {mem_gib:g} GiB")
+        elif not math.isfinite(load) or load < 0 or load > QUIET_LOAD_FRACTION * NCPU:
+            reason = ("load", f"load1 {load:g} unavailable or above {QUIET_LOAD_FRACTION:g} * {NCPU} CPUs")
+        elif builds is None or builds:
+            reason = ("processes", f"build/compiler processes: {builds}")
+        if reason:
+            quiet_since = None
+            key, message = reason
+            say(key, f"waiting: {message}")
+        else:
+            now = time.monotonic()
+            if quiet_since is None:
+                quiet_since = now
+            if now - quiet_since >= QUIET_SECONDS:
+                print(f"build-slot: quiet for {QUIET_SECONDS:g}s: load1={load:g} cpus={NCPU} avail_gib={avail:.1f} build_processes=0", file=sys.stderr, flush=True)
+                return
+        wait(2)
+
+
+def ledger_quiet_exec(args):
+    """`--_ledger-quiet MEM_GIB DEADLINE [--execution-start-fd N] -- COMMAND...`.
+
+    What the verb execs for --exclusive, in the claim's own PID and under its
+    ALONE claim: build-slot's quiet-machine wait, then COMMAND in this PID. A
+    DEADLINE of 0 is none; otherwise it is the wall-clock end of --wait-timeout,
+    and passing it starts nothing (exit 2, as the pool's timeout).
+    """
+    try:
+        split = args.index("--")
+        words, command = args[:split], args[split + 1:]
+        mem_gib, deadline = float(words[0]), float(words[1])
+        rest = words[2:]
+        start = None
+        if rest[:1] == ["--execution-start-fd"] and len(rest) == 2:
+            start = ExecutionStart(rest[1])
+        elif rest:
+            raise ValueError
+        if not command or not math.isfinite(mem_gib) or not math.isfinite(deadline):
+            raise ValueError
+    except (ValueError, IndexError):
+        print("build-slot: REFUSED — malformed ledger quiet entry; no command was started", file=sys.stderr)
+        return 2
+    announced = set()
+
+    def say(key, message):
+        if key not in announced:
+            announced.add(key)
+            print(f"build-slot: {message}", file=sys.stderr, flush=True)
+
+    def check_deadline():
+        if deadline and time.time() >= deadline:
+            raise AdmissionTimeout
+
+    def wait(seconds):
+        check_deadline()
+        time.sleep(seconds if not deadline else max(0.0, min(seconds, deadline - time.time())))
+
+    wait_until_quiet(mem_gib, check_deadline, wait, say)
+    if start is not None:
+        start.notify(os.getpid(), time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000)
+    os.execvp(command[0], command)
+
+
+def stop_unanswered_claim(child, observe_exit):
+    """TERM the verb's group, KILL it after LEDGER_STOP_GRACE; leave it unreaped."""
+    owner = resource_transport_owner()
+    owner.signal_owned_group(child.pid, signal.SIGTERM)
+    stop_by = time.monotonic() + LEDGER_STOP_GRACE
+    while not observe_exit(child.pid, nohang=True):
+        if time.monotonic() >= stop_by:
+            owner.signal_owned_group(child.pid, signal.SIGKILL)
+            observe_exit(child.pid)
+            break
+        time.sleep(0.05)
+
+
+def ledger_admit_and_run(cli, cmd, owned, *, legacy_dir, cores, mem_gib, mem_explicit, exclusive,
+                         per_worktree, wait_timeout, memory_attempt, memory_since_ms,
+                         execution_start, rank, claim_key):
+    """One ledger claim covers the whole command; build-slot itself holds no capacity.
+
+    `aterm pkg claim` waits holding nothing, takes the per-worktree lock in the
+    look that admits, writes one record to a private status pipe and execs the
+    command in its own PID, through resource-run when that attributes it to an
+    aterm session. While it waits it watches that pipe: if build-slot dies, the
+    reader closes and the waiter leaves the ledger. build-slot bounds the wait
+    itself as well, so a verb that never answers cannot hold this caller.
+    """
+    deadline = time.monotonic() + wait_timeout if wait_timeout is not None else None
+    if not math.isfinite(mem_gib) or not 0 <= mem_gib < 2**33:
+        print("build-slot: REFUSED — --mem-gb must be finite and nonnegative; no command was started",
+              file=sys.stderr)
+        return 2
+    own_args = cmd[1:cmd.index("--", 1)] if "--" in cmd[1:] else cmd[1:]
+    if os.path.basename(cmd[0]) in ("targo", "atpkg") and "--resource-worker-v2" in own_args:
+        print("build-slot: REFUSED — native worker epochs are granted only by the build-slot pool, "
+              "and this host admits through aterm's capacity ledger; no command was started",
+              file=sys.stderr)
+        return 2
+    observe_exit = original_child_exit_observer()
+    if observe_exit is None:
+        return 2
+    worktree = worktree_lock_path() if per_worktree else None
+    worktree_fd = None
+    if worktree:
+        # An adopted job holds its worktree by record, not by flock: wait it
+        # out holding nothing, as the pool's try_lease does.
+        announced = False
+        while (holder := worktree_holder(worktree)) is not None:
+            kind, info = holder
+            if memory_attempt is not None:
+                return 75  # heavy_gate releases its memory and retries this attempt
+            if not announced:
+                print(f"build-slot: waiting: another build-slot job runs in this worktree "
+                      f"(pid={info.get('pid')} cmd={info.get('cmd')})", file=sys.stderr, flush=True)
+                announced = True
+            if kind == "flock":
+                break  # the verb takes the lock in the look that admits
+            if deadline is not None and time.monotonic() >= deadline:
+                raise AdmissionTimeout
+            time.sleep(2 if deadline is None else max(0.0, min(2, deadline - time.monotonic())))
+        worktree_fd = os.open(worktree, os.O_RDWR | os.O_CREAT, 0o644)
+        owned.add(worktree_fd)
+    wait_ms = None
+    if deadline is not None:
+        wait_ms = math.ceil((deadline - time.monotonic()) * 1000)
+        if wait_ms <= 0:
+            raise AdmissionTimeout
+    checkout = checkout_directory()
+    key = claim_key or default_claim_key(cmd, checkout)
+    # A claim names its memory only where the caller did; otherwise the ledger
+    # sizes it from the key's measured peak, or its own cold figure.
+    memory_bytes = math.ceil(mem_gib * 1073741824) if mem_explicit else None
+    env = dict(os.environ)
+    env["BUILD_SLOT_HELD"] = "1"
+    env["BUILD_SLOT_DIR"] = legacy_dir
+    env.pop("BUILD_SLOT_EXCLUSIVE", None)
+    if exclusive:
+        env["BUILD_SLOT_EXCLUSIVE"] = "1"
+    env["BUILD_SLOT_CPU_PROTOCOL"] = "1"
+    env["BUILD_SLOT_CPU_SOURCE"] = "ledger-grant"
+    # The asked-for cores bound the command even before the verb lowers all
+    # three to its grant at exec: targo reads TARGO_CALLER_JOBS as a hard cap.
+    for name in ("CARGO_BUILD_JOBS", "TARGO_PLANNED_JOBS", "TARGO_CALLER_JOBS"):
+        env[name] = str(cores)
+    for name in ("BUILD_SLOT_CPU_BUDGET", "BUILD_SLOT_CPU_MODE", "BUILD_SLOT_POOL_SLOTS",
+                 "BUILD_SLOT_LEGACY_DIR", "BUILD_SLOT_V2_DIR", "BUILD_SLOT_V2_SLOTS",
+                 "BUILD_SLOT_FENCE_FDS"):
+        env.pop(name, None)
+    launch = resource_command(cmd, env)
+    passed = {*inherited_resource_fds(env)}
+    if worktree_fd is not None:
+        passed.add(worktree_fd)
+    quiet_start = None
+    if exclusive:
+        # The ALONE claim drains the ledger and the pool; the quiet wait that
+        # the pool runs holding every slot runs here under that claim.
+        quiet = [*(_REEXEC or [sys.executable, "-I", "-B", os.path.abspath(__file__)]),
+                 "--_ledger-quiet", repr(mem_gib),
+                 repr(time.time() + (deadline - time.monotonic())) if deadline is not None else "0"]
+        if execution_start is not None:
+            quiet_start, execution_start = execution_start, None
+            quiet += ["--execution-start-fd", str(quiet_start.fd)]
+            passed.add(quiet_start.fd)
+        launch = [*quiet, "--", *launch]
+    reader, writer = os.pipe()
+    owned.add(reader)
+    claim = ledger_argv(cli, label=job_label(cmd), key=key, checkout=checkout, rank=rank,
+                        memory_bytes=memory_bytes, cores=cores, alone=exclusive,
+                        worktree_fd=worktree_fd, wait_ms=wait_ms, once=memory_attempt is not None,
+                        since_ms=memory_since_ms, status_fd=writer)
+    print(f"build-slot: claiming in aterm's capacity ledger: key={key} rank={rank} cores<={cores} "
+          f"mem_bytes={'by key' if memory_bytes is None else memory_bytes}{' alone' if exclusive else ''}",
+          file=sys.stderr, flush=True)
+    try:
+        child = subprocess.Popen([*claim, *launch], env=env, start_new_session=True,
+                                 pass_fds=sorted({writer, *passed}))
+    finally:
+        os.close(writer)
+        if quiet_start is not None:
+            os.close(quiet_start.fd)  # the quiet entry alone reports the start
+    interrupted = None
+    forwardable = child
+
+    def forward(sig, _frame):
+        nonlocal interrupted
+        interrupted = sig
+        if forwardable is not None:
+            resource_transport_owner().signal_owned_group(forwardable.pid, sig)
+
+    previous = {sig: signal.signal(sig, forward)
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    record, refusal, notification_failed, unanswered = None, None, False, False
+    answer_by = None if deadline is None else deadline + LEDGER_ANSWER_GRACE
+    try:
+        raw = b""
+        while b"\n" not in raw and len(raw) <= 4096:
+            if answer_by is not None:
+                remaining = answer_by - time.monotonic()
+                if remaining <= 0 or not select.select([reader], [], [], remaining)[0]:
+                    if time.monotonic() < answer_by:
+                        continue
+                    # The verb outlived its --wait-ms and the grace: stop it.
+                    unanswered = True
+                    stop_unanswered_claim(child, observe_exit)
+                    os.set_blocking(reader, False)
+                    try:
+                        raw += os.read(reader, 4097 - len(raw))
+                    except BlockingIOError:
+                        pass
+                    break
+            part = os.read(reader, 4097 - len(raw))
+            if not part:
+                break
+            raw += part
+        started_us = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+        if raw:
+            try:
+                if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+                    raise ValueError("not one newline-terminated record")
+                record = ledger_event(raw, cores)
+            except (ValueError, UnicodeError, RecursionError) as error:
+                refusal = f"aterm pkg claim sent an invalid admission record ({error}); its command was stopped"
+                resource_transport_owner().signal_owned_group(child.pid, signal.SIGKILL)
+        if record is not None and unanswered:
+            refusal = ("aterm pkg claim admitted the command only after its wait bound; "
+                       "its command was stopped")
+        elif record is not None:
+            print(f"build-slot: aterm {record['event']} the command with {record['cores']} cores",
+                  file=sys.stderr, flush=True)
+            if worktree_fd is not None:
+                os.ftruncate(worktree_fd, 0)
+                os.write(worktree_fd, json.dumps({"pid": child.pid, "cmd": job_label(cmd), "cwd": os.getcwd(),
+                                                  "started": time.time(), "ledger": True}).encode())
+            if memory_attempt is not None:
+                os.write(memory_attempt, b"R")
+                os.close(memory_attempt)
+            if execution_start is not None:
+                try:
+                    execution_start.notify(child.pid, started_us)
+                except Exception as error:
+                    # The original child/group still belongs to us. A closed
+                    # receiver must not strand it or retire its claim early.
+                    notification_failed = True
+                    print(f"build-slot: {error}", file=sys.stderr)
+                    resource_transport_owner().signal_owned_group(child.pid, signal.SIGKILL)
+        observe_exit(child.pid)
+        forwardable = None
+        rc = child.wait()
+    finally:
+        forwardable = None
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if refusal is not None:
+        print(f"build-slot: REFUSED — {refusal}", file=sys.stderr)
+        return 2
+    if record is None:
+        # The verb starts the command only after its admission record.
+        if interrupted is not None:
+            return 128 + interrupted
+        if unanswered:
+            raise AdmissionTimeout
+        if memory_attempt is not None and rc == 75:
+            return 75  # one look found no room: heavy_gate releases memory and retries
+        why = ("its wait ended without admission" if rc == 75
+               else f"`aterm pkg claim` exited {128 - rc if rc < 0 else rc} without admitting")
+        print(f"build-slot: REFUSED — aterm's capacity ledger did not admit this command: {why}; "
+              "no command was started", file=sys.stderr)
+        return 2
+    return 2 if notification_failed else (128 - rc if rc < 0 else rc)
+
+
+def worktree_holder(path):
+    """Who holds the worktree now, judged as try_lease judges it, holding nothing after.
+
+    ("flock", stamp) for a live lock holder, ("adopted", record) for an adopted
+    job (checked under the flock, as active_adoption requires), else None. The
+    verb takes the flock itself in the look that admits, so a flock answer only
+    names the holder and lets heavy_gate's attempt retry early.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "flock", holder_info(path) or {}
+        adopted = active_adoption(path)
+        return None if adopted is None else ("adopted", adopted)
+    finally:
+        os.close(fd)
 
 
 def cpu_jobs(slots, requested=None, *, budget=None, strict=False):
@@ -901,8 +1441,45 @@ def try_shared_slots(slots, needed, maximum=None, reserved=0):
             os.close(fd)
 
 
+class NativeMemoryObservation(float):
+    """One fresh native kernel reading; its GiB projection is diagnostic."""
+    def __new__(cls, count):
+        if type(count) is not int or not 0 <= count < 2**64:
+            raise ValueError("invalid native available-memory bytes")
+        value = super().__new__(cls, count / 1073741824)
+        value.native_bytes = count
+        return value
+
+
+def native_memory_observation():
+    """Use the selected maintained observer, never a program named by a ticket."""
+    program = shutil.which("trust-build-status")
+    arguments = ["--json"]
+    if not program:
+        program = shutil.which("targo")
+        arguments = ["--unverified", "resource", "status", "--json"]
+    if not program:
+        return None
+    try:
+        status, output, _ = bounded_native_query(
+            [program, *arguments],
+            timeout=2, limit=65536, purpose="memory observation")
+        if status:
+            return None
+        record = decode_admission_record(output)
+        if record.get("protocol") != "native-resource-status-v1":
+            return None
+        return NativeMemoryObservation(record["available_memory_bytes"])
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError,
+            subprocess.SubprocessError, NamespaceError, CpuBridgeUnavailable):
+        return None
+
+
 def available_gib():
     """Available memory in GiB, or None if it cannot be measured."""
+    native = native_memory_observation()
+    if native is not None:
+        return native
     try:
         if sys.platform == "darwin":
             out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
@@ -1330,6 +1907,96 @@ def try_command_claim(worktree, slots, exclusive, needed, maximum=None, pending=
             os.close(fd)
 
 
+def decode_admission_record(data):
+    """Read either original queue protocol without accepting ambiguous fields."""
+    if len(data) > 65536:
+        raise ValueError("admission ticket exceeds its bound")
+
+    def unique(pairs):
+        row = {}
+        for key, value in pairs:
+            if key in row:
+                raise ValueError("duplicate admission field")
+            row[key] = value
+        return row
+
+    def invalid_constant(value):
+        raise ValueError("invalid admission JSON number")
+
+    # serde_json reads UTF8 JSON and rejects native unsigned fields spelled
+    # as -0. Preserve that token's float kind instead of Python's integer 0.
+    record = json.loads(data.decode("utf-8"), object_pairs_hook=unique,
+                        parse_int=lambda value: -0.0 if value == "-0" else int(value),
+                        parse_constant=invalid_constant)
+    if not isinstance(record, dict):
+        raise ValueError("admission ticket is not an object")
+    return record
+
+
+def admission_requirements(record):
+    """Normalize original native byte requirements and legacy GiB requirements.
+
+    A ticket establishes queue priority only. Resource and worktree leases must
+    still be acquired by their original owners. Unknown protocols stay barriers.
+    """
+    required = record["requires"]
+    if not isinstance(required, dict):
+        raise ValueError("admission requirements are not an object")
+    if "native_admission_version" in record:
+        if (set(record) != {"native_admission_version", "pid", "requires"}
+                or type(record["native_admission_version"]) is not int
+                or record["native_admission_version"] != 1
+                or type(record["pid"]) is not int or not 1 <= record["pid"] < 2**32
+                or not {"slots", "needed", "exclusive", "minimum_memory_bytes"} <= set(required)
+                or set(required) - {"worktree_bytes", "slots", "needed", "exclusive",
+                                    "minimum_memory_bytes"}):
+            raise ValueError("unsupported native admission record")
+        memory = required["minimum_memory_bytes"]
+        if type(memory) is not int or not 0 <= memory < 2**64:
+            raise ValueError("invalid native admission memory")
+        path = required.get("worktree_bytes")
+        if path is not None:
+            if (not isinstance(path, list) or len(path) > 32768
+                    or any(type(byte) is not int or not 0 <= byte <= 255 for byte in path)):
+                raise ValueError("invalid native worktree bytes")
+            path = bytes(path)
+    else:
+        if (not {"slots", "memory", "exclusive"} <= set(required)
+                or set(required) - {"worktree", "slots", "memory", "exclusive", "needed"}):
+            raise ValueError("invalid legacy admission requirements")
+        gib = required["memory"]
+        if type(gib) not in (int, float) or not math.isfinite(gib) or gib < 0:
+            raise ValueError("invalid legacy admission memory")
+        scaled = gib * 1073741824
+        if not math.isfinite(scaled) or scaled >= 2**64:
+            raise ValueError("legacy admission memory overflows")
+        memory = math.ceil(scaled)
+        path = required.get("worktree")
+        if path is not None:
+            if not isinstance(path, str):
+                raise ValueError("invalid legacy worktree path")
+            path.encode("utf-8")
+            path = os.fsencode(path)
+    if path is not None:
+        if (not path.startswith(b"/") or len(path) > 32768 or b"\0" in path
+                or b".." in path.split(b"/")):
+            raise ValueError("invalid admission worktree path")
+        path = os.fsdecode(path)
+    slots, needed, exclusive = required["slots"], required.get("needed", 1), required["exclusive"]
+    if (type(slots) is not int or not 1 <= slots <= 65536
+            or type(needed) is not int or not 1 <= needed <= slots
+            or type(exclusive) is not bool):
+        raise ValueError("invalid admission slot requirements")
+    return {"worktree": path, "slots": slots, "needed": needed, "exclusive": exclusive,
+            "native": "native_admission_version" in record,
+            "minimum_memory_bytes": memory, "memory": memory / 1073741824}
+
+
+def read_admission_requirements(path):
+    with open(path, "rb") as stream:
+        return admission_requirements(decode_admission_record(stream.read(65537)))
+
+
 def waiter_eligible(path, available, *, draining=False):
     """A busy worktree or memory-ineligible waiter does not idle other slots.
 
@@ -1337,20 +2004,17 @@ def waiter_eligible(path, available, *, draining=False):
     Unreadable requirements fail closed as a barrier, never as permission to pass.
     """
     try:
-        with open(path) as stream:
-            required = json.load(stream)["requires"]
+        required = read_admission_requirements(path)
         worktree, slots = required["worktree"], required["slots"]
-        memory, exclusive = required["memory"], required["exclusive"]
+        memory, exclusive = required["minimum_memory_bytes"], required["exclusive"]
         needed = required.get("needed", 1)
-        if (worktree is not None and not isinstance(worktree, str)
-                or not isinstance(slots, int) or slots < 1
-                or type(needed) is not int or not 1 <= needed <= slots
-                or not isinstance(memory, (int, float))
-                or not isinstance(exclusive, bool)):
-            return True
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
         return True
-    if available is not None and available < memory:
+    if required["native"] and not isinstance(available, NativeMemoryObservation):
+        return True
+    available_bytes = (available.native_bytes if isinstance(available, NativeMemoryObservation)
+                       else available * 1073741824 if available is not None else None)
+    if available_bytes is not None and available_bytes < memory:
         return False
     worktree_fd = None
     try:
@@ -1431,19 +2095,13 @@ class AdmissionWaiter:
                 if path == self.path:
                     continue
                 try:
-                    with open(path) as stream:
-                        required = json.load(stream)["requires"]
+                    required = read_admission_requirements(path)
                     worktree = required["worktree"]
                     slots, needed = required["slots"], required.get("needed", 1)
-                    exclusive, memory = required["exclusive"], required["memory"]
-                    if (worktree is not None and not isinstance(worktree, str)
-                            or type(slots) is not int or slots < 1
-                            or type(needed) is not int or not 1 <= needed <= slots
-                            or not isinstance(exclusive, bool)
-                            or type(memory) not in (int, float)
-                            or not math.isfinite(memory) or memory < 0):
+                    exclusive = required["exclusive"]
+                    if required["native"] and not isinstance(available, NativeMemoryObservation):
                         return self.required["slots"], protected
-                except (OSError, ValueError, KeyError, TypeError):
+                except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
                     return self.required["slots"], protected
                 # Our minimum and shared admission are already held. Exclusive
                 # work cannot overlap; withholding extras cannot admit it.
@@ -1786,9 +2444,7 @@ def queued_status(directory=None):
                         data = os.read(fd, 65537)
                         if len(data) > 65536:
                             raise ValueError("admission ticket exceeds observation bound")
-                        record = json.loads(data)
-                        if not isinstance(record, dict):
-                            raise ValueError("admission ticket is not an object")
+                        record = decode_admission_record(data)
                     else:
                         stale += 1
                         continue
@@ -1849,8 +2505,11 @@ def print_queued_status(directory=None):
     print(f"queue: {len(rows)} pending request(s), {stale} stale ticket(s) ignored; "
           "oldest eligible first; eligible exclusive requests reserve the whole pool")
     for position, (_, record) in enumerate(rows):
-        required = record.get("requires")
-        if not isinstance(required, dict) or record.get("observation_error"):
+        try:
+            required = admission_requirements(record)
+            if record.get("observation_error"):
+                raise ValueError("unreadable admission record")
+        except (ValueError, KeyError, TypeError, OverflowError, RecursionError):
             print(f"wait {position}: requirements unavailable; "
                   "no eligibility or capacity claim can be made")
             continue
@@ -1946,7 +2605,7 @@ def status(slots, directory=None):
 
 
 def usage():
-    print("usage: build-slot [--exclusive] [--wait-timeout S] [--cpus N] [--slots N] [--mem-gb G] [--no-worktree-lock] -- <command> [args...]\n       build-slot [options] adopt PID\n       build-slot status", file=sys.stderr)
+    print("usage: build-slot [--exclusive] [--wait-timeout S] [--cpus N] [--slots N] [--mem-gb G] [--no-worktree-lock] [--rank ordinary|release] [--claim-key K] [--wide] -- <command> [args...]\n       build-slot [options] adopt PID\n       build-slot status\n       build-slot --capabilities", file=sys.stderr)
 
 
 class ExecutionStart:
@@ -2003,13 +2662,28 @@ def _main(argv, owned):
     global DIR
     slots = default_slots()
     mem_gib = float(os.environ.get("BUILD_SLOT_MEM_GB", "8"))
+    # Only a caller's own figure is claimed as memory in aterm's ledger; the
+    # default 8 GiB is the pool's admission floor, not a measurement.
+    mem_explicit = "BUILD_SLOT_MEM_GB" in os.environ
     per_worktree = True
     exclusive = False
+    wide = False
     wait_timeout = None
     execution_start = None
     cpus = None
     memory_attempt = None
     memory_arrival = None
+    memory_since_ms = None
+    rank = "ordinary"
+    claim_key = None
+    if argv == ["--capabilities"]:
+        # Answered before any namespace, admission or environment is read: an
+        # older copy refuses this as an unknown option and starts nothing.
+        print(CLAIM_WORDS_PROTOCOL)
+        return 0
+    if argv[:1] == ["--_ledger-quiet"]:
+        # Exec'd by `aterm pkg claim` under an exclusive (ALONE) claim.
+        return ledger_quiet_exec(argv[1:])
     if argv[:1] == ["status"]:
         DIR = slot_directory()
         runtime = os.path.join(DIR, "runtime-v2")
@@ -2017,8 +2691,12 @@ def _main(argv, owned):
             print("legacy pool (native epochs hold shared exclusion fences here):")
             result = status(slots)
             print("native runtime-v2 pool:")
-            return max(result, status(slots, runtime))
-        return status(slots)
+            result = max(result, status(slots, runtime))
+        else:
+            result = status(slots)
+        if result == 0:  # a refused status reports nothing on stdout
+            print_admission_authority()
+        return result
     args = list(argv)
     cmd = None
     options = []
@@ -2039,6 +2717,16 @@ def _main(argv, owned):
             cpus = int(args.pop(0))
         elif a == "--mem-gb":
             mem_gib = float(args.pop(0))
+            mem_explicit = True
+        elif a == "--wide":
+            wide = True
+        elif a == "--_memory-since-ms":
+            # The coordinator's wall-clock arrival, for the ledger's one look.
+            if (not args or not args[0].isascii() or not args[0].isdigit()
+                    or len(args[0]) > 20 or int(args[0]) < 1):
+                print("build-slot: coordinated admission needs a positive arrival time", file=sys.stderr)
+                return 2
+            memory_since_ms = int(args.pop(0))
         elif a == "--_memory-attempt":
             try:
                 memory_attempt = int(args.pop(0))
@@ -2054,6 +2742,17 @@ def _main(argv, owned):
                 return 2
         elif a == "--no-worktree-lock":
             per_worktree = False
+        elif a == "--rank":
+            if not args or args[0] not in RANKS:
+                print("build-slot: --rank takes ordinary or release; no command was started", file=sys.stderr)
+                return 2
+            rank = args.pop(0)
+        elif a == "--claim-key":
+            if not args or not CLAIM_KEY.fullmatch(args[0]):
+                print("build-slot: --claim-key takes 1 to 200 of [A-Za-z0-9._:/@+-], starting with a "
+                      "letter or digit; no command was started", file=sys.stderr)
+                return 2
+            claim_key = args.pop(0)
         elif a == "--exclusive":
             exclusive = True
         elif a == "--execution-start-fd":
@@ -2090,6 +2789,17 @@ def _main(argv, owned):
     if not cmd:
         usage()
         return 2
+    if wide and (cpus is not None or exclusive or adopt_pid is not None):
+        print("build-slot: --wide asks for the host's cores itself; it takes no --cpus, --exclusive "
+              "or adopt; no command was started", file=sys.stderr)
+        return 2
+    if memory_since_ms is not None and memory_attempt is None:
+        print("build-slot: an arrival time belongs to a coordinated attempt; no command was started",
+              file=sys.stderr)
+        return 2
+    # Reject malformed hidden fronts before fixed/exclusive admission can run
+    # them. Ordinary non-Targo commands retain their existing admission path.
+    worker_invocation(cmd)
     original_resources = inherited_resource_fds(os.environ)
     if execution_start is not None:
         for fd in original_resources:
@@ -2144,6 +2854,13 @@ def _main(argv, owned):
         if cpus is not None:
             try:
                 parent_jobs = cpu_jobs(1, os.environ.get("CARGO_BUILD_JOBS", "0"), budget=NCPU, strict=True)
+                if cpus > parent_jobs and os.environ.get("BUILD_SLOT_CPU_SOURCE") == "ledger-grant":
+                    # A pool parent held at least one share, so its callers' --cpus
+                    # fit; a ledger grant can be one core. Narrow to the grant: the
+                    # parent's claim is what bounds the machine, never this word.
+                    print(f"build-slot: --cpus {cpus} narrowed to the parent's ledger grant of "
+                          f"{parent_jobs}", file=sys.stderr, flush=True)
+                    cpus = parent_jobs
                 if cpus > parent_jobs:
                     raise ValueError("a nested command cannot enlarge its parent's CPU budget")
                 os.environ["CARGO_BUILD_JOBS"] = str(cpus)
@@ -2179,13 +2896,46 @@ def _main(argv, owned):
                         strict=cpus is not None and not generated_jobs) if adopt_pid is None else None
         if jobs is not None and caller_jobs is not None:
             jobs = min(jobs, caller_jobs)
+        # A ledger claim asks for the explicit --cpus, the host's cores for
+        # --exclusive or --wide, else one pool share, under the same caller
+        # caps. The ledger grants up to what is free and the grant is held for
+        # the whole run, so an uncapped test, push or script must not ask for
+        # the machine. The ledger's grant may be smaller than what is asked.
+        ledger_budget = (cpus if cpus is not None else NCPU if exclusive or wide
+                         else max(1, NCPU // (slots if slots > 0 else default_slots())))
+        ledger_cores = cpu_jobs(1, os.environ.get("CARGO_BUILD_JOBS"), budget=ledger_budget,
+                                strict=cpus is not None and not generated_jobs) if adopt_pid is None else None
+        if ledger_cores is not None and caller_jobs is not None:
+            ledger_cores = min(ledger_cores, caller_jobs)
     except ValueError as exc:
         print(f"build-slot: REFUSED — {exc}; no command was started", file=sys.stderr)
         return 2
-    if adopt_pid is not None:
-        return adopt(adopt_pid, slots, mem_gib, per_worktree, exclusive)
-    if wrapper is not None and not exclusive and memory_attempt is None:
+    if wrapper is not None and not exclusive and memory_attempt is None and adopt_pid is None:
         return coordinate_memory(options, wrapper)
+    # One admission authority: where aterm's capacity ledger can hold this
+    # command's one covering claim, it alone admits, and no slot is taken.
+    try:
+        ledger = admission_ledger()
+    except LedgerRefused as unknown:
+        print(f"build-slot: REFUSED — which authority admits here is unknown ({unknown}); "
+              "no command was started", file=sys.stderr)
+        return 2
+    if adopt_pid is not None:
+        if ledger is not None:
+            # An adopted slot is a pool record the ledger would have to count
+            # for this job to be seen; start the job under build-slot instead.
+            print("build-slot: REFUSED — adopt records a slot in the build-slot pool, and this host "
+                  "admits through aterm's capacity ledger; run the job under build-slot instead",
+                  file=sys.stderr)
+            return 2
+        return adopt(adopt_pid, slots, mem_gib, per_worktree, exclusive)
+    if ledger is not None:
+        return ledger_admit_and_run(
+            ledger, cmd, owned, legacy_dir=DIR, cores=ledger_cores, mem_gib=mem_gib,
+            mem_explicit=mem_explicit, exclusive=exclusive, per_worktree=per_worktree,
+            wait_timeout=wait_timeout, memory_attempt=memory_attempt,
+            memory_since_ms=memory_since_ms, execution_start=execution_start,
+            rank=rank, claim_key=claim_key)
 
     automatic = (cpus is None and not exclusive
                  and ("CARGO_BUILD_JOBS" not in os.environ or generated_jobs)
@@ -2339,29 +3089,7 @@ def _main(argv, owned):
             say("exclusive", f"waiting for all {len(pool_slots(slots))} canonical slots; draining legacy or adopted slot holders for exclusive reservation")
             wait(2)
         print(f"build-slot: reserved {len(acquired)} slots exclusively; waiting for host readiness", file=sys.stderr, flush=True)
-        quiet_since = None
-        while True:
-            check_deadline()
-            avail, load, builds = available_gib(), load1(), build_processes()
-            reason = None
-            if avail is None or not math.isfinite(avail) or avail < mem_gib:
-                reason = ("mem", f"memory {avail} GiB unavailable or below {mem_gib:g} GiB")
-            elif not math.isfinite(load) or load < 0 or load > QUIET_LOAD_FRACTION * NCPU:
-                reason = ("load", f"load1 {load:g} unavailable or above {QUIET_LOAD_FRACTION:g} * {NCPU} CPUs")
-            elif builds is None or builds:
-                reason = ("processes", f"build/compiler processes: {builds}")
-            if reason:
-                quiet_since = None
-                key, message = reason
-                say(key, f"waiting: {message}")
-            else:
-                now = time.monotonic()
-                if quiet_since is None:
-                    quiet_since = now
-                if now - quiet_since >= QUIET_SECONDS:
-                    print(f"build-slot: quiet for {QUIET_SECONDS:g}s: load1={load:g} cpus={NCPU} avail_gib={avail:.1f} build_processes=0", file=sys.stderr, flush=True)
-                    break
-            wait(2)
+        wait_until_quiet(mem_gib, check_deadline, wait, say)
 
     if not exclusive:
         held_fds.remove(admission_fd)

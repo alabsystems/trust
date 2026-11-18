@@ -84,7 +84,7 @@ const KEY_SCHEMA: &str = "trust-stage1-seed-key/v1";
 /// Written before the cloned entries are renamed into place and removed after: an
 /// interrupted seed is undone by the next run instead of being half trusted.
 const INCOMPLETE: &str = ".trust-stage1-seed-incomplete";
-const PARTIAL: &str = ".trust-seed-partial";
+pub(crate) const PARTIAL: &str = ".trust-seed-partial";
 /// The purpose the lease a seed takes on its donor records. The donor's lock script waits
 /// for a live holder with it, and a seed judges a gone one by it ([`clone_from_with`]).
 const SEED_SOURCE: &str = "stage-1 seed source (another worktree clones this build tree)";
@@ -1105,7 +1105,7 @@ fn clone_from_with(
     Ok((names, donor_times))
 }
 
-fn same_volume(a: &Path, b: &Path) -> Result<(), String> {
+pub(crate) fn same_volume(a: &Path, b: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1124,7 +1124,7 @@ fn same_volume(a: &Path, b: &Path) -> Result<(), String> {
 
 /// `clonefile(2)` without following a symbolic link: a copy-on-write clone of a whole
 /// tree, never a link to it and never a byte copy (which `cp -c` silently falls back to).
-fn clonefile(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn clonefile(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;

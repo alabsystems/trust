@@ -43,19 +43,21 @@ pub(crate) mod candidate_runner;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod qualification;
 pub mod qualification_command;
-mod shared_dependencies;
+pub(crate) mod shared_dependencies;
+// Trust: DC-24a, a program the build names that may hold a shared unit.
+pub(crate) mod unit_source;
 // Trust: compiler-declared managed cache ownership, separate from proof transport.
 mod build_config;
 // Trust: DC-12a, the receipt a successful build keeps of the units it used.
 mod build_receipt;
 // Trust: DC-12b, the incremental folders a build directory keeps.
-mod incremental_trim;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
 mod compilation;
 mod compile_kind;
 mod crate_type;
 mod custom_build;
+mod incremental_trim;
 mod post_build_compiler;
 mod rustc_command_context;
 pub(crate) mod trust_witness_cleanup;
@@ -144,6 +146,7 @@ pub use self::build_context::TargetInfo;
 pub use self::build_runner::{BuildRunner, Metadata, UnitHash};
 use self::compilation::RustcProcessRole;
 pub use self::compilation::{Compilation, Doctest, UnitOutput};
+pub(crate) use self::compilation::{configured_target_runner, execution_runner_kind};
 pub use self::compile_kind::{CompileKind, CompileKindFallback, CompileTarget};
 pub use self::crate_type::CrateType;
 pub use self::custom_build::LinkArgTarget;
@@ -172,11 +175,13 @@ use crate::diagnostics::get_key_value;
 use crate::util::OnceExt;
 use crate::util::errors::{CargoResult, VerboseError};
 use crate::util::interning::InternedString;
+use crate::util::log_message::SharedDependencyExclusion;
 use crate::util::machine_message::{self, Message};
 use crate::util::process_authority::{
     CARGO_PRIMARY_PACKAGE_ENV, FIX_ENV_INTERNAL, FIX_PROXY_CONTROL_ENVS,
     RUSTC_WORKSPACE_WRAPPER_ENV, is_authenticated_targo_process_authority_env,
-    is_benign_build_script_provenance_env, validate_verified_command_runtime_library_authority,
+    is_benign_build_script_provenance_env, is_native_pairing_input,
+    validate_verified_command_runtime_library_authority,
 };
 use crate::util::rustc_options::{canonical_codegen_backend_value, rustc_option_parts};
 use crate::util::tippy_arg_protocol::{CLIPPY_ARGS_ENV, TIPPY_ENCODED_ARGS_ENV};
@@ -428,7 +433,7 @@ fn compile<'gctx>(
     )
     .map_err(anyhow::Error::msg)?;
 
-    let lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking {
+    let lock = if build_runner.bcx.fine_grain_locking {
         Some(build_runner.lock_manager.lock_shared(build_runner, unit)?)
     } else {
         None
@@ -499,7 +504,7 @@ fn compile<'gctx>(
                 } else {
                     rustc(build_runner, unit, exec, capture.clone(), false)?
                 };
-                if build_runner.bcx.gctx.cli_unstable().fine_grain_locking {
+                if build_runner.bcx.fine_grain_locking {
                     work = fingerprint::invalidate_before_build(build_runner, unit).then(work);
                 }
                 work.then(link_targets(build_runner, unit, false)?)
@@ -525,8 +530,7 @@ fn compile<'gctx>(
             // Trust: the complete graph generation already owns every write
             // right before callbacks or Work preparation. The existing runtime
             // recheck stays on its worker; no inline Fresh job waits on queue IPC.
-            if build_runner.bcx.gctx.cli_unstable().fine_grain_locking && job.freshness().is_dirty()
-            {
+            if build_runner.bcx.fine_grain_locking && job.freshness().is_dirty() {
                 if let Some(lock) = lock {
                     let output_options = OutputOptions::for_fresh(build_runner, unit);
                     let manifest = ManifestErrorContext::new(build_runner, unit)?;
@@ -543,7 +547,7 @@ fn compile<'gctx>(
                     } else {
                         fresh_work
                     };
-                    job.recheck_after_lock(fresh_work, force);
+                    job.recheck_after_lock(fresh_work, force, build_runner.bcx.unit_source.clone());
                     job.before(prebuild_lock_exclusive(lock.clone()));
                     job.after(downgrade_lock_to_shared(lock));
                 }
@@ -551,6 +555,22 @@ fn compile<'gctx>(
 
             job
         };
+        // Trust (DC-18c): before a shared member's job reads or writes its
+        // slot, fresh or dirty, the build scripts and proc macros it is keyed
+        // on have run: their output must be what the slot was named by.
+        let mut job = job;
+        if let Some(slot) = build_runner
+            .files()
+            .member_slot(unit)
+            .filter(|slot| slot.waiting || slot.inputs.is_some())
+            .filter(|_| build_runner.bcx.shared_member(unit))
+        {
+            let (inputs, waiting) = (slot.inputs.clone(), slot.waiting);
+            let recorder = build_runner.bcx.shared_eligibility.recorder(unit)?;
+            job.before(shared_dependencies::check_member_inputs(
+                inputs, waiting, recorder,
+            ));
+        }
         jobs.enqueue(build_runner, unit, job)?;
     }
 
@@ -643,6 +663,33 @@ fn rustc(
     let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
 
     let mut output_options = OutputOptions::for_dirty(build_runner, unit);
+    // Trust (DC-18b): a shared member whose compile fails (`-Ztrust-path-free`
+    // refused its metadata, its sandbox denied a read outside its package,
+    // or anything else) or whose sources move while it compiles is refused:
+    // the checkout records why, and the build is planned again with the
+    // member private, whose compile reports what it reports.
+    let member = if build_runner.bcx.shared_member(unit) {
+        output_options.shared_member = true;
+        Some(build_runner.bcx.shared_eligibility.recorder(unit)?)
+    } else {
+        None
+    };
+    let keyed_member = member.is_some()
+        && build_runner
+            .files()
+            .member_slot(unit)
+            .is_some_and(|slot| slot.inputs.is_some());
+    // Trust (DC-18c): the checkout's own directories, which a shared member's
+    // outputs must not name (`CheckoutPrefixes`).
+    let checkout_prefixes = member.as_ref().map(|_| {
+        let ws = build_runner.bcx.ws;
+        shared_dependencies::CheckoutPrefixes::new([
+            ws.root(),
+            unit.pkg.root(),
+            ws.target_dir().as_path_unlocked(),
+            ws.build_dir().as_path_unlocked(),
+        ])
+    });
     let package_id = unit.pkg.package_id();
     let target = Target::clone(&unit.target);
     let mode = unit.mode;
@@ -751,6 +798,10 @@ fn rustc(
         // located somewhere in there.
         // Finally, if custom environment variables have been produced by
         // previous build scripts, we include them in the rustc invocation.
+        // Trust (DC-18c): a shared member keyed on build-script output binds
+        // its command as prepared; the overlays below come from that output,
+        // which its slot name holds and its job checked before it began.
+        let prepared = keyed_member.then(|| rustc.clone());
         if let Some(build_scripts) = build_scripts {
             let script_outputs = build_script_outputs.lock().unwrap();
             append_build_script_overlays(
@@ -807,14 +858,16 @@ fn rustc(
         for source in &audited_trust_spec_sources {
             source.verify_unchanged().map_err(anyhow::Error::msg)?;
         }
-        if let Some(inputs) = &source_inputs {
-            inputs.ensure_current()?;
+        if let Some(inputs) = &source_inputs
+            && let Err(error) = inputs.ensure_current()
+        {
+            return Err(moved_member(member.as_ref(), error));
         }
         if let Some(inputs) = &platform_inputs {
             inputs.ensure_current()?;
         }
         if let Some(inputs) = &command_inputs {
-            inputs.ensure_matches(&rustc)?;
+            inputs.ensure_matches(prepared.as_ref().unwrap_or(&rustc))?;
         }
 
         // The ordinary warm and dirty paths use the SAME runtime dependency/
@@ -943,6 +996,14 @@ fn rustc(
         }
 
         if let Err(e) = result {
+            if let Some(member) = &member {
+                tracing::debug!("shared member compile failed: {e:#}");
+                return Err(member.refuse(if output_options.path_free_refused {
+                    SharedDependencyExclusion::PathBound
+                } else {
+                    SharedDependencyExclusion::MemberCompileFailed
+                }));
+            }
             // Trust: failed compilation can replace dep-info while retaining a
             // previous managed cache. Its declared partial outputs still belong
             // to this unit. Keep the original compiler error authoritative.
@@ -971,8 +1032,10 @@ fn rustc(
         if let Some(inputs) = &platform_inputs {
             inputs.ensure_current()?;
         }
-        if let Some(inputs) = &source_inputs {
-            inputs.ensure_current()?;
+        if let Some(inputs) = &source_inputs
+            && let Err(error) = inputs.ensure_current()
+        {
+            return Err(moved_member(member.as_ref(), error));
         }
         debug_assert_eq!(output_options.errors_seen, 0);
 
@@ -986,10 +1049,38 @@ fn rustc(
         // in JobState::run_to_finish when the live report/file was missing.
         output_options.metadata_readiness.finish()?;
 
+        // Trust (DC-18c): `-Ztrust-path-free` judged the member's metadata; a
+        // proc macro's untracked read of its checkout (its manifest directory,
+        // the working directory, a span's file) reaches the object code,
+        // which no key binds. A shared member whose outputs other than its
+        // dep-info name its checkout is path-bound, and its outputs leave the
+        // slot (`shared_dependencies::withdraw_outputs`).
+        if let (Some(member), Some(prefixes)) = (&member, &checkout_prefixes) {
+            let named = prefixes.named_below(&root, &rustc_dep_info_loc);
+            if !matches!(named, Ok(None)) {
+                shared_dependencies::withdraw_outputs(&root, prefixes);
+            }
+            match named {
+                Ok(None) => {}
+                Ok(Some((file, prefix))) => {
+                    tracing::debug!("{} names the checkout directory {prefix}", file.display());
+                    return Err(member.refuse(SharedDependencyExclusion::PathBound));
+                }
+                Err(error) => {
+                    tracing::debug!("a shared member's outputs cannot be searched: {error:#}");
+                    return Err(member.refuse_for_now(SharedDependencyExclusion::PathBound));
+                }
+            }
+        }
+
         if rustc_dep_info_loc.exists() {
             // Trust: the compiler names its opaque cache; bind that declaration
-            // to this compilation's package, never to a directory scan.
-            trust_witness_cleanup::record(&rustc_dep_info_loc, package_id)?;
+            // to this compilation's package, never to a directory scan. A
+            // shared member's slot is no checkout's to clean (DC-18b), and its
+            // package id would name the checkout that produced it.
+            if member.is_none() {
+                trust_witness_cleanup::record(&rustc_dep_info_loc, package_id)?;
+            }
             fingerprint::translate_dep_info(
                 &rustc_dep_info_loc,
                 &dep_info_loc,
@@ -6938,6 +7029,18 @@ mod trust_verification_role_tests {
             );
         }
 
+        for name in [
+            "TRUST_TARGO_PAIRED_COMPILER_PROFILE",
+            "trust_targo_paired_compiler_profile",
+        ] {
+            let mut command = ProcessBuilder::new("trustc");
+            assert!(apply_build_script_env(&mut command, false, name, "not-a-producer").is_err());
+            assert!(
+                !command.get_envs().contains_key(name),
+                "late pairing rejection must precede mutation"
+            );
+        }
+
         let mut authenticated = ProcessBuilder::new("trustc");
         apply_build_script_env(&mut authenticated, true, "SAFE_ENV", "retained")
             .expect("non-authority build-script environment remains supported");
@@ -8228,7 +8331,7 @@ fn prepare_rustdoc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
     rustdoc.args(&features_args(unit));
     rustdoc.args(&check_cfg_args(unit));
 
-    add_error_format_and_color(build_runner.bcx, &mut rustdoc);
+    add_error_format_and_color(build_runner.bcx, &mut rustdoc, false);
     add_allow_features(build_runner.bcx, &mut rustdoc);
 
     if build_runner.bcx.gctx.cli_unstable().rustdoc_depinfo {
@@ -8612,7 +8715,7 @@ fn add_allow_features(bcx: &BuildContext<'_, '_>, cmd: &mut ProcessBuilder) {
 /// which Cargo will extract and display to the user.
 ///
 /// [`--error-format`]: https://doc.rust-lang.org/nightly/rustc/command-line-arguments.html#--error-format-control-how-errors-are-produced
-fn add_error_format_and_color(bcx: &BuildContext<'_, '_>, cmd: &mut ProcessBuilder) {
+fn add_error_format_and_color(bcx: &BuildContext<'_, '_>, cmd: &mut ProcessBuilder, shared: bool) {
     let enable_timings = bcx.gctx.cli_unstable().section_timings && bcx.logger.is_some();
     if enable_timings {
         cmd.arg("-Zunstable-options");
@@ -8635,8 +8738,11 @@ fn add_error_format_and_color(bcx: &BuildContext<'_, '_>, cmd: &mut ProcessBuild
     }
     cmd.arg(json);
 
+    // Trust: a shared unit's command is part of its identity, which must not
+    // follow the width of the terminal a build happens to run in; its
+    // diagnostics, replayed from the store, keep the compiler's own width.
     let gctx = bcx.gctx;
-    if let Some(width) = gctx.shell().err_width().diagnostic_terminal_width() {
+    if !shared && let Some(width) = gctx.shell().err_width().diagnostic_terminal_width() {
         cmd.arg(format!("--diagnostic-width={width}"));
     }
 }
@@ -8676,7 +8782,11 @@ fn build_base_args_context<L: std::borrow::Borrow<layout::LayoutPaths>>(
     edition.cmd_edition_arg(cmd);
 
     add_path_args(bcx.ws, unit, cmd);
-    add_error_format_and_color(build_runner.bcx, cmd);
+    add_error_format_and_color(
+        build_runner.bcx,
+        cmd,
+        build_runner.bcx.shared_dependency_units.contains(unit),
+    );
     add_allow_features(build_runner.bcx, cmd);
 
     let mut contains_dy_lib = false;
@@ -8778,7 +8888,11 @@ fn build_base_args_context<L: std::borrow::Borrow<layout::LayoutPaths>>(
         }
     }
 
-    trim_paths::trim_paths_args(cmd, build_runner.bcx, unit, &trim_paths)?;
+    if bcx.shared_member(unit) {
+        trim_paths::shared_member_args(cmd, bcx, unit);
+    } else {
+        trim_paths::trim_paths_args(cmd, build_runner.bcx, unit, &trim_paths)?;
+    }
 
     match compute_cap_lints(bcx, unit) {
         None | Some(CapLints::Warn) => {
@@ -8850,7 +8964,11 @@ fn build_base_args_context<L: std::borrow::Borrow<layout::LayoutPaths>>(
 
     add_codegen_linker_context(cmd, build_runner, unit, bcx.gctx.target_applies_to_host()?);
 
-    if incremental {
+    // Trust (DC-18b): a shared unit compiles without incremental state. Under
+    // `-C incremental` the compiler names each codegen unit's object with a
+    // per-run random suffix, so two compiles of one unit would differ in
+    // bytes; and the state would be a store unit's private input.
+    if incremental && !bcx.shared_dependency_units.contains(unit) {
         add_codegen_incremental(cmd, build_runner, unit)
     }
 
@@ -9240,6 +9358,14 @@ fn validate_build_script_env_name(authenticated_targo: bool, name: &str) -> Carg
     {
         anyhow::bail!(
             "authenticated Targo refuses build-script `cargo::rustc-env` authority variable `{name}`"
+        );
+    }
+    // Trust: this is a producer-only compiler input even when the frontend
+    // is used through its compatibility entry. No late script overlay may
+    // reinstall it after the typed compiler/script-role preparation.
+    if is_native_pairing_input(name) {
+        anyhow::bail!(
+            "build-script `cargo::rustc-env` cannot supply reserved compiler input `{name}`"
         );
     }
     Ok(())
@@ -9704,6 +9830,47 @@ struct OutputOptions {
     warnings_seen: usize,
     /// Tracks the number of errors we've seen so far.
     errors_seen: usize,
+    /// Trust (DC-18b): a shared member's compile. Its errors, and what the
+    /// compiler says after the first, are not shown: a failed compile is
+    /// refused, and the member compiled privately reports them.
+    shared_member: bool,
+    /// Trust (DC-18b): this shared member's compile reported an error.
+    member_failed: bool,
+    /// Trust (DC-18b): the error was `-Ztrust-path-free`'s refusal.
+    path_free_refused: bool,
+}
+
+/// Trust (DC-18b): the prefix of the note `-Ztrust-path-free` (DC-18a) ends
+/// its one refusal with.
+const PATH_FREE_RECORD: &str = "trust-path-free-v1 ";
+
+/// Trust (DC-18b): a compiler diagnostic's own level (`error`, `warning`,
+/// …), not its children's.
+fn compiler_message_level(message: &str) -> Option<&'static str> {
+    #[derive(serde::Deserialize)]
+    struct Level<'m> {
+        level: Option<&'m str>,
+    }
+    let level = serde_json::from_str::<Level<'_>>(message).ok()?.level?;
+    match level {
+        "error" | "error: internal compiler error" => Some("error"),
+        _ => None,
+    }
+}
+
+/// Trust (DC-18b): a confined unit's sources moved while it compiled. A
+/// shared member is refused for this process; any other unit fails.
+fn moved_member(
+    member: Option<&shared_dependencies::MemberRecorder>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match member {
+        Some(member) => {
+            tracing::debug!("shared member sources moved: {error:#}");
+            member.refuse_for_now(SharedDependencyExclusion::MemberSourceUncaptured)
+        }
+        None => error,
+    }
 }
 
 impl OutputOptions {
@@ -9728,6 +9895,9 @@ impl OutputOptions {
             replay_native_disclosure: false,
             warnings_seen: 0,
             errors_seen: 0,
+            shared_member: false,
+            member_failed: false,
+            path_free_refused: false,
         }
     }
 
@@ -9751,6 +9921,9 @@ impl OutputOptions {
             replay_native_disclosure: true,
             warnings_seen: 0,
             errors_seen: 0,
+            shared_member: false,
+            member_failed: false,
+            path_free_refused: false,
         }
     }
 
@@ -9780,6 +9953,9 @@ mod native_disclosure_replay_tests {
             replay_native_disclosure: replay,
             warnings_seen: 0,
             errors_seen: 0,
+            shared_member: false,
+            member_failed: false,
+            path_free_refused: false,
         }
     }
 
@@ -9946,6 +10122,19 @@ fn on_stderr_line_inner(
             return Ok(true);
         }
     };
+
+    // Trust (DC-18b): a shared member's error, and what the compiler says
+    // after it, is neither shown nor cached: the compile is refused and the
+    // build planned again with the member compiled privately, which reports
+    // it. A `-Ztrust-path-free` refusal records the member as path-bound.
+    if options.shared_member
+        && (options.member_failed
+            || compiler_message_level(compiler_message.get()) == Some("error"))
+    {
+        options.member_failed = true;
+        options.path_free_refused |= compiler_message.get().contains(PATH_FREE_RECORD);
+        return Ok(false);
+    }
 
     if let Some(observation) = &mut options.output_observation {
         observation.observe(compiler_message.get());

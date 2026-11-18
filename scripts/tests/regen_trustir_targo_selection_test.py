@@ -35,7 +35,11 @@ class ProducerToolSelectionTests(unittest.TestCase):
     def tool(self, relative, mode):
         path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"#!{sys.executable}\n" +
+        # A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces
+        # (atpkg's python lives under `Application Support/`): exec splits it, the fake
+        # never runs and every test errors on a missing trace. The sh/python polyglot
+        # keeps argv[0] as this file, which the traces record, under any interpreter path.
+        path.write_text(f'#!/bin/sh\n""":"\nexec "{sys.executable}" "$0" "$@"\n":"""\n' +
             "import json,os,sys\n" +
             f"mode={mode!r}\n" +
             "with open(os.environ['FIXTURE_CALLS'],'a') as f: f.write(json.dumps(dict(tool=sys.argv[0],args=sys.argv[1:]))+'\\n')\n" +

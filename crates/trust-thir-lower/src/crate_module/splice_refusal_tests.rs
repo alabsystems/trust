@@ -29,6 +29,91 @@ fn field(name: &str, ty: Ty, offset: Option<u64>) -> FieldDef {
     FieldDef { name: name.to_string(), ty, offset }
 }
 
+fn nested_closure_record() -> BodyRecord {
+    let mut record = lineage_body_record(0, "nested_closure_capture_graph");
+    record.func_types.push(FuncTy {
+        params: Vec::new(), returns: Vec::new(), is_vararg: false, abi: None,
+    });
+    record.closure_types = vec![
+        trust_ir::ClosureTy { func: FuncTyId::new(0), captures: vec![Ty::Ptr] },
+        trust_ir::ClosureTy {
+            func: FuncTyId::new(0),
+            captures: vec![Ty::Closure(trust_ir::ClosureTyId::new(0))],
+        },
+    ];
+    record.target_info = Some(trust_ir::TargetInfo {
+        triple: "aarch64-apple-darwin".into(), pointer_size: 8,
+        endianness: trust_ir::Endianness::Little, abi: None,
+        struct_passing: trust_ir::StructPassingPolicy::Unclassified,
+    });
+    record.closure_layouts = (0..2).map(|id| trust_ir::ClosureLayoutDescriptor {
+        origin: None, closure: trust_ir::ClosureTyId::new(id),
+        size: 8, align: 8, capture_offsets: vec![0],
+    }).collect();
+    record
+}
+
+#[test]
+fn nested_closure_capture_graph_splices_and_relocates_its_original_frames() {
+    let record = nested_closure_record();
+    assert_eq!(splice_refusal(&record, std::slice::from_ref(&record)), None);
+    let mut destination = Module::new("nested_closure_destination");
+    let func = destination.add_func_type(record.func_types[0].clone()).unwrap();
+    destination.add_closure_type(trust_ir::ClosureTy {
+        func, captures: vec![Ty::U64],
+    }).unwrap();
+    let mut globals = static_globals::StaticGlobals::default();
+    assert!(prepare_body_tables(&record, &mut destination, &mut globals).is_ok());
+    assert_eq!(destination.closure_types.len(), 3);
+    assert_eq!(destination.closure_types[1].captures, vec![Ty::Ptr]);
+    assert_eq!(destination.closure_types[2].captures,
+        vec![Ty::Closure(trust_ir::ClosureTyId::new(1))]);
+    assert_eq!(destination.closure_layouts.len(), 2);
+    for (index, frame) in destination.closure_layouts.iter().enumerate() {
+        assert_eq!(frame.closure, trust_ir::ClosureTyId::new(index as u32 + 1));
+        assert_eq!((frame.size, frame.align, frame.capture_offsets.as_slice()), (8, 8, &[0][..]));
+    }
+}
+
+#[test]
+fn nested_closure_capture_graph_refuses_cycles_forward_ids_and_unmapped_shapes() {
+    for capture in [
+        Ty::Closure(trust_ir::ClosureTyId::new(1)), // self
+        Ty::Closure(trust_ir::ClosureTyId::new(2)), // absent/forward
+        Ty::Tuple(vec![Ty::Closure(trust_ir::ClosureTyId::new(0))]),
+        Ty::Struct(StructId::new(0)),
+    ] {
+        let mut record = nested_closure_record();
+        record.closure_types[1].captures = vec![capture];
+        assert_eq!(splice_refusal(&record, std::slice::from_ref(&record)),
+            Some(SpliceRefusal::ClosureTable));
+    }
+    let mut forward = nested_closure_record();
+    forward.closure_types[0].captures = vec![Ty::Closure(trust_ir::ClosureTyId::new(1))];
+    assert_eq!(splice_refusal(&forward, std::slice::from_ref(&forward)),
+        Some(SpliceRefusal::ClosureTable));
+    let mut bad_signature = nested_closure_record();
+    bad_signature.closure_types[0].func = FuncTyId::new(99);
+    assert_eq!(splice_refusal(&bad_signature, std::slice::from_ref(&bad_signature)),
+        Some(SpliceRefusal::ClosureTable));
+    let mut bad_signature = nested_closure_record();
+    bad_signature.func_types[0].params.push(Ty::Closure(trust_ir::ClosureTyId::new(0)));
+    assert_eq!(splice_refusal(&bad_signature, std::slice::from_ref(&bad_signature)),
+        Some(SpliceRefusal::ClosureTable));
+}
+
+#[test]
+fn nested_closure_capture_graph_keeps_layout_failure_atomic() {
+    let mut record = nested_closure_record();
+    record.closure_layouts[1].capture_offsets[0] = 8;
+    let mut destination = Module::new("nested_closure_bad_frame");
+    let before = destination.clone();
+    let mut globals = static_globals::StaticGlobals::default();
+    assert_eq!(prepare_body_tables(&record, &mut destination, &mut globals).err(),
+        Some(SpliceRefusal::ClosureLayout));
+    assert_eq!(destination, before);
+}
+
 fn row(
     id: u32,
     name: &str,

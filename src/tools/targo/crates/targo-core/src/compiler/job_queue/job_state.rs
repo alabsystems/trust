@@ -374,18 +374,26 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
 
     /// The coordinator owns BuildRunner and its non-Send configuration. Ask
     /// it to repeat the ordinary freshness check while we hold the unit lock.
-    pub fn recheck_freshness(&self, force: bool) -> CargoResult<bool> {
+    /// Trust (DC-24a): a miss of a shared unit carries its key where the build
+    /// names a unit source. `staged` asks for the check of a unit a source
+    /// staged and the worker placed (`fingerprint::recheck_after_lock`).
+    pub(crate) fn recheck_freshness(
+        &self,
+        force: bool,
+        staged: bool,
+    ) -> CargoResult<crate::compiler::unit_source::Recheck> {
         let (reply, result) = std::sync::mpsc::channel();
         self.messages.push(Message::RecheckFreshness {
             id: self.id,
             force,
+            staged,
             reply,
         });
-        let warm = result
+        let recheck = result
             .recv()
             .map_err(|_| anyhow::anyhow!("build coordinator closed the freshness reply"))??;
-        self.current_warm.set(warm);
-        Ok(warm)
+        self.current_warm.set(recheck.fresh);
+        Ok(recheck)
     }
 
     pub fn downgrade_to_shared(&self, lock: &LockKey) -> CargoResult<()> {

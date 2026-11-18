@@ -18,6 +18,7 @@ use crate::CargoResult;
 use crate::util::file_identity::{
     metadata_is_plain_directory, metadata_is_plain_file, opened_file_identity,
 };
+use crate::util::log_message::SharedDependencyExclusion;
 
 const MAX_ENTRIES: usize = 100_000;
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -25,6 +26,9 @@ const MAX_BYTES: u64 = 512 * 1024 * 1024;
 #[derive(Debug)]
 pub(crate) struct SourceInputs {
     root: PathBuf,
+    /// Trust (DC-18b): the workspace directory a relocatable capture's digest
+    /// leaves out (a shared member's), `None` for one that binds its path.
+    workspace: Option<PathBuf>,
     digest: String,
     // SAME admitted package originals retained across units, policies and
     // failed commands. Legacy content identity alone acquires no such owner.
@@ -62,7 +66,18 @@ impl SourceInputs {
         }
         Self::capture_legacy(root)
     }
+    /// Trust (DC-18b): a workspace member's tree, digested without the
+    /// checkout's path: the package's place in the workspace and every entry
+    /// below it, as `capture` digests them. Two checkouts at one commit give
+    /// one digest. Always the legacy capture: members are not shared under a
+    /// native resource owner (`shared_dependencies::Eligibility`).
+    pub fn capture_relocatable(root: &Path, workspace: &Path) -> CargoResult<Self> {
+        Self::capture_tree(root, Some(workspace))
+    }
     fn capture_legacy(root: &Path) -> CargoResult<Self> {
+        Self::capture_tree(root, None)
+    }
+    fn capture_tree(root: &Path, workspace: Option<&Path>) -> CargoResult<Self> {
         tracing::trace!(path = %root.display(), "capturing confined source inputs");
         if !root.is_absolute() {
             bail!("source input root must be absolute");
@@ -71,9 +86,30 @@ impl SourceInputs {
         let root = root.canonicalize()?;
         let entries = inventory(&root)?;
         let mut hash = Sha256::new();
-        field(&mut hash, b"targo-read-only-source-tree-v1");
-        field(&mut hash, selected.as_os_str().as_encoded_bytes());
-        field(&mut hash, root.as_os_str().as_encoded_bytes());
+        match workspace {
+            None => {
+                field(&mut hash, b"targo-read-only-source-tree-v1");
+                field(&mut hash, selected.as_os_str().as_encoded_bytes());
+                field(&mut hash, root.as_os_str().as_encoded_bytes());
+            }
+            Some(workspace) => {
+                let place = selected.strip_prefix(workspace).with_context(|| {
+                    format!(
+                        "member source {} is outside its workspace {}",
+                        selected.display(),
+                        workspace.display()
+                    )
+                })?;
+                if root != workspace.canonicalize()?.join(place) {
+                    bail!(
+                        "member source {} resolves outside its workspace",
+                        selected.display()
+                    );
+                }
+                field(&mut hash, b"targo-relocatable-source-tree-v1");
+                field(&mut hash, place.as_os_str().as_encoded_bytes());
+            }
+        }
         let mut bytes = 0_u64;
         for (relative, directory) in &entries {
             field(&mut hash, relative.as_os_str().as_encoded_bytes());
@@ -128,6 +164,7 @@ impl SourceInputs {
         }
         Ok(Self {
             root: selected,
+            workspace: workspace.map(Path::to_path_buf),
             digest: hash.finish_hex(),
             #[cfg(unix)]
             native: None,
@@ -149,6 +186,7 @@ impl SourceInputs {
         original.validate(deadline)?;
         Ok(Self {
             root: root.into(),
+            workspace: None,
             digest: hex::encode(original.content_digest()),
             native: Some((original, deadline)),
         })
@@ -173,7 +211,7 @@ impl SourceInputs {
             original.validate(*deadline)?;
             return Ok(());
         }
-        if Self::capture_legacy(&self.root)?.digest != self.digest {
+        if Self::capture_tree(&self.root, self.workspace.as_deref())?.digest != self.digest {
             bail!(
                 "confined action source inputs changed: {}",
                 self.root.display()
@@ -263,7 +301,7 @@ pub(super) fn for_unit(
         if let Some(inputs) = inputs {
             // Replanning after a unit-lock wait must not reuse the earlier
             // source snapshot after the live directory has changed.
-            inputs.ensure_current()?;
+            ensure_member_current(build, unit, inputs)?;
         }
         return Ok(inputs.clone());
     }
@@ -280,7 +318,17 @@ pub(super) fn for_unit(
     }
     let home = build.bcx.gctx.home().as_path_unlocked();
     let inputs = if source_is_read_only(&root, &writable, home) {
-        Some(Arc::new(SourceInputs::capture(&root)?))
+        Some(if build.bcx.shared_member(unit) {
+            // Trust (DC-18b): the slot was chosen by this same capture.
+            let inputs =
+                build.bcx.shared_eligibility.source(unit).ok_or_else(|| {
+                    anyhow::anyhow!("shared member has no planned source capture")
+                })?;
+            ensure_member_current(build, unit, &inputs)?;
+            inputs
+        } else {
+            Arc::new(SourceInputs::capture(&root)?)
+        })
     } else {
         None
     };
@@ -288,7 +336,29 @@ pub(super) fn for_unit(
     Ok(inputs)
 }
 
-fn source_is_read_only(root: &Path, writable: &[PathBuf], cache: &Path) -> bool {
+/// Trust (DC-18b): a shared member whose sources moved since its slot was
+/// chosen (an editor's save, a file the desktop writes) is not that slot's:
+/// it is compiled privately, and the next invocation tries it again. Any
+/// other unit's change stays an error.
+pub(super) fn ensure_member_current(
+    build: &BuildRunner<'_, '_>,
+    unit: &Unit,
+    inputs: &SourceInputs,
+) -> CargoResult<()> {
+    match inputs.ensure_current() {
+        Err(error) if build.bcx.shared_member(unit) => {
+            tracing::debug!("shared member sources moved: {error:#}");
+            Err(build
+                .bcx
+                .shared_eligibility
+                .recorder(unit)?
+                .refuse_for_now(SharedDependencyExclusion::MemberSourceUncaptured))
+        }
+        result => result,
+    }
+}
+
+pub(super) fn source_is_read_only(root: &Path, writable: &[PathBuf], cache: &Path) -> bool {
     let (Ok(root), Ok(cache)) = (root.canonicalize(), cache.canonicalize()) else {
         return false;
     };

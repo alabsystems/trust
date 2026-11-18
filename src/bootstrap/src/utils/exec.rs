@@ -451,7 +451,11 @@ impl<'a> BootstrapCommand {
 
     /// Spawn the command in background, while capturing and returning all its output.
     #[track_caller]
-    #[expect(dead_code, reason = "general-purpose, currently unused")]
+    // Trust: exec's protected tests call it, so it is dead only outside them.
+    #[cfg_attr(
+        not(all(test, any(target_os = "macos", target_os = "linux"))),
+        expect(dead_code, reason = "general-purpose, currently unused")
+    )]
     pub(crate) fn start_capture(
         &'a mut self,
         exec_ctx: impl AsRef<ExecutionContext>,
@@ -767,7 +771,11 @@ impl CommandProcess {
 pub(crate) struct StreamingCommand {
     child: StreamingChild,
     pub(crate) stdout: Option<CommandReader>,
-    #[expect(dead_code, reason = "symmetric with `stdout`")]
+    // Trust: exec's protected tests read it, so it is dead only outside them.
+    #[cfg_attr(
+        not(all(test, any(target_os = "macos", target_os = "linux"))),
+        expect(dead_code, reason = "symmetric with `stdout`")
+    )]
     pub(crate) stderr: Option<CommandReader>,
     fingerprint: CommandFingerprint,
     start_time: Instant,

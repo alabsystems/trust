@@ -979,6 +979,7 @@ impl TrustCgCodegenBackend {
                                 never_inline: instance_is_never_inline(tcx, instance),
                                 placement: agreement.placement.clone(),
                                 inventory_residue: false,
+                                adapter_identity: agreement.adapter_identity(),
                             },
                         );
                         native_abi.push(agreement);
@@ -1062,6 +1063,7 @@ impl TrustCgCodegenBackend {
                                 never_inline: instance_is_never_inline(tcx, instance),
                                 placement: agreement.placement.clone(),
                                 inventory_residue: true,
+                                adapter_identity: agreement.adapter_identity(),
                             },
                         );
                         native_abi.push(agreement);
@@ -2547,10 +2549,13 @@ fn fn_abi_preconditions_with_source<'tcx>(
     let instance_ty = instance.ty(tcx, typing_env);
     let (extern_abi, closure_args) = match instance_ty.kind() {
         ty::Closure(def_id, args) if source_closure => {
+            let closure = args.as_closure();
+            let borrowed_empty = closure.kind() == ty::ClosureKind::Fn
+                && closure.upvar_tys().is_empty();
             if instance.def != ty::InstanceKind::Item(*def_id)
-                || args.as_closure().kind() != ty::ClosureKind::FnOnce
+                || (closure.kind() != ty::ClosureKind::FnOnce && !borrowed_empty)
             {
-                return Err("the native source ABI requires an ordinary FnOnce closure".into());
+                return Err("the native source ABI requires an ordinary FnOnce or borrowed empty Fn closure".into());
             }
             let sig = tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
             let [tuple] = sig.inputs() else {

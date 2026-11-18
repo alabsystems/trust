@@ -75,6 +75,8 @@ pub mod fatal_error;
 pub mod profiling;
 
 pub mod macros;
+// Trust: DC-18a, the classifier behind `-Ztrust-path-free`.
+pub mod trust_path_free;
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::hash::Hash;

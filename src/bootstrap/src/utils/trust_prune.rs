@@ -38,6 +38,15 @@
 //!   that its unit's rlib holds as a member of the same name and size. Bootstrap passes
 //!   `-Ztrust-drop-rlib-objects` to no compiler (EW18-DROPIN-1), so every unit compiled
 //!   with debuginfo keeps writing them, in every tree.
+//! * *Incremental folders* ([`plan_incremental`], DC-12c), in the automatic prune only: each
+//!   crate folder of a profile directory's `incremental/` that no unit the judge keeps uses,
+//!   removed once the tree's dead units went. The compiler names the folder and collects old
+//!   sessions only inside the one it uses, so a superseded variant's folder stays for good;
+//!   which folder a unit uses is the note bootstrap's compiler wrapper wrote when it last
+//!   compiled it ([`incremental`]). A live unit with no readable note (compiled before the
+//!   wrapper noted, or noting failed) keeps every folder of a crate name it may have.
+//!   Incremental compilation is off in the tracked defaults (`rust.incremental`, false in
+//!   every `src/bootstrap/defaults` profile) and on where a local `bootstrap.toml` sets it.
 //!
 //! Every tree slim's `target_trees` names is judged ([`target_trees`]), not only the trees
 //! this run built in, and each tree on its own ([`prune`]).
@@ -72,11 +81,13 @@
 //! run compiled nothing, costs that digest: a few stats and those files' bytes. The first
 //! run on a tree clears its backlog. Skipping is never a deletion: what a later root would
 //! supersede in an unchanged tree waits for its next change. Each run prints the units,
-//! GiB and seconds; a failure warns and leaves the tree, and the build's result never
-//! changes. `rust.trust-prune-superseded = false` turns it off.
+//! objects and incremental folders, GiB and seconds; a failure warns and leaves the tree,
+//! and the build's result never changes. `rust.trust-prune-superseded = false` turns it
+//! off.
 //!
 //! **The interface** is bootstrap-free: [`target_trees`] and [`profile_dirs`] take paths,
-//! [`plan_tree`] takes a tree, its profile directories and the extra roots and returns a
+//! [`plan_tree_selected`] takes a tree, its profile directories, extra roots and selected
+//! cleanup classes and returns a
 //! [`Plan`], so Targo's target cleaning (targo-core `workspace/gc.rs`) can later reuse the
 //! judge rather than duplicate it. Only [`after_success`] and [`note_cargo_message`] know
 //! bootstrap.
@@ -102,6 +113,9 @@ use crate::core::build_steps::compile::CargoMessage;
 use crate::core::builder::Kind;
 use crate::core::config::Config;
 
+// The wrapper writes what the prune reads; each build uses only its own half.
+#[allow(dead_code)]
+pub(crate) mod incremental;
 pub(crate) mod space;
 
 /// The stamp a judged tree carries at its root: [`STAMP_SCHEMA`], then the digest of what
@@ -348,8 +362,11 @@ pub(crate) struct Summary {
     pub(crate) skipped: Vec<(PathBuf, String)>,
     pub(crate) units: usize,
     pub(crate) objects: usize,
+    /// Incremental crate folders removed: no live unit used them.
+    pub(crate) incremental: usize,
     pub(crate) planned_units: usize,
     pub(crate) planned_objects: usize,
+    pub(crate) planned_incremental: usize,
     pub(crate) space_estimate: Option<space::Estimate>,
     pub(crate) space_observation_errors: Vec<String>,
     pub(crate) bytes: u64,
@@ -377,14 +394,16 @@ impl Summary {
         println!("{}", self.line());
     }
 
-    /// The one line every prune prints: units, GiB and seconds.
+    /// The one line every prune prints: units, objects, incremental folders, GiB and seconds.
     pub(crate) fn line(&self) -> String {
         format!(
-            "Prune: removed {} superseded units and {} duplicate objects, {:.2} GiB, in {:.2} s \
-             ({} target trees: {} judged, {} unchanged since their last prune, {} left as they \
-             are; this run's cargo reported {} artifacts, {} compiled)",
+            "Prune: removed {} superseded units, {} duplicate objects and {} unused incremental \
+             folders, {:.2} GiB, in {:.2} s ({} target trees: {} judged, {} unchanged since \
+             their last prune, {} left as they are; this run's cargo reported {} artifacts, {} \
+             compiled)",
             self.units,
             self.objects,
+            self.incremental,
             self.bytes as f64 / (1u64 << 30) as f64,
             self.elapsed.as_secs_f64(),
             self.trees,
@@ -483,6 +502,9 @@ fn prune_selected_inner(
     summary.trees = trees.len();
     let every_profile: Vec<PathBuf> = trees.iter().flat_map(|(_, p)| p.iter().cloned()).collect();
     let mut links: Option<Vec<PathBuf>> = None;
+    // The incremental folders are judged by the automatic prune alone: manual cleanup has its
+    // own whole-folder reclaim (`repo-prune --rustc-caches`). The stamp binds that choice too.
+    let incremental = variants && observation.is_none();
     for (tree, profiles) in &trees {
         if let Some(why) = outside(build, tree) {
             summary.skipped.push((tree.clone(), why));
@@ -503,17 +525,14 @@ fn prune_selected_inner(
                         || real.as_ref().is_some_and(|real| s.path.starts_with(real)))
             })
         };
-        let digest = selected_digest(tree, profiles, variants, options.objects);
+        let digest = selected_digest(tree, profiles, variants, options.objects, incremental);
         if !dry_run && !compiled_here && digest.is_some() && read_stamp(tree) == digest {
             summary.unchanged += 1;
             drop(locks);
             continue;
         }
-        let planned = if variants {
-            plan_tree(tree, profiles, streamed, options.objects)
-        } else {
-            plan_tree_selected(tree, profiles, streamed, false, options.objects)
-        };
+        let planned =
+            plan_tree_selected(tree, profiles, streamed, variants, options.objects, incremental);
         let plan = match planned {
             Ok(plan) => plan,
             Err(unreadable) => {
@@ -548,6 +567,7 @@ fn prune_selected_inner(
                 .filter(|(_, _, unit)| !*unit)
                 .map(|(_, paths, _)| paths.len())
                 .sum::<usize>();
+            summary.planned_incremental += plan.incremental.iter().filter(|u| u.folder).count();
             if observation.is_some() {
                 prepared.push((tree, profiles, plan, locks));
                 continue;
@@ -566,6 +586,15 @@ fn prune_selected_inner(
                 summary.failures.extend(removal.failures);
                 continue; // judged again next time
             }
+            // Only once every dead unit went: a unit that kept its fingerprint is judged
+            // again, with what it uses.
+            let removal = remove_unused(&plan.incremental);
+            summary.incremental += removal.incremental;
+            summary.bytes += removal.bytes;
+            if !removal.failures.is_empty() {
+                summary.failures.extend(removal.failures);
+                continue;
+            }
         }
         if observation.is_some() {
             prepared.push((tree, profiles, plan, locks));
@@ -573,7 +602,8 @@ fn prune_selected_inner(
         }
         // The stamp binds the selected cleanup policy as well as the inputs.
         if !dry_run
-            && let Some(digest) = selected_digest(tree, profiles, variants, options.objects)
+            && let Some(digest) =
+                selected_digest(tree, profiles, variants, options.objects, incremental)
             && let Err(error) = write_stamp(tree, &digest)
         {
             summary.failures.push(format!("{}: {STAMP} not written: {error}", tree.display()));
@@ -646,6 +676,13 @@ fn prune_selected_inner(
                     summary.failures.extend(removal.failures);
                     continue;
                 }
+                let removal = remove_unused(&plan.incremental);
+                summary.incremental += removal.incremental;
+                summary.bytes += removal.bytes;
+                if !removal.failures.is_empty() {
+                    summary.failures.extend(removal.failures);
+                    continue;
+                }
             }
             if let Some(check) = observation.revalidate
                 && let Err(error) = check()
@@ -653,7 +690,8 @@ fn prune_selected_inner(
                 summary.failures.push(error);
                 break;
             }
-            if let Some(digest) = selected_digest(tree, profiles, variants, options.objects)
+            if let Some(digest) =
+                selected_digest(tree, profiles, variants, options.objects, incremental)
                 && let Err(error) = write_stamp(tree, &digest)
             {
                 summary.failures.push(format!("{}: {STAMP} not written: {error}", tree.display()));
@@ -1926,6 +1964,9 @@ pub(crate) struct Plan {
     pub(crate) verdicts: Vec<Verdict>,
     /// `(unit, its duplicate objects, why)`.
     pub(crate) objects: Vec<(usize, Vec<PathBuf>, String)>,
+    /// The incremental crate folders no live unit uses, and the notes no live unit has
+    /// ([`plan_incremental`]).
+    pub(crate) incremental: Vec<Unused>,
 }
 
 impl Plan {
@@ -1945,8 +1986,12 @@ impl Plan {
         out
     }
 
+    /// Every path the plan deletes: the units' and objects', then the incremental ones.
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
-        self.unit_paths().into_iter().flat_map(|(_, paths, _)| paths).collect()
+        let mut paths: Vec<PathBuf> =
+            self.unit_paths().into_iter().flat_map(|(_, paths, _)| paths).collect();
+        paths.extend(self.incremental.iter().map(|unused| unused.path.clone()));
+        paths
     }
 
     /// One line per unit and object entry the plan removes, with why.
@@ -1970,20 +2015,26 @@ impl Plan {
                 objects.len()
             ));
         }
+        for unused in self.incremental.iter().filter(|unused| unused.folder) {
+            lines.push(format!("incremental {}  {}", rel(&unused.path), unused.why));
+        }
         lines
     }
 }
 
 /// Judges one tree: paths in, a plan out. `profiles` are the tree's profile directories
 /// ([`profile_dirs`]); `streamed` are extra roots (bootstrap: this run's cargo reports).
-/// A stamp that cannot be read, or a profile directory that cannot be listed, refuses.
-pub(crate) fn plan_tree(
+/// The plan holds the units, the duplicate objects and the unused incremental folders.
+/// A stamp that cannot be read, or a profile directory (or its `incremental/`) that cannot
+/// be listed, refuses.
+#[cfg(test)]
+fn plan_tree(
     tree: &Path,
     profiles: &[PathBuf],
     streamed: &[Streamed],
     objects: bool,
 ) -> Result<Plan, Vec<String>> {
-    plan_tree_selected(tree, profiles, streamed, true, objects)
+    plan_tree_selected(tree, profiles, streamed, true, objects, true)
 }
 
 fn plan_tree_selected(
@@ -1992,6 +2043,7 @@ fn plan_tree_selected(
     streamed: &[Streamed],
     variants: bool,
     objects: bool,
+    incremental: bool,
 ) -> Result<Plan, Vec<String>> {
     let unreadable: Vec<String> = profiles.iter().flat_map(|p| stamp_records(p).1).collect();
     if !unreadable.is_empty() {
@@ -2017,7 +2069,131 @@ fn plan_tree_selected(
             }
         }
     }
-    Ok(Plan { tree: tree.to_owned(), units, verdicts, objects: planned })
+    let mut unused = Vec::new();
+    if variants && incremental {
+        for profile in profiles {
+            unused.extend(plan_incremental(profile, &units, &verdicts).map_err(|e| vec![e])?);
+        }
+    }
+    Ok(Plan { tree: tree.to_owned(), units, verdicts, objects: planned, incremental: unused })
+}
+
+// --------------------------------------------------------------------------------------
+// Incremental folders (DC-12c).
+// --------------------------------------------------------------------------------------
+
+/// An entry of a profile directory's `incremental/` that the plan removes: a crate folder
+/// (`folder`) or a note ([`incremental::NOTE_PREFIX`]), and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Unused {
+    pub(crate) path: PathBuf,
+    pub(crate) folder: bool,
+    pub(crate) why: String,
+}
+
+/// The crate names a unit's incremental folder may carry when no note says which one it is:
+/// every `-`-suffix of its hash files' names (cargo's `<kind>-<target>`: `lib-<crate>`,
+/// `build-script-build-script-build`) with `-` read as `_`, the crate its artifacts name, and,
+/// for a unit with neither, its package name read the same way. A build script's package name
+/// is not its crate's (`build_script_build`), so it is not claimed where the hash files say.
+/// More is only kept longer.
+fn unit_crates(unit: &Unit) -> HashSet<String> {
+    let mut crates = HashSet::new();
+    for kind in &unit.kinds {
+        for (at, _) in kind.match_indices('-') {
+            crates.insert(kind[at + 1..].replace('-', "_"));
+        }
+    }
+    for path in unit.outputs.iter().chain(&unit.depinfo).chain(&unit.objects) {
+        if let Some((krate, _)) =
+            path.file_name().and_then(|name| name.to_str()).and_then(artifact_name)
+        {
+            crates.insert(krate.to_owned());
+        }
+    }
+    if crates.is_empty() {
+        crates.insert(unit.pkg.replace('-', "_"));
+    }
+    crates
+}
+
+/// What of `profile`'s `incremental/` no unit the judge keeps uses
+/// ([`incremental`] has the link). A crate folder stays when the note of a live unit of
+/// `profile` names it, or when its crate name is one a live unit with no readable note may
+/// have ([`unit_crates`]): that unit was last compiled before the wrapper noted folders, or
+/// noting failed. Every other crate folder goes, with the note of each unit that is dead or
+/// gone and each note's stage a wrapper left ([`incremental::partial_note`]). Other files,
+/// links and names that are no crate folder's stay. An absent or linked `incremental/` holds
+/// nothing; one that cannot be listed leaves the tree.
+pub(crate) fn plan_incremental(
+    profile: &Path,
+    units: &[Unit],
+    verdicts: &[Verdict],
+) -> Result<Vec<Unused>, String> {
+    let dir = profile.join("incremental");
+    let mut folders = Vec::new();
+    let mut notes: HashMap<String, PathBuf> = HashMap::new();
+    let mut unused = Vec::new();
+    for entry in entries(&dir)? {
+        let name = name_of(&entry);
+        if is_dir_entry(&entry) && incremental::folder_crate(&name).is_some() {
+            folders.push((name, entry.path()));
+        } else if is_file_entry(&entry)
+            && let Some(id) = incremental::note_unit(&name)
+        {
+            notes.insert(id.to_owned(), entry.path());
+        } else if is_file_entry(&entry) && incremental::partial_note(&name) {
+            // The prune holds the tree's cargo locks, so no wrapper of this tree is writing it.
+            unused.push(Unused {
+                path: entry.path(),
+                folder: false,
+                why: "a note's stage its wrapper never finished".to_owned(),
+            });
+        }
+    }
+    let mut named: HashSet<String> = HashSet::new();
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut live_ids: HashSet<&str> = HashSet::new();
+    let mut dead_ids: HashSet<&str> = HashSet::new();
+    for verdict in verdicts {
+        let unit = &units[verdict.unit];
+        if unit.profile != profile {
+            continue;
+        }
+        if verdict.dead {
+            dead_ids.insert(&unit.unit_id);
+            continue;
+        }
+        live_ids.insert(&unit.unit_id);
+        match notes.get(&unit.unit_id).map(|note| incremental::read_note(note)) {
+            Some(Ok(folders)) => named.extend(folders),
+            _ => claimed.extend(unit_crates(unit)),
+        }
+    }
+    for (name, path) in folders {
+        let krate = incremental::folder_crate(&name).unwrap_or_default();
+        if named.contains(&name) || claimed.contains(krate) {
+            continue;
+        }
+        unused.push(Unused {
+            path,
+            folder: true,
+            why: format!(
+                "unused: no live unit's note names it, and no live unit without a note can be \
+                 `{krate}`"
+            ),
+        });
+    }
+    let mut ids: Vec<(&String, &PathBuf)> = notes.iter().collect();
+    ids.sort();
+    for (id, path) in ids {
+        if live_ids.contains(id.as_str()) {
+            continue;
+        }
+        let why = if dead_ids.contains(id.as_str()) { "its unit is dead" } else { "no unit" };
+        unused.push(Unused { path: path.clone(), folder: false, why: why.to_owned() });
+    }
+    Ok(unused)
 }
 
 /// `os.path.abspath`: absolute, with `.` and `..` resolved by spelling alone.
@@ -2130,12 +2306,10 @@ pub(crate) fn stamped_in_plan(doomed: &[PathBuf], profiles: &[PathBuf]) -> Vec<S
 pub(crate) fn outside_trees(plan: &Plan) -> Vec<String> {
     let mut lines = Vec::new();
     let tree = realpath(&plan.tree);
-    for (_, paths, _) in plan.unit_paths() {
-        for path in paths {
-            let parent = realpath(path.parent().unwrap_or(Path::new("/")));
-            if parent != tree && !parent.starts_with(&tree) {
-                lines.push(format!("{} is outside {}", path.display(), plan.tree.display()));
-            }
+    for path in plan.paths() {
+        let parent = realpath(path.parent().unwrap_or(Path::new("/")));
+        if parent != tree && !parent.starts_with(&tree) {
+            lines.push(format!("{} is outside {}", path.display(), plan.tree.display()));
         }
     }
     lines
@@ -2322,6 +2496,8 @@ impl CargoLocks {
 pub(crate) struct Removal {
     pub(crate) units: usize,
     pub(crate) objects: usize,
+    /// Incremental crate folders removed whole.
+    pub(crate) incremental: usize,
     /// Allocated bytes of every file whose last link went.
     pub(crate) bytes: u64,
     pub(crate) failures: Vec<String>,
@@ -2494,6 +2670,23 @@ pub(crate) fn remove_units(unit_paths: &[(&Unit, Vec<PathBuf>, bool)]) -> Remova
     removal
 }
 
+/// Removes the incremental folders and notes the plan found unused; a folder is counted only
+/// when all of it went.
+pub(crate) fn remove_unused(unused: &[Unused]) -> Removal {
+    let mut removal = Removal::default();
+    for entry in unused {
+        // One that is already gone is nothing removed.
+        let there = fs::symlink_metadata(&entry.path).is_ok();
+        if remove_path(&entry.path, &mut removal.bytes, &mut removal.failures)
+            && entry.folder
+            && there
+        {
+            removal.incremental += 1;
+        }
+    }
+    removal
+}
+
 // --------------------------------------------------------------------------------------
 // The stamp: what a tree was when it was last judged.
 // --------------------------------------------------------------------------------------
@@ -2503,18 +2696,20 @@ fn selected_digest(
     profiles: &[PathBuf],
     variants: bool,
     objects: bool,
+    incremental: bool,
 ) -> Option<String> {
     let inputs = tree_digest(tree, profiles)?;
     let mut digest = sha2::Sha256::new();
     digest.update(b"trust-prune-selection/v1");
-    digest.update([u8::from(variants), u8::from(objects)]);
+    digest.update([u8::from(variants), u8::from(objects), u8::from(incremental)]);
     digest.update(inputs.as_bytes());
     Some(format!("{:x}", digest.finalize()))
 }
 
 /// A digest of what judging `tree` reads that a build changes: for each profile
-/// directory, the identity and modification time of its `.fingerprint`, `deps`, `build`
-/// and `examples` directories (a unit made or removed changes one; a new-layout package
+/// directory, the identity and modification time of its `.fingerprint`, `deps`, `build`,
+/// `examples` and `incremental` directories (a unit, an incremental crate folder or a note
+/// made or removed changes one; a new-layout package
 /// directory under `build/` is listed too), the bytes of its stamps and uplifted dep-info,
 /// and the size and time of its other files and of `examples/`'s uplifted ones. A no-op
 /// build rewrites every stamp and dep-info with the same bytes and clones every uplift
@@ -2538,7 +2733,7 @@ pub(crate) fn tree_digest(tree: &Path, profiles: &[PathBuf]) -> Option<String> {
     for profile in profiles {
         let rel = profile.strip_prefix(tree).unwrap_or(profile);
         line(format!("profile {}", rel.display()));
-        for sub in [".fingerprint", "deps", "build", "examples"] {
+        for sub in [".fingerprint", "deps", "build", "examples", "incremental"] {
             line(format!("dir {sub} {}", stat(&profile.join(sub))));
         }
         let mut listing: Vec<fs::DirEntry> = fs::read_dir(profile).ok()?.flatten().collect();

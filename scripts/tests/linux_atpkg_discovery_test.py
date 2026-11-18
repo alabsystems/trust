@@ -49,7 +49,7 @@ class NativeAtpkgDiscoveryTests(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(recreate.platform, "system", return_value="Linux"))
         self.stack.enter_context(forbid_processes())
 
-    def fixture_pack(self, system="Linux"):
+    def fixture_pack(self, system="Linux", *, aside=False):
         relative = "Library/Application Support/aterm/pkg" if system == "Darwin" else ".local/share/aterm/pkg"
         prefix = self.task_home / relative
         pack = prefix / "store/trust/42"
@@ -67,6 +67,10 @@ class NativeAtpkgDiscoveryTests(unittest.TestCase):
         (prefix / "status.toml").write_text(
             'schema = 1\n[programs.trust]\ninstalled_build = 42\ntree_root = "' + "a" * 64 + '"\n'
         )
+        if aside:
+            physical = pack.with_name(f"{pack.name}.noindex")
+            pack.rename(physical)
+            pack.symlink_to(physical.name, target_is_directory=True)
         return prefix, pack
 
     def test_linux_default_is_the_actual_atpkg_prefix(self):
@@ -99,6 +103,37 @@ class NativeAtpkgDiscoveryTests(unittest.TestCase):
         with mock.patch.object(recreate.platform, "system", return_value="Darwin"):
             self.assertEqual(recreate._capture_atpkg_pack()["pack_local_path"], str(pack))
 
+    def test_laid_aside_pack_retains_logical_tool_selection(self):
+        _, pack = self.fixture_pack("Darwin", aside=True)
+        physical = pack.with_name("42.noindex")
+        paths = {key: str(pack / "bin" / name) for key, name in recreate.ATPKG_STAGE0_TOOLS.items()}
+        with mock.patch.object(recreate.platform, "system", return_value="Darwin"):
+            capture = recreate._capture_atpkg_pack(paths)
+        self.assertEqual(capture["build"], 42)
+        self.assertEqual(capture["pack_local_path"], str(pack))
+        self.assertEqual(capture["pack_physical_path"], str(physical))
+        self.assertEqual(capture["configured_tools"]["rustc"]["selected_local_path"], paths["rustc"])
+        self.assertEqual(capture["configured_tools"]["rustc"]["resolved_real_path"], str(physical / "bin/trustc"))
+
+    def test_unowned_or_chained_pack_alias_refuses(self):
+        _, pack = self.fixture_pack(aside=True)
+        physical = pack.with_name("42.noindex")
+        pack.with_name("other").symlink_to(physical.name, target_is_directory=True)
+        pack.with_name("43.noindex").mkdir()
+        for target in (physical, "other", "43.noindex"):
+            with self.subTest(target=target):
+                pack.unlink()
+                pack.symlink_to(target, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "numbered store pack|owned .noindex"):
+                    recreate._capture_atpkg_pack()
+
+        pack.unlink()
+        physical.rename(pack.with_name("43"))
+        physical.symlink_to("43", target_is_directory=True)
+        pack.symlink_to(physical.name, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "numbered store pack|owned .noindex"):
+            recreate._capture_atpkg_pack()
+
     def test_linux_mixed_shims_still_refuse(self):
         prefix, _ = self.fixture_pack()
         (prefix / "bin/trustc").write_text('#!/bin/sh\nexec /untrusted/trustc "$@"\n')
@@ -113,7 +148,7 @@ class NativeAtpkgDiscoveryTests(unittest.TestCase):
             recreate._capture_atpkg_pack()
 
     def test_linux_authority_remains_local_candidate_not_release(self):
-        _, pack = self.fixture_pack()
+        _, pack = self.fixture_pack(aside=True)
         verifier = self.task_home / "atpkg"
         verifier.write_bytes(b"inert verifier")
         verifier.chmod(0o755)
@@ -122,7 +157,7 @@ class NativeAtpkgDiscoveryTests(unittest.TestCase):
             self.assertEqual(argv[0], str(verifier))
             if argv[1:] == ["verify", "trust"]:
                 return SimpleNamespace(returncode=0, stdout="atpkg: trust build 42 OK (matches signed tree_root)\n", stderr="")
-            self.assertEqual(argv[1:], ["tree-root", str(pack)])
+            self.assertEqual(argv[1:], ["tree-root", str(pack.with_name("42.noindex"))])
             return SimpleNamespace(returncode=0, stdout="a" * 64 + "\n", stderr="")
 
         with mock.patch.object(recreate.shutil, "which", return_value=str(verifier)), mock.patch.object(subprocess, "run", side_effect=verify):
@@ -139,7 +174,7 @@ class NativeAtpkgDiscoveryTests(unittest.TestCase):
         with mock.patch.object(recreate, "atpkg_trust_sysroot", side_effect=AssertionError("fresh seed must use pin")), mock.patch.object(recreate, "resolve_seed", return_value=False) as resolve, contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "refusing genesis fallback"):
                 recreate.resolve_stage0_selection(self.task_home, args)
-        resolve.assert_called_once_with(self.task_home, allow_fetch=False, host="aarch64-unknown-linux-gnu")
+        resolve.assert_called_once_with(self.task_home, allow_fetch=False, host="aarch64-unknown-linux-gnu", use_store=True)
 
     def test_ddc_search_uses_platform_default_and_excludes_current_pin(self):
         for system, relative in (("Linux", ".local/share/aterm/pkg"), ("Darwin", "Library/Application Support/aterm/pkg")):

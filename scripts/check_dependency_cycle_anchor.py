@@ -159,6 +159,18 @@ TERMINAL_POLICY_V2_PRE_MARKER = (
 # constants of the 2026-09-21 ruling and are spelled into the v3 marker.
 TRUST_WP_W0 = "e7c353690e1b58a4e830edc9facb0e4396164585"
 TRUST_WP_PRESERVATION_FLOOR = "1de995e192aabec74646d4d53642df05fa59466f"
+# Three pushed merges that recorded a TrustWP binding neither marked parent
+# carried, landed while no push lane judged v3 (docs/DECISION_QUEUE.md
+# TRUSTWP-MERGE-MINT-ADMITTED).  Pushed history is not rewritten, so each EXACT
+# (merge, binding) pair is judged as a merge that adopted that binding: every
+# marked parent's binding must still be retained by it, through (a) or (b).
+# Any other merge that mints, including one of these with another binding or
+# another merge with one of these bindings, is still refused.
+TRUST_WP_ADMITTED_MERGE_MINTS = {
+    "543a69d86babc39175a31b6d8337695f4b6fce48": "af8bad3fed08d92fcf94542a75391bc925901997",
+    "7385559b83501afe7ce0e4a2e0f21725e6791b5b": "2605e3c0d457f6f4f23058752857b5ede926ecc7",
+    "6e82620248f35f01c5c01b7e59155a17270b5380": "889a9db3c560e9033114e20bbb21ecd2da88f2bf",
+}
 TERMINAL_POLICY_V3_MARKER_PATH = ".trust-terminal-policy-v3"
 TERMINAL_POLICY_V3_POLICY_ID = "trust.constellation.terminal-policy.v3"
 
@@ -1706,7 +1718,14 @@ def validate_trust_wp_policy(
                     for parent, parent_wp in marked_parent_wps.items()
                     if parent_wp != child_wp
                 }
-                if child_wp not in marked_parent_wps.values():
+                if (
+                    child_wp not in marked_parent_wps.values()
+                    and TRUST_WP_ADMITTED_MERGE_MINTS.get(child) == child_wp
+                ):
+                    # An admitted pushed mint: every marked parent's binding
+                    # differs from child_wp and is judged for retention below.
+                    adoptions.append((child, child_wp, mismatched))
+                elif child_wp not in marked_parent_wps.values():
                     # A merge may adopt a marked parent's binding, never mint
                     # one -- whatever an unmarked parent or a conflict
                     # resolution carried.  A new binding takes a one-parent

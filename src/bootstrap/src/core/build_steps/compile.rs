@@ -2236,15 +2236,9 @@ impl Step for Sysroot {
         let _ = fs::remove_dir_all(&sysroot);
         t!(fs::create_dir_all(&sysroot));
 
-        // In some cases(see https://github.com/rust-lang/rust/issues/109314), when the stage0
-        // compiler relies on more recent version of LLVM than the stage0 compiler, it may not
-        // be able to locate the correct LLVM in the sysroot. This situation typically occurs
-        // when we upgrade LLVM version while the stage0 compiler continues to use an older version.
-        //
-        // Make sure to add the correct version of LLVM into the stage0 sysroot.
-        if compiler.stage == 0 {
-            dist::maybe_install_llvm_target(builder, compiler.host, &sysroot);
-        }
+        // Trust: StdLink imports stage0's original libraries, including its LLVM
+        // runtime. Resolving this source tree's LLVM here would select a different
+        // provider before that import, even for seed-built library tests.
 
         // If we're downloading a compiler from CI, we can use the same compiler for all stages other than 0.
         if builder.download_rustc() && compiler.stage != 0 {

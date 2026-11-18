@@ -64,12 +64,31 @@ from typing import Callable
 SCHEMA = "trust.daily-local-stage.v1"
 CONSUMER_RECEIPT_SCHEMA = "trust.daily-consumer-acceptance.v2"
 MAX_QUERY_BYTES = 1024 * 1024
-# One bound for the whole dependency preparation: the copy and hash of the
-# declared Cargo inputs, the local transfer of each Git dependency's history,
-# the online pass, the handoff copy and both offline passes. 900 s held only
-# while those inputs were small: with the 28 GB of Git databases today's locks
-# name, m86 reached offline fetch 32 of the first 55 when it expired.
-DEPENDENCY_PREWARM_SECONDS = 3600
+# The dependency preparation is bounded item by item, by progress, and by a ceiling
+# computed from its inputs, never by one total (RL-55). An item is one tree copied into
+# a Cargo home, one Git acquisition, one `targo fetch` of one manifest: it runs as long
+# as it keeps moving and ends after the recreator's stall window below its floor
+# (SUBMODULE_STALL_WINDOW_SECONDS, SUBMODULE_FLOOR_BYTES_PER_SECOND). The ceiling keeps
+# the whole finite: PREWARM_ITEM_SECONDS for every item it counts at its start, plus
+# every byte it was given, copied twice (into its home, then into the handoff), at
+# PREWARM_FLOOR_BYTES_PER_SECOND. One total of 900 s, then 3600 s, ended moving
+# preparations as the Git databases grew (m86, 2026-11-14: offline fetch 32 of 55).
+# 30 s an item, measured on m86 on 2026-11-17 (origin/main's pins and configuration, the
+# train's cache declarations, two preparations at once, load 17 to 40) once a fetch item
+# no longer walked what Cargo had finished (cargo_home_progress_bytes): from an empty
+# input home its 165 fetches took 6.8 s on average (online 12.9 s, the slowest 453 s;
+# offline 1.2 s; handoff replay 6.2 s), and the whole 1,704 s of a 5,370 s ceiling (32%);
+# from the train's input home 1,695 s of 6,092 s (28%). Before that change the empty-home
+# preparation took 3,682 s (69%), its offline fetches 12.9 s each. The sum of the items
+# carries the slow ones.
+PREWARM_ITEM_SECONDS = 30
+PREWARM_FLOOR_BYTES_PER_SECOND = 1024 * 1024
+# The trees of an input Cargo home the preparation copies. Its git/db databases are
+# lent as object stores and never copied: a copy carried every ancestor's bodies (28 GB
+# on 2026-11-14) into the home and from it into the handoff (RL-54).
+PREWARM_COPIED_TREES = ("registry/index", "registry/cache")
+# How often the preparation's own waits (a tree copy) look at an item's progress.
+PREWARM_POLL_SECONDS = 1.0
 # x.py takes its build lease only from a manager that answers this to `--protocol`
 # (x.py, _trust_build_lock_frontend). The tree's own managers, in x.py's order: the
 # Bootstrap bootstrap.py builds, then the one scripts/build-tree-manager.sh builds for
@@ -101,6 +120,8 @@ TRAIN_ISSUE = "FLEET-BUILD-REPORT-1"
 TRAIN_ISSUE_FILE = "docs/OPEN_ISSUES.md"
 TRAIN_ISSUE_SECTION = "## Toolchain, bootstrap and release"
 TRAIN_HISTORY = 8
+TRAIN_SOURCE_PINS = "trust.train-source-pins.v1"
+TRAIN_SOURCE_OBJECTS = "trust.train-source-objects.v1"
 # What a build regenerates; the last good build is kept without it.
 TRAIN_INTERMEDIATES = ("source/build", "targets", "dependencies", "consumer-targets", "consumer-rustup")
 BUILD_TAG = re.compile(r"atpkg-trust-([0-9]+)")
@@ -247,13 +268,21 @@ def fingerprint(path: Path, source: Path | None = None) -> dict:
     return {"sha256": digest.hexdigest(), "entries": count}
 
 
-def read_json_artifact(path: Path) -> tuple[dict, dict]:
+def read_json_artifact(path: Path, *, unique_keys: bool = False) -> tuple[dict, dict]:
     """Bind a bounded JSON object and artifact identity to the same file bytes."""
     limit = 8 * 1024 * 1024
 
     def physical_identity(info: os.stat_result) -> tuple:
         return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
                 info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise Refused(f"duplicate JSON artifact field {key!r}: {path}")
+            result[key] = value
+        return result
 
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -266,7 +295,7 @@ def read_json_artifact(path: Path) -> tuple[dict, dict]:
         if (len(payload) > limit or len(payload) != before.st_size
                 or physical_identity(before) != physical_identity(after)):
             raise Refused(f"JSON artifact changed while reading: {path}")
-        value = json.loads(payload.decode("utf-8"))
+        value = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object if unique_keys else None)
         if not isinstance(value, dict):
             raise Refused(f"not a JSON artifact object: {path}")
         row = [".", "file", stat.S_IMODE(before.st_mode), len(payload),
@@ -406,15 +435,162 @@ def private_python(state: Path, interpreter: Path) -> Path:
     return alias
 
 
+KEPT_AGH = "kept-agh"
+
+
+def keep_agh(root: Path, inherited: str) -> dict | None:
+    """Keep the Agh first on the PATH `inherited` under `root`/kept-agh; None when PATH names none.
+
+    Each Agh acquisition records the identity of the Agh it selected (path, inode, bytes,
+    SHA-256) and refuses when that differs at its end: "Agh source transport changed during
+    acquisition". A tick's acquisitions run for an hour or more, and the Agh on PATH is a
+    link into the installed aterm, which the Mac's updater replaces: three times in the 21
+    hours of 2026-11-16, once inside a tick's fetch, which ended that tick. So a run selects
+    its Agh once, here, and runs a kept copy to its end. The acquisitions' identity check is
+    unchanged; it reads a file nothing replaces.
+
+    macOS ends a copy of an application's executable that starts outside its bundle, whose
+    Info.plist its signature binds (aterm 0.205.0: SIGKILL from every directory), so an
+    executable in NAME.app/Contents/MacOS is kept with its bundle. Once any program in a
+    copied bundle has run, macOS's App Management protection lets no process but the
+    bundle's own signer and the programs a person allowed change or delete it, the process
+    that copied and ran it included (measured on m86, macOS 27.2, 2026-11-17: EPERM on the
+    bundle's directory for a process outside aterm; the train runs under launchd, outside
+    aterm). Replacing the previous run's copy therefore ended every tick after the first.
+    So each copy lives in a directory named by its fingerprint and is never written again:
+    a run whose installed Agh is the one already kept reuses that copy, after checking it is
+    still whole and still runs; a run after an update makes a new one beside it. A copy the
+    run cannot remove is left where it is and named in the record (`left`), never a reason
+    to stop: a session in aterm (the bundle's signer) can remove it.
+
+    The copy must hold the selected Agh's bytes and must run: an Agh replaced while it was
+    being copied, or one that does not answer `agh version` from here, refuses the run at
+    its start. The caller holds `root`'s lock.
+    """
+    selected = shutil.which("agh", path=inherited)
+    if selected is None:
+        return None
+    if not Path(selected).is_absolute():
+        raise Refused(f"the run's Agh must come from an absolute PATH directory: {selected}")
+    program = Path(selected).resolve(strict=True)
+    home = root / KEPT_AGH
+    if home.is_symlink() or (home.exists() and not home.is_dir()):
+        raise Refused(f"the kept Agh must be this state root's own directory: {home}")
+    if program.is_relative_to(home.resolve()):
+        raise Refused(f"PATH already selects the Agh a run kept under {home}; start the run with the installed one")
+    parents = program.parents
+    bundled = (len(parents) > 3 and parents[0].name == "MacOS" and parents[1].name == "Contents"
+               and parents[2].suffix == ".app")
+    origin = parents[2] if bundled else program
+    expected = fingerprint(origin)
+    copies = home / "program"
+    if copies.is_symlink() or (copies.exists() and not copies.is_dir()):
+        raise Refused(f"the kept Agh copies must be this state root's own directory: {copies}")
+    slot = copies / expected["sha256"]
+    if slot.is_symlink() or (slot.exists() and not slot.is_dir()):
+        raise Refused(f"the kept Agh slot must be this state root's own directory: {slot}")
+    kept = slot / origin.name
+    reused = kept.exists() and not kept.is_symlink() and fingerprint(kept) == expected
+    if not reused:
+        if slot.exists() or slot.is_symlink():
+            try:
+                remove_tree(slot)  # an unfinished copy: one that never ran can be removed
+            except PermissionError as error:
+                raise Refused(f"a kept Agh copy is neither whole nor removable by this run: {slot}; "
+                              "remove it from a session in aterm") from error
+        kept.parent.mkdir(parents=True)
+        if bundled:
+            shutil.copytree(origin, kept, symlinks=True)
+        else:
+            shutil.copy2(origin, kept)
+        if fingerprint(kept) != expected:
+            raise Refused(f"Agh changed while this run copied it, so the copy is no Agh: {origin}")
+    executable = kept / program.relative_to(origin) if bundled else kept
+    # One name on the run's PATH and nothing else of the bundle: the link chooses the
+    # program by its name, as the installed one does. It sits beside the copy, outside it.
+    link = slot / "bin/agh"
+    if link.parent.is_symlink() or (link.parent.exists() and not link.parent.is_dir()):
+        raise Refused(f"the kept Agh's link directory must be this state root's own: {link.parent}")
+    if link.is_symlink() and os.readlink(link) != str(executable):
+        link.unlink()
+    if not link.is_symlink():
+        link.parent.mkdir(exist_ok=True)
+        if link.exists():
+            raise Refused(f"the kept Agh's link is not a link: {link}")
+        link.symlink_to(executable)
+    try:
+        answer = subprocess.run([str(link), "version"], capture_output=True, text=True, timeout=60,
+                                stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Refused(f"the Agh this run kept does not run from {link}: {error}") from error
+    if answer.returncode != 0:
+        raise Refused(f"the Agh this run kept does not run from {link}: `agh version` exited {answer.returncode}"
+                      + (f": {answer.stderr.strip().splitlines()[-1]}" if answer.stderr.strip() else ""))
+    # Earlier copies, and the single-copy layout of trust d0b7f21a61 (kept-agh/bin and
+    # kept-agh/program/NAME.app): removed when this run may, named when it may not.
+    left = []
+    stale = [entry for entry in sorted(copies.iterdir()) if entry != slot]
+    if (home / "bin").is_dir() and not (home / "bin").is_symlink():
+        stale.append(home / "bin")
+    for entry in stale:
+        try:
+            if entry.is_symlink() or not entry.is_dir():
+                entry.unlink()
+            else:
+                remove_tree(entry)
+        except PermissionError:
+            left.append(str(entry))
+    if left:
+        print(f"train: {len(left)} earlier kept Agh cop{'y' if len(left) == 1 else 'ies'} macOS protects from "
+              f"this run; remove from a session in aterm: {' '.join(left)}", file=sys.stderr)
+    return {"selected": selected, "program": str(program), "kept": str(link), "directory": str(link.parent),
+            "executable": str(executable), "sha256": file_hash(executable),
+            "version": answer.stdout.strip().splitlines()[0] if answer.stdout.strip() else "",
+            "reused": reused, "left": left}
+
+
+def first_on_path(directory: str, inherited: str) -> str:
+    return os.pathsep.join(dict.fromkeys([directory, *inherited.split(os.pathsep)]))
+
+
+@contextlib.contextmanager
+def agh_kept_in(root: Path):
+    """Run a block with `root`'s kept Agh (keep_agh) first on this process's PATH.
+
+    The process's own PATH, because the recreator's acquisitions select their Agh in this
+    process; every child's environment starts from it. Yields keep_agh's record."""
+    inherited = os.environ.get("PATH")
+    kept = keep_agh(root, os.defpath if inherited is None else inherited)
+    if kept is None:
+        yield None
+        return
+    os.environ["PATH"] = first_on_path(kept["directory"], os.defpath if inherited is None else inherited)
+    try:
+        yield kept
+    finally:
+        if inherited is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = inherited
+
+
 def command(argv: list[str], cwd: Path, env: dict[str, str], log: Path,
             timeout: int | None = None, *, cleanup_owner: Path | None = None,
-            cancel_event: threading.Event | None = None) -> str:
-    """One child, one waiter; delegate gate-tree cleanup to its established owner."""
+            cancel_event: threading.Event | None = None, progress=None) -> str:
+    """One child, one waiter; delegate gate-tree cleanup to its established owner.
+
+    `progress` is the recreator's _SubmoduleProgress: the child ends when the bytes arriving
+    under its paths and in this log stay below its floor rate for its stall window, and runs
+    however long it takes while they keep arriving. `timeout` is a total, for a step that has one.
+    """
     with log.open("w", encoding="utf-8") as stream:
         stream.write(json.dumps({"argv": argv, "cwd": str(cwd)}) + "\n")
         stream.flush()
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("staging cancelled before command launch")
+        if progress is not None:
+            progress.paths = (*progress.paths, log)  # what the child prints
+            progress.begin()
         child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stream,
                                  stderr=subprocess.STDOUT, start_new_session=True)
         try:
@@ -429,7 +605,9 @@ def command(argv: list[str], cwd: Path, env: dict[str, str], log: Path,
                     result = child.wait(timeout=min(0.2, left) if left is not None else 0.2)
                     break
                 except subprocess.TimeoutExpired:
-                    continue
+                    pass
+                if progress is not None:
+                    progress.check(argv)
         except BaseException as error:
             if cleanup_owner is not None:
                 cleanup_api(cleanup_owner)["terminate_process_group"](child)
@@ -444,7 +622,8 @@ def command(argv: list[str], cwd: Path, env: dict[str, str], log: Path,
                     child.kill()
                     child.wait(timeout=10)
             if isinstance(error, subprocess.TimeoutExpired):
-                raise CommandFailed(f"command timed out after {timeout}s; see {log}", child.returncode, True) from error
+                why = getattr(error, "reason", None) or f"command timed out after {timeout}s"
+                raise CommandFailed(f"{why}; see {log}", child.returncode, True) from error
             if isinstance(error, (KeyboardInterrupt, InterruptedError)):
                 error.child_exit_code = child.returncode
             raise
@@ -691,6 +870,29 @@ def consumer_outcome(engine: Path, policy: dict, step: dict) -> dict:
             "accepted": not refusals, "refusals": refusals}
 
 
+def require_consumer_terminal_receipt(step: dict, name: str, cwd: Path, engine: Path,
+                                      command: list[str], timeout: int) -> None:
+    """Check the command owner's saved shell completion against the observed step."""
+    path = Path(step["log"]).with_suffix(".result.json")
+    argv = step.get("argv")
+    if (step.get("name") != name or step.get("cwd") != str(cwd)
+            or not isinstance(argv, list) or "_owned-command" not in argv):
+        raise Refused("consumer terminal receipt does not belong to its owned command")
+    owner_args = [str(engine), str(path), str(timeout), "--", *command]
+    if step.get("result_file") != str(path) or argv[argv.index("_owned-command") + 1:] != owner_args:
+        raise Refused("consumer terminal receipt does not belong to its owned command")
+    measured, identity = read_json_artifact(path, unique_keys=True)
+    for result in (measured, step.get("owned_result")):
+        if (not isinstance(result, dict)
+                or result.keys() != {"exit_code", "signal", "timed_out", "interrupted"}
+                or type(result["exit_code"]) is not int or result["exit_code"] != 0
+                or result["signal"] is not None or result["timed_out"] is not False
+                or result["interrupted"] is not False):
+            raise Refused("consumer terminal receipt does not show a successful owned shell exit")
+    if step.get("owned_result_identity") != identity:
+        raise Refused("consumer terminal receipt changed or lacks its completion identity")
+
+
 def consumer_mappings(values: list[str]) -> dict[str, Path]:
     result = {}
     for value in values:
@@ -753,6 +955,20 @@ def owned_step_argv(slot: Path, python: Path, driver: Path, cleanup_owner: Path,
             "_owned-command", str(cleanup_owner), str(result), str(timeout or 0), "--", *argv]
 
 
+# What a build-slot that takes --rank and --claim-key answers to `--capabilities`.
+BUILD_SLOT_CLAIM_WORDS = "build-slot-claim-v1"
+# A fetch-only step's real needs: it compiles nothing, so it asks the gate for one core
+# and no memory, and an aterm ledger's ALONE claim (which stops memory claims) never
+# holds it back behind compile work.
+FETCH_ONLY_ADMISSION = ["--cpus", "1", "--mem-gb", "0"]
+
+
+def train_claim_key(step: str) -> str:
+    """The ledger key of one train step: retries of a step (`-<attempt>`) share it, so
+    aterm's memory book sizes a retry by what the step has used before."""
+    return "trust-train:" + re.sub(r"-[0-9]+$", "", step)
+
+
 def bind_owned_failure(step: dict, error: BaseException, detail: dict) -> None:
     """Preserve the wrapper wait separately from its original actual child."""
     step["owned_result"] = detail
@@ -770,9 +986,149 @@ def bound_dependency_owner(source_owner, path: Path, name: str):
     return module.__dict__, module.__source_sha256__
 
 
+def prewarm_ceiling(source: Path, cache: Path, cargo_input: Path | None, closure, recreator,
+                    transport, measure, handoff: int) -> dict:
+    """The preparation's ceiling, from what it measures at its start.
+
+    Items: each input tree it will copy, each Git commit the owner locks name, the
+    source owner's acquisition/check passes and the actual handoff replay, and the handoff's
+    copy of each Cargo home tree. Bytes: what its home is filled from, the input's
+    registry trees or the reused home's trees, counted for both copies. Gitlink
+    children are found only during acquisition and share their parents' allowance.
+    """
+    manifests = closure["stage0_bootstrap_manifest_roots"](source)
+    _locks, roots = transport["owner_lock_roots"](source, manifests, recreator)
+    # One acquisition per commit, however many locked packages it holds (trust-ir's
+    # workspace locks one row per crate: 158 rows, 11 commits on 2026-11-17).
+    commits = {(root["url"], root["oid"]) for root in roots}
+    if cache.exists():
+        copies = []
+        given = measure(tuple(cache / name for name in ("registry/index", "registry/cache", "git/db")))
+    else:
+        copies = [name for name in PREWARM_COPIED_TREES if cargo_input is not None and (cargo_input / name).is_dir()]
+        given = measure(tuple(cargo_input / name for name in copies)) if copies else 0
+    passes = 2 if callable(closure.get("acquire_dependency_inputs")) else 3
+    items = len(copies) + len(commits) + passes * len(manifests) + handoff
+    seconds = -(-(PREWARM_ITEM_SECONDS * items * PREWARM_FLOOR_BYTES_PER_SECOND + 2 * given)
+                // PREWARM_FLOOR_BYTES_PER_SECOND)
+    return {"seconds": seconds, "items": items, "input_copies": len(copies), "git_commits": len(commits),
+            "manifests": len(manifests), "fetch_passes": passes, "handoff_copies": handoff, "input_bytes": given,
+            "item_seconds": PREWARM_ITEM_SECONDS, "floor_bytes_per_second": PREWARM_FLOOR_BYTES_PER_SECOND,
+            "stall_window_seconds": recreator["SUBMODULE_STALL_WINDOW_SECONDS"],
+            "stall_floor_bytes_per_second": recreator["SUBMODULE_FLOOR_BYTES_PER_SECOND"]}
+
+
+def describe_ceiling(ceiling: dict) -> str:
+    return (f"dependency preparation ceiling: {ceiling['seconds']} s for {ceiling['items']} items "
+            f"({ceiling['input_copies']} input copies, {ceiling['git_commits']} locked Git commits, "
+            f"{ceiling.get('fetch_passes', 3)} fetches of {ceiling['manifests']} manifests, "
+            f"{ceiling['handoff_copies']} handoff copies) at "
+            f"{ceiling['item_seconds']} s each and {ceiling['input_bytes']} input bytes, copied twice, at "
+            f"{ceiling['floor_bytes_per_second']} bytes/s; each item ends after "
+            f"{ceiling['stall_window_seconds']} s below {ceiling['stall_floor_bytes_per_second']} bytes/s")
+
+
+def finished_cargo_directory(path: str) -> bool:
+    """A directory Cargo has finished and never writes into again: a Git checkout
+    (`git/checkouts/<name>/<rev>`) or an unpacked crate (`registry/src/<index>/<crate>`)
+    holding `.cargo-ok`. Cargo writes that file last: after the checkout and its
+    submodules (targo-core sources/git/utils.rs, CheckoutGuard::mark_ok, which removes it
+    before a checkout starts again) and after the crate is unpacked (sources/registry/
+    mod.rs, unpack_package)."""
+    grand = os.path.dirname(os.path.dirname(path))
+    kind = (os.path.basename(os.path.dirname(grand)), os.path.basename(grand))
+    return kind in {("git", "checkouts"), ("registry", "src")} and os.path.lexists(os.path.join(path, ".cargo-ok"))
+
+
+def cargo_home_progress_bytes(paths: tuple[Path, ...]) -> int:
+    """Bytes of the regular files under ``paths``, counted as the recreator's
+    _submodule_progress_bytes counts them (links not followed, a file that vanishes
+    while it is read skipped), but never inside a finished_cargo_directory.
+
+    A `targo fetch` item watches its whole Cargo home, and the home's checkouts and
+    unpacked crates are most of its entries: walking them at each item's start and at
+    each sample cost m86 11.5 s for ty's checkout alone (475,787 entries, load 40) and
+    made every offline fetch about 13 s, not 2.4 s (2026-11-17). A finished directory
+    never grows, so it is no progress. When one finishes, the count drops by what it
+    held; the bound counts only growth, so that reads as no growth, never as progress.
+    """
+    total = 0
+    pending = [os.fspath(path) for path in paths]
+    while pending:
+        current = pending.pop()
+        try:
+            metadata = os.lstat(current)
+            if stat.S_ISREG(metadata.st_mode):
+                total += metadata.st_size
+            elif stat.S_ISDIR(metadata.st_mode) and not finished_cargo_directory(current):
+                with os.scandir(current) as entries:
+                    pending.extend(entry.path for entry in entries)
+        except OSError:
+            continue  # a fetch renames and removes its own files while it is read
+    return total
+
+
+class PrewarmBound:
+    """The bound of one dependency preparation: its ceiling, and the bound of each item.
+
+    ``owner`` merges into the recreator's namespace what the transport reads
+    (daily_dependency_git.item_progress): the ceiling's end, its clock, its measure.
+    """
+
+    def __init__(self, recreator, transport, ceiling: dict, *, clock=time.monotonic, measure=None,
+                 poll: float = PREWARM_POLL_SECONDS):
+        self.recreator, self.transport, self.ceiling, self.poll = recreator, transport, ceiling, poll
+        self.start = clock()
+        self.end = self.start + ceiling["seconds"]
+        self.owner = {**recreator, "_dependency_deadline": self.end, "_dependency_clock": clock,
+                      "_dependency_ceiling": ceiling["seconds"],
+                      "_dependency_measure": measure or cargo_home_progress_bytes}
+
+    def item(self, label: str, paths=()):
+        """One item's progress bound, for an owner that supervises its own child."""
+        self.transport["ceiling_left"](self.owner, label)
+        return self.transport["item_progress"](self.owner, label, paths)
+
+    def run(self, label: str, function, *paths: Path):
+        """Run ``function`` (an in-process tree copy) as one item, watching ``paths``."""
+        watch = self.item(label, paths)
+        done, outcome = threading.Event(), {}
+
+        def work():
+            try:
+                outcome["value"] = function()
+            except BaseException as error:  # noqa: BLE001 - re-raised by the waiter
+                outcome["error"] = error
+            finally:
+                done.set()
+
+        watch.begin()
+        threading.Thread(target=work, name="trust-prewarm-item", daemon=True).start()
+        try:
+            while not done.wait(self.poll):
+                watch.check(label)
+        except self.recreator["_SubmoduleStalled"] as error:
+            raise Refused(f"dependency preparation ended {label}: {error}") from error
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
+
 def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
-                         providers: list[Path], cargo_input: Path | None, policy_engine: Path) -> None:
-    """Fetch only, using the archive-authenticated native seed and existing owners."""
+                         providers: list[Path], cargo_input: Path | None, policy_engine: Path, *,
+                         object_caches: dict[str, Path] | None = None, ceiling_seconds: int | None = None,
+                         ceiling_only: bool = False, clock=time.monotonic, measure=None,
+                         poll: float = PREWARM_POLL_SECONDS, checkout_cache_specs=()) -> None:
+    """Fetch only, using the archive-authenticated native seed and existing owners.
+
+    ``object_caches`` (canonical GitHub URL -> repository) are the repositories a host
+    declared for its first-party gitlinks; the locked commits they hold are taken from
+    them as checkout closures. The ceiling is computed here, at the start; a caller that
+    gave its supervisor ``ceiling_seconds`` must find the same number, and
+    ``ceiling_only`` writes the ceiling to ``output`` and fetches nothing.
+    ``checkout_cache_specs`` (URL#COMMIT=/absolute/repository) let Agh read one exact
+    locked commit's checkout objects from that repository (prepare_profile).
+    """
     helper = source / "scripts/daily_dependency_git.py"
     helper_bytes = helper.read_bytes()
     helper_sha256 = hashlib.sha256(helper_bytes).hexdigest()
@@ -814,78 +1170,11 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
     for directory in (cache, work / "home", work / "git-bin", work / "mint-inputs", work / "unused-target"):
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
             raise Refused(f"dependency Cargo home and support directories must be owned non-symlink directories: {directory}")
-    # Existing extractions are authenticated before executing any of their bytes.
-    if not seed.exists():
-        # The recreator has already materialized/validated these exact archives.
-        dist = source / "bootstrap/trust-stage0/dist" / pins["compiler_date"]
-        staircase["seed_sysroot"](dist, pin, seed)
-    pinned = staircase["pinned_seed_record"](seed, source)
-    def bind_seed_support():
-        for path, actual in staircase["support_source_inputs"]().items():
-            relative = Path(path).relative_to(source).as_posix()
-            if expected_owners.get(relative) != actual:
-                raise Refused("seed support differs from the selected source owner")
-            owner_inputs[path] = actual
-    bind_seed_support()
-    source_loader.recheck()
-    driver = seed / "bin/targo"
-    for binary in (driver, seed / "bin/trustc"):
-        if staircase["native_kind"](binary) not in {"macho", "elf"}:
-            raise Refused("pinned dependency drivers must be their native archive binaries")
-    runtime = mint["foreign_load_commands"](seed, providers)
-    admission = mint["compiler_identity"](seed, "pinned dependency seed")
-    if (admission.get("commit") != pins["compiler_git_commit_hash"] or admission.get("host") != host
-            or admission.get("date") != pins["compiler_date"] or admission.get("lineage") != "trust"):
-        raise Refused(f"pinned dependency seed identity refused: {admission}")
-    if not cache.exists():
-        initial = mint["cargo_home_inputs"](cargo_input, cache)
-        atomic_json(work / "initial-cache.json", initial)
-    else:
-        # A reused home holds the Git checkouts Cargo made in it. Cargo makes them by a local
-        # clone of git/db, which hardlinks the database's objects, and validate_bare_db
-        # refuses any database file with another link: a home used once could never be
-        # revalidated (the 5062 relaunch, 2026-11-15). They are derived state, no tree the
-        # mint imports (CARGO_HOME_INPUT_TREES) and nothing its handoff copies, so they go
-        # before anything validates or uses the home. A database file linked from anywhere
-        # else still refuses.
-        for path in (cache / "git", cache / "git/checkouts"):
-            if path.is_symlink() or (path.exists() and not path.is_dir()):
-                raise Refused(f"reused dependency Cargo home has a linked or non-directory {path}")
-        if (cache / "git/checkouts").exists():
-            shutil.rmtree(cache / "git/checkouts")
-    for name in mint["CARGO_HOME_INPUT_TREES"]:
-        tree = cache / name
-        if tree.exists() or tree.is_symlink():
-            fingerprint(tree)  # Reject special files and escaping links before use.
-    # Agh alone acquires Git source objects. The seed's Git CLI will be a
-    # local-only exact source-store adapter, never a credential helper.
-    recreator["_reject_local_git_execution_authority"](source)
+    # The source's Cargo configuration is refused before anything reads the manifest graph
+    # it would steer, the ceiling's census of the owner locks included.
     environment = recreator["_provenance_git_environment"]()
     home = work / "home"
-    home.mkdir(exist_ok=True)
     git_bin = work / "git-bin"
-    git_bin.mkdir(exist_ok=True)
-    fixed_git = recreator["_controlled_git_command"]([])
-    git_environment = recreator["_submodule_materialization_environment"]()
-    git_environment["GIT_TERMINAL_PROMPT"] = "0"
-    # Cache Git configs are data, never additional transport/executable policy.
-    allowed = {"core.repositoryformatversion", "core.bare", "core.filemode", "core.logallrefupdates",
-               "core.ignorecase", "core.precomposeunicode", "remote.origin.url", "remote.origin.fetch",
-               "extensions.objectformat"}
-    git_configs = [*(cache / "git/db").glob("*/config"),
-                   *(cache / "registry/index").glob("*/.git/config")]
-    for config in sorted(git_configs):
-        if config.is_symlink() or not config.is_file():
-            raise Refused("dependency cache Git config must be a regular file")
-        result = subprocess.run([fixed_git[0], "config", "--no-includes", "--file", str(config),
-                                 "--null", "--list"], env=git_environment,
-                                capture_output=True, check=True, timeout=30)
-        for key, _value in recreator["_parse_git_config_records"](result.stdout, config.parent, "cache"):
-            if key.lower() not in allowed:
-                raise Refused("dependency cache Git config contains unsupported authority")
-        for relative in ("objects/info/alternates", "objects/info/http-alternates", "info/grafts"):
-            if (config.parent / relative).exists() or (config.parent / relative).is_symlink():
-                raise Refused("dependency cache Git objects name external or replacement custody")
     environment["HOME"] = str(home)
     environment.update(CARGO_HOME=str(cache), RUSTC=str(seed / "bin/trustc"),
                        CARGO_TARGET_DIR=str(work / "unused-target"),
@@ -912,9 +1201,12 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
             raise Refused("dependency Cargo configuration has unsupported HTTP routing/TLS authority")
         if net.get("offline") is True:
             offline = True
-        # Even harmless [env] entries are unnecessary in this fetch-only lane.
-        if "env" in value:
-            raise Refused("dependency Cargo config contains unsupported [env] authority")
+        # [env] is judged by name by the one shared policy below (publication's
+        # config_refusals: loader, compiler/toolchain and credential/network
+        # families refused, a malformed entry refused), never wholesale here: a
+        # blanket refusal stopped every tick from 2026-11-16 22:21Z, when Trust's
+        # own .cargo/config.toml gained [env] RUST_MIN_STACK (72166f7901), a
+        # variable that reaches only a running Rust program and no fetch.
         if value.get("registry", {}).get("default", "crates-io") != "crates-io" or any(
                 name != "crates-io" for name in value.get("registries", {})):
             raise Refused("dependency Cargo config has unsupported registry authority")
@@ -938,6 +1230,87 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
                           + "; ".join(refusals))
     if offline:
         environment["CARGO_NET_OFFLINE"] = "true"
+    ceiling = prewarm_ceiling(source, cache, cargo_input, closure, recreator, transport_owner,
+                              measure or cargo_home_progress_bytes, len(mint["CARGO_HOME_INPUT_TREES"]))
+    print(describe_ceiling(ceiling), file=sys.stderr, flush=True)
+    if ceiling_seconds is not None and ceiling_seconds != ceiling["seconds"]:
+        raise Refused(f"the dependency preparation's ceiling is {ceiling['seconds']} s, not the "
+                      f"{ceiling_seconds} s its supervisor was given: an input changed in between")
+    if ceiling_only:
+        atomic_json(output, ceiling)
+        return
+    bound = PrewarmBound(recreator, transport_owner, ceiling, clock=clock, measure=measure, poll=poll)
+    object_caches = {transport_owner["canonical_url"](url): Path(path)
+                     for url, path in (object_caches or {}).items()}
+    # Existing extractions are authenticated before executing any of their bytes.
+    if not seed.exists():
+        # The recreator has already materialized/validated these exact archives.
+        dist = source / "bootstrap/trust-stage0/dist" / pins["compiler_date"]
+        staircase["seed_sysroot"](dist, pin, seed)
+    pinned = staircase["pinned_seed_record"](seed, source)
+    def bind_seed_support():
+        for path, actual in staircase["support_source_inputs"]().items():
+            relative = Path(path).relative_to(source).as_posix()
+            if expected_owners.get(relative) != actual:
+                raise Refused("seed support differs from the selected source owner")
+            owner_inputs[path] = actual
+    bind_seed_support()
+    source_loader.recheck()
+    driver = seed / "bin/targo"
+    for binary in (driver, seed / "bin/trustc"):
+        if staircase["native_kind"](binary) not in {"macho", "elf"}:
+            raise Refused("pinned dependency drivers must be their native archive binaries")
+    runtime = mint["foreign_load_commands"](seed, providers)
+    admission = mint["compiler_identity"](seed, "pinned dependency seed")
+    if (admission.get("commit") != pins["compiler_git_commit_hash"] or admission.get("host") != host
+            or admission.get("date") != pins["compiler_date"] or admission.get("lineage") != "trust"):
+        raise Refused(f"pinned dependency seed identity refused: {admission}")
+    if not cache.exists():
+        initial = mint["cargo_home_inputs"](cargo_input, cache, trees=PREWARM_COPIED_TREES, run=bound.run)
+        atomic_json(work / "initial-cache.json", initial)
+    else:
+        # A reused home holds the Git checkouts Cargo made in it. Cargo makes them by a local
+        # clone of git/db, which hardlinks the database's objects, and validate_bare_db
+        # refuses any database file with another link: a home used once could never be
+        # revalidated (the 5062 relaunch, 2026-11-15). They are derived state, no tree the
+        # mint imports (CARGO_HOME_INPUT_TREES) and nothing its handoff copies, so they go
+        # before anything validates or uses the home. A database file linked from anywhere
+        # else still refuses.
+        for path in (cache / "git", cache / "git/checkouts"):
+            if path.is_symlink() or (path.exists() and not path.is_dir()):
+                raise Refused(f"reused dependency Cargo home has a linked or non-directory {path}")
+        if (cache / "git/checkouts").exists():
+            shutil.rmtree(cache / "git/checkouts")
+    for name in mint["CARGO_HOME_INPUT_TREES"]:
+        tree = cache / name
+        if tree.exists() or tree.is_symlink():
+            fingerprint(tree)  # Reject special files and escaping links before use.
+    # Agh alone acquires Git source objects. The seed's Git CLI will be a
+    # local-only exact source-store adapter, never a credential helper.
+    recreator["_reject_local_git_execution_authority"](source)
+    home.mkdir(exist_ok=True)
+    git_bin.mkdir(exist_ok=True)
+    fixed_git = recreator["_controlled_git_command"]([])
+    git_environment = recreator["_submodule_materialization_environment"]()
+    git_environment["GIT_TERMINAL_PROMPT"] = "0"
+    # Cache Git configs are data, never additional transport/executable policy.
+    allowed = {"core.repositoryformatversion", "core.bare", "core.filemode", "core.logallrefupdates",
+               "core.ignorecase", "core.precomposeunicode", "remote.origin.url", "remote.origin.fetch",
+               "extensions.objectformat"}
+    git_configs = [*(cache / "git/db").glob("*/config"),
+                   *(cache / "registry/index").glob("*/.git/config")]
+    for config in sorted(git_configs):
+        if config.is_symlink() or not config.is_file():
+            raise Refused("dependency cache Git config must be a regular file")
+        result = subprocess.run([fixed_git[0], "config", "--no-includes", "--file", str(config),
+                                 "--null", "--list"], env=git_environment,
+                                capture_output=True, check=True, timeout=30)
+        for key, _value in recreator["_parse_git_config_records"](result.stdout, config.parent, "cache"):
+            if key.lower() not in allowed:
+                raise Refused("dependency cache Git config contains unsupported authority")
+        for relative in ("objects/info/alternates", "objects/info/http-alternates", "info/grafts"):
+            if (config.parent / relative).exists() or (config.parent / relative).is_symlink():
+                raise Refused("dependency cache Git objects name external or replacement custody")
     if providers:
         environment["DYLD_LIBRARY_PATH"] = os.pathsep.join(str(p) for p in providers)
     version = subprocess.run([str(driver), "--unverified", "--version"], env=environment,
@@ -947,9 +1320,13 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
     proxy_file = source / "scripts/daily_registry_proxy.py"
     proxy_owner = load_owner(proxy_file, "daily_registry_transport")
     proxy_sha256 = owner_inputs[str(proxy_file)]
-    deadline = time.monotonic() + DEPENDENCY_PREWARM_SECONDS
+    deadline = bound.end
+    # A cut can select an older source owner's helper: it is given only the options in use.
+    profile_options = {name: value for name, value in (
+        ("object_caches", object_caches), ("input_home", cargo_input),
+        ("checkout_cache_specs", tuple(checkout_cache_specs))) if value}
     profile_path, profile = transport_owner["prepare_profile"](
-        source, work, cache, closure, recreator, environment, deadline=deadline)
+        source, work, cache, closure, bound.owner, environment, deadline=deadline, **profile_options)
     shim = git_bin / "git"
     script = "#!/bin/sh\nexec " + shlex.join(
         [sys.executable, "-I", "-B", str(helper), "--policy", str(profile_path), "--"]) + ' "$@"\n'
@@ -977,17 +1354,32 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
                 capture_output=True, text=True, timeout=min(30, max(0.01, deadline - time.monotonic())), check=True)
             if json.loads(target_configuration.stdout) != {"build": {"target-dir": str(work / "unused-target")}}:
                 raise Refused("native pinned resolver did not retain its owned target directory")
-            report = closure["dependency_closure"](source, str(driver), fetch_environment, prepare=True, deadline=deadline)
+            acquire = closure.get("acquire_dependency_inputs")
+            acquisition = None
+            if callable(acquire):
+                acquisition = acquire(source, str(driver), fetch_environment,
+                                      deadline=deadline, progress=bound.item).report()
+                report = acquisition
+            else:
+                # A selected older cut owns its helper API. Preserve its preparation
+                # ceremony instead of passing an unsupported new flag or forging a check.
+                report = closure["dependency_closure"](source, str(driver), fetch_environment, prepare=True,
+                                                       deadline=deadline, progress=bound.item)
             # Prove the exact input form mint imports, without registry/src or Git
             # checkouts left by online fetch masking an absent archive/object database.
             handoffs = work / "mint-inputs"
             handoffs.mkdir(exist_ok=True)
             handoff = Path(tempfile.mkdtemp(prefix="attempt-", dir=handoffs)) / "cargo-home"
-            handoff_manifest = mint["cargo_home_inputs"](cache, handoff)
+            handoff_manifest = mint["cargo_home_inputs"](cache, handoff, run=bound.run)
             replay = closure["dependency_closure"](source, str(driver), {**fetch_environment, "CARGO_HOME": str(handoff)},
-                                                 deadline=deadline)
+                                                 deadline=deadline, progress=bound.item)
             if closure["_snapshot"]([Path(p) for p in report["source_inputs_sha256"]]) != report["source_inputs_sha256"]:
                 raise Refused("dependency source/config/driver changed during handoff replay")
+            if acquisition is not None:
+                # Only the actual offline handoff run carries the readiness schema.
+                # Retain acquisition separately; it cannot satisfy a readiness reader.
+                report = {**replay, "source_inputs_sha256": dict(replay["source_inputs_sha256"]),
+                          "input_acquisition": acquisition}
             if staircase["pinned_seed_record"](seed, source) != pinned:
                 raise Refused("pinned dependency seed changed during fetch")
             bind_seed_support()
@@ -1017,9 +1409,10 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
                           transport=transport,
                           config_policy={"path": str(policy_file), "sha256": policy_sha256},
                           driver_sha256=file_hash(driver), cargo_home=str(handoff),
-                          handoff_manifest=handoff_manifest, handoff_offline_replay=replay,
+                          handoff_manifest=handoff_manifest, handoff_offline_replay=replay, ceiling=ceiling,
                           cache_trees={name: fingerprint(handoff / name) if (handoff / name).exists() else None
                                        for name in mint["CARGO_HOME_INPUT_TREES"]})
+            validate_preparation_fetches(report)
     except BaseException as error:
         # This is an attempted transport observation, never cache readiness.
         atomic_json(profile_path.parent / "registry-http-failure.json", {
@@ -1037,9 +1430,50 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
     atomic_json(output, report)
 
 
+def validate_preparation_fetches(report: dict) -> None:
+    """Judge actual acquisition and handoff observations, including older cut replies."""
+    if (report.get("schema") != "trust.bootstrap-offline-dependency-closure.v1"
+            or not report.get("source_inputs_sha256")):
+        raise Refused("dependency owner did not establish actual locked offline fetch readiness")
+    replay = report.get("handoff_offline_replay", {})
+    if replay.get("schema") != report["schema"] or not replay.get("source_inputs_sha256"):
+        raise Refused("dependency handoff lacks its actual offline replay from safe cache trees")
+    acquisition = report.get("input_acquisition")
+    if acquisition is None:
+        # Existing selected cuts and resumed receipts retain their established three-pass law.
+        modes = {}
+        for row in report.get("completed_fetches", []):
+            modes.setdefault(row.get("manifest"), []).append(row.get("offline"))
+        if not modes or any(value != [False, True] for value in modes.values()):
+            raise Refused("dependency owner did not establish actual locked offline fetch readiness")
+        expected = [{"manifest": name, "offline": True} for name in modes]
+    else:
+        manifests = acquisition.get("manifests")
+        policy = acquisition.get("manifest_policy_sha256")
+        if (acquisition.get("schema") != "trust.bootstrap-dependency-acquisition.v1"
+                or not acquisition.get("source_inputs_sha256")
+                or not isinstance(manifests, list) or not manifests
+                or any(not isinstance(name, str) or not name for name in manifests)
+                or len(set(manifests)) != len(manifests)
+                or not isinstance(policy, str) or re.fullmatch(r"[0-9a-f]{64}", policy) is None
+                or acquisition.get("completed_fetches") != [
+                    {"manifest": name, "offline": False} for name in manifests]
+                or any(observed.get("manifests") != manifests
+                       or observed.get("manifest_policy_sha256") != policy
+                       for observed in (report, replay))):
+            raise Refused("dependency acquisition and handoff do not bind the same ordered manifest/policy inputs")
+        expected = [{"manifest": name, "offline": True} for name in manifests]
+        if report.get("completed_fetches") != expected:
+            raise Refused("dependency readiness was not established by the final offline handoff")
+    if replay.get("completed_fetches") != expected:
+        raise Refused("dependency handoff lacks its actual offline replay from safe cache trees")
+
+
 def validate_dependency_preparation(preparation: dict) -> None:
     report = read_json(Path(preparation["report"]))
-    inputs = {**report["source_inputs_sha256"], **report["handoff_offline_replay"]["source_inputs_sha256"]}
+    validate_preparation_fetches(report)
+    inputs = {**report.get("input_acquisition", {}).get("source_inputs_sha256", {}),
+              **report["source_inputs_sha256"], **report["handoff_offline_replay"]["source_inputs_sha256"]}
     inputs[report["config_policy"]["path"]] = report["config_policy"]["sha256"]
     for name, expected in inputs.items():
         path = Path(name)
@@ -1058,7 +1492,8 @@ def trust_checkout(label: str) -> bool:
     """Whether a synchronize label names a checkout of the Trust source.
 
     Those are the snapshot the cut builds and the train's landing worktree (`landing-<step>`),
-    the only ones with the first-party gitlinks a --source-object-cache declares.
+    the only ones with the first-party gitlinks a --source-object-cache or --owned-object-cache
+    declares.
     """
     return label == "source" or label.startswith("landing-")
 
@@ -1098,10 +1533,41 @@ class Runner:
         self.checkpoint: dict = {}
         self.log_index = 0
         self.record_lock = threading.RLock()
+        # The Agh every acquisition of this run selects (keep_agh): a train's tick keeps one
+        # for its reader and each of its runs, and a run of its own keeps one in run().
+        self.agh: dict | None = getattr(train, "agh", None)
         self.thread_state = threading.local()
         self.cancelled = threading.Event()
         self.publication_source: Path | None = None
         self.publication_commit: str | None = None
+        # Whether each build-slot this run selects takes the train's claim words.
+        self.slot_claims: dict[str, bool] = {}
+
+    def claim_words(self, step: str, *, sized: bool = False) -> list[str]:
+        """The train's Release-rank ledger claim for one build-slot step, or nothing.
+
+        A cut runs its own snapshot's build-slot, and a resumed cut's may predate --rank,
+        --claim-key and --wide: it would refuse them as unknown options and start nothing.
+        So the selected build-slot is asked once (`--capabilities`, which an older copy
+        refuses the same way) and given the words only when it answers build-slot-claim-v1.
+        Where aterm's capacity ledger admits, the claim is a Release holder `aterm pkg
+        capacity` shows as trust-train:<step>. Every unsized train step compiles (the
+        publisher builds itself, the push runs the pre-push hook's builds), so it asks
+        for the host's cores (--wide), as the slot pool's uncapped borrowing gives it; a
+        step that declares its own size (`sized`, the fetch-only prewarm) keeps it. On
+        the slot pool the words change nothing."""
+        slot = str(self.slot)
+        if slot not in self.slot_claims:
+            try:
+                probe = subprocess.run([slot, "--capabilities"], env=self.env, stdin=subprocess.DEVNULL,
+                                       capture_output=True, timeout=60)
+                self.slot_claims[slot] = (probe.returncode == 0
+                                          and probe.stdout == (BUILD_SLOT_CLAIM_WORDS + "\n").encode())
+            except (OSError, subprocess.SubprocessError):
+                self.slot_claims[slot] = False
+        if not self.slot_claims[slot]:
+            return []
+        return ["--rank", "release", "--claim-key", train_claim_key(step), *([] if sized else ["--wide"])]
 
     def save(self) -> None:
         with self.record_lock:
@@ -1136,8 +1602,14 @@ class Runner:
         return self.publication_source, self.publication_commit
 
     def call(self, name: str, argv: list[str], cwd: Path | None = None,
-             *, heavy: bool = False, env: dict | None = None, timeout: int | None = None) -> str:
+             *, heavy: bool = False, env: dict | None = None, timeout: int | None = None,
+             progress=None, admission: list[str] | None = None) -> str:
+        if progress is not None and heavy:
+            raise Refused(f"{name}: a build-slot step is bounded by its own owner, not by a progress bound")
+        if admission and not heavy:
+            raise Refused(f"{name}: admission words declare a build-slot step's needs; this step takes no build-slot")
         selected_env = env or self.env
+        consumer_check = name.endswith("-consumer-check")
         bootstrap = next((Path(arg) for arg in argv if Path(arg).name == "recreate_bootstrap.py"), None)
         if bootstrap:
             selected_env = bootstrap_environment(selected_env, bootstrap)
@@ -1153,11 +1625,18 @@ class Runner:
         if heavy:
             result_file = log.with_suffix(".result.json")
             argv = owned_step_argv(self.slot, self.python, Path(__file__).resolve(),
-                                   cleanup_owner, result_file, timeout, argv)
+                                   cleanup_owner, result_file, timeout, argv,
+                                   admission=[*(admission or []),
+                                              *self.claim_words(name, sized=bool(admission))])
         step = {"name": name, "argv": argv, "cwd": str(cwd or self.source),
                 "log": str(log), "status": "running", "started_at": now()}
         if timeout is not None:
             step["timeout_seconds"] = timeout
+        bound = {}
+        if progress is not None:
+            step["progress_bound"] = {"stall_window_seconds": progress.window,
+                                      "floor_bytes_per_second": progress.floor}
+            bound = {"progress": progress}
         if result_file:
             step["result_file"] = str(result_file)
         with self.record_lock:
@@ -1167,20 +1646,29 @@ class Runner:
         try:
             result = self.execute(argv, cwd or self.source, selected_env, log,
                                   timeout=None if heavy else timeout, cleanup_owner=cleanup_owner,
-                                  cancel_event=self.cancelled)
+                                  cancel_event=self.cancelled, **bound)
             if result_file:
                 if not result_file.exists():
                     raise Refused("owned command exited without its result receipt")
-                detail = read_json(result_file)
+                if consumer_check:
+                    detail, identity = read_json_artifact(result_file, unique_keys=True)
+                    step.update(owned_result=detail, owned_result_identity=identity)
+                else:
+                    detail = read_json(result_file)
                 if detail.get("exit_code") != 0 or detail.get("timed_out") or detail.get("interrupted"):
                     raise CommandFailed("owned command did not complete successfully", detail.get("exit_code"), detail.get("timed_out", False))
-            if name.endswith("-consumer-check"):
+            if consumer_check:
                 step["log_identity"] = fingerprint(log)
         except BaseException as error:
             with self.record_lock:
                 if result_file and result_file.exists():
-                    detail = read_json(result_file)
-                    bind_owned_failure(step, error, detail)
+                    if consumer_check:
+                        with contextlib.suppress(ValueError, Refused):
+                            detail, _ = read_json_artifact(result_file, unique_keys=True)
+                            bind_owned_failure(step, error, detail)
+                    else:
+                        detail = read_json(result_file)
+                        bind_owned_failure(step, error, detail)
                 step.update(status="failed", error=str(error), finished_at=now())
                 if isinstance(error, CommandFailed):
                     step.update(exit_code=error.exit_code, timed_out=error.timed_out)
@@ -1193,7 +1681,7 @@ class Runner:
                 raise InterruptedError("owned gate interrupted; its process tree was cleaned by publication") from error
             raise
         with self.record_lock:
-            if result_file and result_file.exists():
+            if result_file and result_file.exists() and "owned_result" not in step:
                 step["owned_result"] = read_json(result_file)
             step.update(status="passed", exit_code=0, finished_at=now())
             self.thread_state.step = step
@@ -1290,8 +1778,12 @@ class Runner:
         transport["GIT_TERMINAL_PROMPT"] = "0"
         if origin.startswith("https://"):
             def acquire(argv, environment):
-                self.call("fetch-main", argv, destination, env=environment,
-                          timeout=recreator["SUBMODULE_UPDATE_TIMEOUT_SECONDS"])
+                # Bounded by its progress, as the recreator's own acquisitions are: a fetch of
+                # main that keeps receiving is not cut at a total (600 s, until 2026-11-16).
+                with recreator["_agh_transfer_paths"](destination, environment, self.invocation) as (
+                        child_environment, paths):
+                    self.call("fetch-main", argv, destination, env=child_environment,
+                              progress=recreator["_SubmoduleProgress"](f"Agh's fetch of {label} main", paths))
             acquisition = recreator["_agh_source_fetch"](
                 origin, destination, "refs/heads/main", ref, execute=acquire,
             )
@@ -1321,9 +1813,15 @@ class Runner:
         if marker.exists():
             old = query("previous-source", destination, "rev-parse", "HEAD")
             query("source-fast-forward", destination, "merge-base", "--is-ancestor", old, commit)
-        working_cache = recreator["_prepare_source_working_cache"](destination, commit, repository)
+        # Git checks the snapshot out from the objects just acquired; no working file of the
+        # controller or a consumer checkout is read. Its bytes are proven by the source lineage.
+        fresh = not marker.exists()
         query("select-main", destination, "-c", "submodule.recurse=false", "checkout", "--detach", commit)
-        self.write_json(self.invocation / f"{suffix}-{label}-working-data.json", working_cache.verify())
+        # A fresh tree holds exactly Git's checkout: nothing untracked and nothing ignored, as the
+        # per-file route's final audit required. A reused snapshot keeps its ignored build outputs.
+        if fresh and query("snapshot-complete", destination, "status", "--porcelain=v1",
+                           "--untracked-files=all", "--ignored", "--ignore-submodules=all"):
+            raise Refused(f"a fresh snapshot holds untracked or ignored files after Git's checkout: {destination}")
         self.snapshot_custody(destination, origin, query)
         self.write_json(marker, ownership)
         return commit
@@ -1409,6 +1907,16 @@ class Runner:
             if any(file_hash(Path(name)) != expected for name, expected in before.items()):
                 raise Refused("managed Git synchronization transport changed")
 
+    def dependency_object_caches(self) -> dict[str, Path]:
+        """The declared first-party caches by their gitlink's URL in the snapshot: the
+        dependency preparation takes the locked commits they hold from them (RL-54)."""
+        if not self.args.source_object_cache:
+            return {}
+        owner = self.git_owner()
+        caches = owner["_first_party_checkout_caches"](self.source, self.args.source_object_cache)
+        urls = {entry.path.as_posix(): entry.url for entry in owner["_indexed_submodules"](self.source)}
+        return {urls[path]: cache.resolve(strict=True) for path, cache in sorted(caches.items())}
+
     def acquire_submodule_pins(self, path: Path, label: str, attempt: int) -> None:
         owner = self.git_owner()
         # Only the Trust source has the first-party gitlinks a declared cache names.
@@ -1418,6 +1926,18 @@ class Runner:
         # reads the objects a local repository already holds.
         caches = (owner["_first_party_checkout_caches"](path, self.args.source_object_cache)
                   if trust_checkout(label) and self.args.source_object_cache else {})
+        if caches and self.train is not None:
+            # Read the gitlinks under this runner's admission for the linked landing worktree.
+            entries = owner["_indexed_submodules"](path)
+            caches = self.train.source_objects().select(entries, caches, self.train.state.get("good"))
+        if trust_checkout(label) and self.args.owned_object_cache:
+            owned = owner["_first_party_checkout_caches"](path, self.args.owned_object_cache)
+            if caches.keys() & owned.keys():
+                raise Refused("a gitlink takes one object cache, a declared or an owned one: "
+                              + ", ".join(sorted(caches.keys() & owned.keys())))
+            for gitlink, cache in sorted(owned.items()):
+                self.refresh_object_cache(path, gitlink, cache)
+            caches = {**caches, **owned}
         if caches:
             owner["ensure_submodules"](path, checkout_caches=caches)
         else:
@@ -1434,11 +1954,15 @@ class Runner:
             original_head = self.git("submodule-original-head", child, "rev-parse", "HEAD")
             present = self.git("submodule-local-pin", child, "rev-parse", "--disambiguate=" + entry.oid)
             if entry.oid not in present.splitlines():
+                def acquire(argv, environment):
+                    with owner["_agh_transfer_paths"](child, environment, self.invocation) as (
+                            child_environment, paths):
+                        self.call("acquire-submodule-pin", argv, child, env=child_environment,
+                                  progress=owner["_SubmoduleProgress"](
+                                      f"Agh's fetch of the pin of {state.display_path}", paths))
                 receipt = owner["_agh_source_fetch"](
                     entry.url, child, entry.oid, "refs/agh/trust-daily-staging/pins/" + entry.oid,
-                    execute=lambda argv, environment: self.call(
-                        "acquire-submodule-pin", argv, child, env=environment,
-                        timeout=owner["SUBMODULE_UPDATE_TIMEOUT_SECONDS"]))
+                    execute=acquire)
                 receipts.append({"path": state.display_path, **receipt})
             if (owner["_indexed_submodules"](state.repository) != entries
                     or self.git("submodule-retained-head", child, "rev-parse", "HEAD") != original_head):
@@ -1447,6 +1971,67 @@ class Runner:
         self.write_json(self.invocation / f"{label}-submodule-acquisition-{attempt}.json",
                         {"schema": "trust.daily-submodule-acquisition.v1", "fetched": receipts,
                          "restoration": "separate offline ancestry/dirty/local-anchor owner"})
+
+    def refresh_object_cache(self, path: Path, gitlink: str, cache: Path) -> None:
+        """Bring an --owned-object-cache up to the pin `path` indexes for `gitlink`.
+
+        Agh fetches what the cache lacks of that pin's history (its unfiltered fetch,
+        negotiated against the cache: a day of the sibling's main costs a day's objects,
+        where a closure from a stale cache took gigabytes again every cut) into a private
+        ref, and the cache's HEAD then names the pin, the start Agh tries first for a
+        later closure. That ref, HEAD and the fetched objects are all the runner writes
+        there: no alternates, configuration or working tree, so the cache stays data that
+        Agh reads and checks, never authority. A refresh that fails is recorded and the
+        cache is read as it is; the closure fetches what it lacks.
+        """
+        owner = self.git_owner()
+        entry = next(entry for entry in owner["_indexed_submodules"](path) if entry.path.as_posix() == gitlink)
+        refreshed = self.record.setdefault("owned_object_caches", {})
+        if refreshed.get(gitlink, {}).get("pin") == entry.oid and refreshed[gitlink]["repository"] == str(cache):
+            # This run already refreshed it at this pin, or tried and failed: the landing
+            # worktree reads it as the snapshot left it, and a stall is not waited out twice.
+            return
+        record = refreshed[gitlink] = {"repository": str(cache), "pin": entry.oid, "status": "running",
+                                       "started_at": now()}
+        self.save()
+        ref = "refs/agh/owned-object-cache/" + entry.oid
+        try:
+            if self.git("object-cache-kind", cache, "rev-parse", "--is-bare-repository") != "true":
+                raise Refused(f"an owned object cache is a bare repository, and {cache} is not one")
+
+            def acquire(argv, environment):
+                with owner["_agh_transfer_paths"](cache, environment, self.invocation) as (child_environment, paths):
+                    self.call("refresh-object-cache", argv, cache, env=child_environment,
+                              progress=owner["_SubmoduleProgress"](
+                                  f"Agh's refresh of the object cache of {gitlink}", paths))
+            owner["_agh_source_fetch"](entry.url, cache, entry.oid, ref, execute=acquire, native_exact=True)
+            self.git("object-cache-head", cache, "update-ref", "--no-deref", "HEAD", entry.oid)
+            # The pin HEAD names keeps its history; an earlier pin's ref is not needed.
+            for name in self.git("object-cache-refs", cache, "for-each-ref", "--format=%(refname)",
+                                 "refs/agh/owned-object-cache/").splitlines():
+                if name != ref:
+                    self.git("object-cache-earlier-ref", cache, "update-ref", "-d", name)
+            record.update(status="refreshed", head=entry.oid,
+                          pack_kib=self.object_cache_pack_kib(cache))
+        except Refused as error:
+            # A transfer that failed or stalled, or a Git step on the cache. Anything else (a
+            # changed Agh, a ref naming another commit, a cancelled run) ends the run as it would
+            # any acquisition's.
+            record.update(status="failed", error=str(error))
+            print(f"  the owned object cache of {gitlink} was not refreshed, and is read as it is: {error}",
+                  flush=True)
+        except BaseException as error:
+            record.update(status="failed", error=str(error) or type(error).__name__)
+            raise
+        finally:
+            record["finished_at"] = now()
+            self.save()
+
+    def object_cache_pack_kib(self, cache: Path) -> int | None:
+        """The packed size Git counts in an owned object cache, which grows as its sibling's history does."""
+        counted = self.git("object-cache-size", cache, "count-objects", "-v")
+        sizes = [line.split(":", 1)[1].strip() for line in counted.splitlines() if line.startswith("size-pack:")]
+        return int(sizes[0]) if sizes and sizes[0].isdecimal() else None
 
     def synchronize(self, path: Path, label: str) -> str:
         # This owner initializes missing modules and restores only provably safe drift;
@@ -1472,25 +2057,71 @@ class Runner:
             else:
                 raise Refused("nested submodules exceed the staging depth bound")
         self.clean(path)
+        if (self.train is not None and path == self.source and label == "source"
+                and self.args.source_object_cache):
+            retained = self.train.source_objects()
+            caches = retained.optional(self.git_owner()["_first_party_checkout_caches"],
+                                       path, self.args.source_object_cache)
+            if caches:
+                retained.optional(retained.capture, path, self.state, caches)
         return pins
 
     def pinned_source(self) -> None:
         self.record["submodules"] = self.synchronize(self.source, "source")
         self.save()
 
-    def build_tree_manager(self) -> None:
+    def build_tree_manager(self, work: Path | None = None, prepared: Path | None = None) -> None:
         """Give the snapshot the build-tree manager its x.py runs take their lease from.
 
-        A fresh snapshot has none, and until 2026-11-15 only the mint's first x.py noticed,
-        after the dependency prewarm: "native build-tree manager v2 is unavailable". So it is
-        asked here, before any prewarm or build, and built by the snapshot's own
-        scripts/build-tree-manager.sh when none answers (docs/BUILD_AND_INSTALL.md)."""
+        A fresh snapshot has none, and until 2026-11-15 only the mint's first x.py noticed:
+        "native build-tree manager v2 is unavailable". So it is asked before the first x.py,
+        and built by the snapshot's own scripts/build-tree-manager.sh when none answers
+        (docs/BUILD_AND_INSTALL.md).
+
+        That build is offline (`--frozen`): it resolves src/bootstrap/Cargo.lock from its
+        Cargo home alone. A stage run gives it what the dependency preparation has just
+        proved for that manifest: `prepared`, the handoff its offline replay resolved,
+        copied once more through the mint's safe-input owner (the build unpacks crates into
+        its home, and the handoff is the mint's input), and the pinned seed's Targo in
+        `work`, the driver of that replay and the compiler bootstrap.py builds Bootstrap
+        with. The step then depends neither on --cargo-home, an optional input cache that
+        may be partial or absent, nor on the Targo this Mac installs. Built before the
+        preparation with the run's own Cargo home, it ended six of the train's ten ticks
+        on 2026-11-16 in three seconds, on "no matching package named `chrono` found":
+        that home held every locked archive and the index entries of 81 of Bootstrap's 194
+        registry crates. A prepare run has no preparation; its manager is built with the
+        run's environment, whose --cargo-home that mode requires filled."""
         manager = tree_build_manager(self.source, self.env)
         built = manager is None
+        detail = {}
         if built:
+            argv = ["bash", str(self.source / "scripts/build-tree-manager.sh")]
+            environment = None
+            if prepared is not None:
+                seed = work / "seed"
+                targo = seed / "bin/targo"
+                if targo.is_symlink() or not targo.is_file() or not os.access(targo, os.X_OK):
+                    raise Refused(f"the dependency preparation left no pinned seed Targo to build the manager with: {targo}")
+                homes = work / "manager-inputs"
+                if homes.is_symlink() or (homes.exists() and not homes.is_dir()):
+                    raise Refused(f"the manager's Cargo homes must be an owned non-symlink directory: {homes}")
+                homes.mkdir(exist_ok=True)
+                # A fresh home per attempt: the safe-input owner fills only a path that does not exist.
+                attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=homes))
+                home, manifest = attempt / "cargo-home", attempt / "cargo-home-inputs.json"
+                self.call("build-tree-manager-inputs", [
+                    str(self.python), "-I", "-S", str(self.source / "scripts/mint_seed_support.py"),
+                    "cargo-home-inputs", "--source", str(prepared), "--destination", str(home),
+                    "--output", str(manifest)])
+                argv += ["--targo", str(targo)]
+                for directory in self.args.seed_dylib_path:
+                    argv += ["--seed-dylib-path", str(directory.resolve(strict=True))]
+                # As for the recreator and the prewarm: no ambient compiler, flag or cache override.
+                environment = {**bootstrap_environment(self.env, self.source / "scripts/recreate_bootstrap.py"),
+                               "CARGO_HOME": str(home)}
+                detail = {"targo": str(targo), "cargo_home": str(home), "cargo_home_inputs": str(manifest)}
             try:
-                self.call("build-tree-manager", ["bash", str(self.source / "scripts/build-tree-manager.sh")],
-                          heavy=True)
+                self.call("build-tree-manager", argv, heavy=True, env=environment)
             except CommandFailed as error:
                 raise Refused("the build-tree-manager step built no manager that answers "
                               f"{MANAGER_PROTOCOL.decode().strip()}; see {self.last_step()['log']}") from error
@@ -1499,7 +2130,13 @@ class Runner:
                 raise Refused("the build-tree-manager step left no manager that answers "
                               f"{MANAGER_PROTOCOL.decode().strip()}, so the mint's x.py would refuse "
                               f"its build lease; see {self.last_step()['log']}")
-        self.record["build_tree_manager"] = {"path": str(manager), "sha256": file_hash(manager), "built": built}
+            if prepared is not None:
+                # The build ran the seed the mint is about to build with. Its tree is one of the
+                # preparation's bound inputs; say so now, not after the hours of a mint.
+                expected = self.checkpoint["dependency_preparation"]["inputs"][str(seed)]
+                if fingerprint(seed) != expected:
+                    raise Refused(f"the build-tree-manager step changed the pinned seed it built with: {seed}")
+        self.record["build_tree_manager"] = {"path": str(manager), "sha256": file_hash(manager), "built": built, **detail}
         self.save()
 
     def consumers(self, staged: Path) -> list[str]:
@@ -1542,6 +2179,9 @@ class Runner:
                 raw = self.call(f"{name}-committed-policy", [str(self.python), str(Path(__file__).resolve()),
                                 "_consumer-policy", str(engine), str(work)], work)
                 policy = json.loads(raw)
+                check_name = f"{name}-consumer-check"
+                check_command = [str(shell), "-c", policy["command"]]
+                check_timeout = policy["bound"]["seconds"]
                 identity = {"consumer": name, "source_commit": commit, "submodules": pins,
                             "runner_sha256": file_hash(Path(__file__)), "environment_sha256": environment_sha256,
                             "cargo_configs": cargo_config_inputs(work, base_environment),
@@ -1604,17 +2244,19 @@ class Runner:
                             or previous.get("log_identity") != fingerprint(previous_log)
                             or previous.get("step", {}).get("log") != str(previous_log)):
                         raise Refused("consumer acceptance cache or its retained log changed")
-                    outcome = consumer_outcome(engine, policy, previous["step"])
+                    check_step = previous["step"]
+                    require_consumer_terminal_receipt(check_step, check_name, work, engine, check_command, check_timeout)
+                    outcome = consumer_outcome(engine, policy, check_step)
                     consumer["outcome"] = outcome
                     if not outcome["accepted"] or previous.get("outcome") != outcome:
                         raise Refused("consumer cached outcome is refused or changed")
                     consumer.update(status="passed", reused=True, receipt=str(result_path),
                                     log=str(previous_log), exit_code=0)
                 else:
-                    self.call(f"{name}-consumer-check", [str(shell), "-c", policy["command"]], work,
-                              heavy=True, env=environment, timeout=policy["bound"]["seconds"])
+                    self.call(check_name, check_command, work, heavy=True, env=environment, timeout=check_timeout)
                     check_step = self.last_step()
                     log = Path(check_step["log"])
+                    require_consumer_terminal_receipt(check_step, check_name, work, engine, check_command, check_timeout)
                     outcome = consumer_outcome(engine, policy, check_step)
                     consumer["outcome"] = outcome
                     if not outcome["accepted"]:
@@ -1644,6 +2286,7 @@ class Runner:
                 if (fingerprint(log) != outcome["log_identity"]
                         or file_hash(engine / "bin/pub") != outcome["reader_sha256"]):
                     raise Refused("consumer full output or publication owner changed before acceptance")
+                require_consumer_terminal_receipt(check_step, check_name, work, engine, check_command, check_timeout)
                 if receipt:
                     self.write_json(result_path, receipt)
                     consumer.update(status="passed", reused=False, receipt=str(result_path), log=str(log), exit_code=0)
@@ -1765,6 +2408,9 @@ class Runner:
 
         def mint_action() -> None:
             prepared_cache = self.prepare_dependencies(dependency_work)
+            # The mint's first x.py takes its lease from the snapshot's manager, which is
+            # built from what the preparation proved available offline.
+            self.build_tree_manager(dependency_work, prepared_cache)
             command = [*mint_command, "--cargo-home", str(prepared_cache)]
             self.call("mint-preflight", [*command, "--check-only"])
             try:
@@ -1774,6 +2420,12 @@ class Runner:
                 raise
 
         self.milestone("mint", [stage2, archives, mint / "trust-seed-mint"], mint_action)
+        if "build_tree_manager" not in self.record:
+            # A mint this state root already holds needed no manager from this run; name the
+            # one its snapshot answers with, when one does.
+            manager = tree_build_manager(self.source, self.env)
+            if manager is not None:
+                self.record["build_tree_manager"] = {"path": str(manager), "sha256": file_hash(manager), "built": False}
         preparation = self.checkpoint.get("dependency_preparation")
         if not preparation:
             raise Refused("mint checkpoint lacks its source-bound dependency preparation")
@@ -1931,7 +2583,8 @@ class Runner:
             jobs = receipt["bootstrap_lineage"]["mint_configuration"]["xpy_config_overrides"].get("build.jobs")
             if type(jobs) is not int or jobs < 1:
                 raise Refused("the stage receipt records no job count (build.jobs) for the continuation's --jobs")
-            continuation = [str(self.slot), "--", *command[:2], "--resume-after-provenance", str(evidence),
+            continuation = [str(self.slot), *self.claim_words("sanctioned-mint-and-double-compile"), "--",
+                            *command[:2], "--resume-after-provenance", str(evidence),
                             "--source-root", str(self.source), "--jobs", str(jobs), *command[2:]]
             if "--ddc-seed" not in command:
                 seed = oracle.get("sysroot")
@@ -1990,31 +2643,37 @@ class Runner:
             raise Refused("dependency workspace must not be a symlink")
         work.mkdir(parents=True, exist_ok=True, mode=0o700)
         output = self.invocation / "dependency-closure.json"
-        argv = [str(self.python), "-I", "-S", str(Path(__file__).resolve()), "_prewarm-dependencies",
-                str(self.source), str(work), self.host, str(output)]
-        argv += [str(self.args.cargo_home.resolve(strict=True)) if self.args.cargo_home else "-"]
-        engine, _commit = self.publication()
-        argv.append(str(engine))
-        argv += [str(p.resolve(strict=True)) for p in self.args.seed_dylib_path]
+        planned = self.invocation / "dependency-ceiling.json"
+
+        def prewarm(receipt: Path) -> list[str]:
+            argv = [str(self.python), "-I", "-S", str(Path(__file__).resolve()), "_prewarm-dependencies",
+                    str(self.source), str(work), self.host, str(receipt)]
+            argv += [str(self.args.cargo_home.resolve(strict=True)) if self.args.cargo_home else "-"]
+            engine, _commit = self.publication()
+            argv.append(str(engine))
+            for url, cache in self.dependency_object_caches().items():
+                argv += ["--object-cache", f"{url}={cache}"]
+            argv += [f"--dependency-checkout-cache={declaration}"
+                     for declaration in self.args.dependency_checkout_cache]
+            return argv + [str(p.resolve(strict=True)) for p in self.args.seed_dylib_path]
         environment = bootstrap_environment(self.env, self.source / "scripts/recreate_bootstrap.py")
+        # The ceiling is computed by the preparation's own owners from its inputs, before
+        # it starts, and the same number bounds its supervisor: no constant total (RL-55).
+        # Computing it reads the locks and measures the input home, and prints one line.
+        owner = self.git_owner()
+        self.call("locked-dependency-ceiling", [*prewarm(planned), "--ceiling-only"], env=environment,
+                  progress=owner["_SubmoduleProgress"]("the dependency preparation's ceiling", (planned,)))
+        seconds = read_json(planned).get("seconds")
+        if not isinstance(seconds, int) or not 0 < seconds <= 86400:
+            raise Refused(f"the dependency preparation's ceiling must be 1 to 86400 s, the owned step's range: {seconds!r}")
         # The enclosing supervisor's bound starts before extraction/probes. It
-        # expires before the inner fetch owner's Mac observation-only deadline,
-        # retaining a live owned process tree for publication's precise cleanup.
-        self.call("locked-dependency-prewarm", argv, heavy=True, env=environment,
-                  timeout=DEPENDENCY_PREWARM_SECONDS)
+        # expires before the inner owner's own ceiling, which starts later,
+        # retaining a live owned process tree for publication's precise cleanup. It is a
+        # build-slot step for that owned supervision, and it declares its real needs.
+        self.call("locked-dependency-prewarm", [*prewarm(output), "--ceiling-seconds", str(seconds)],
+                  heavy=True, env=environment, timeout=seconds, admission=FETCH_ONLY_ADMISSION)
         report = read_json(output)
-        completed = report.get("completed_fetches", [])
-        modes = {}
-        for row in completed:
-            modes.setdefault(row.get("manifest"), []).append(row.get("offline"))
-        if (report.get("schema") != "trust.bootstrap-offline-dependency-closure.v1"
-                or not modes or any(value != [False, True] for value in modes.values())
-                or not report.get("source_inputs_sha256")):
-            raise Refused("dependency owner did not establish actual locked offline fetch readiness")
-        replay = report.get("handoff_offline_replay", {})
-        if (replay.get("schema") != report["schema"] or not replay.get("source_inputs_sha256")
-                or replay.get("completed_fetches") != [{"manifest": name, "offline": True} for name in modes]):
-            raise Refused("dependency handoff lacks its actual offline replay from safe cache trees")
+        validate_preparation_fetches(report)
         cache = Path(report["cargo_home"])
         if cache.is_symlink() or not cache.resolve(strict=True).is_relative_to(work / "mint-inputs"):
             raise Refused("dependency owner returned a cache outside its owned handoff directory")
@@ -2045,6 +2704,8 @@ class Runner:
                        "started_at": now(), "source_commit": None, "deployment_ready": False,
                        "consumer_ready": False, "consumers": {},
                        "deployment_requirements": list(REQUIREMENTS), "steps": [], "artifacts": {}, "reused": []}
+        if self.agh is not None:
+            self.record["agh"] = self.agh
         self.save()
         try:
             self.python = Path(sys.executable).resolve(strict=True)
@@ -2079,6 +2740,10 @@ class Runner:
                         "ddc_seed_identity": fingerprint(self.args.ddc_seed.resolve(strict=True)) if self.args.ddc_seed else None,
                         "seed_dylib_path": {str(p.resolve(strict=True)): fingerprint(p.resolve(strict=True))
                                             for p in self.args.seed_dylib_path}}
+            if self.args.dependency_checkout_cache:
+                settings["dependency_checkout_cache"] = sorted(self.args.dependency_checkout_cache)
+            if self.args.owned_object_cache:
+                settings["owned_object_cache"] = sorted(self.args.owned_object_cache)
             if self.train is not None:
                 # The host a fleet build is stage-uploaded through, and where it goes after
                 # its stage-upload: the index, or nowhere.
@@ -2089,9 +2754,10 @@ class Runner:
             if self.checkpoint.get("settings") != settings:
                 raise Refused("checkpoint settings differ; retain it and use a fresh state root")
             self.record["settings"] = settings
-            self.build_tree_manager()
             self.call("pinned-bootstrap-config", self.bootstrap(False))
             if self.args.mode == "prepare":
+                # A stage run builds its manager from its prepared dependencies (stage()).
+                self.build_tree_manager()
                 stage = self.source / "build" / self.host / "stage2"
                 self.milestone("prepared-stage2", [stage], lambda: self.call("pinned-bootstrap",
                                self.bootstrap(True), heavy=True))
@@ -2168,7 +2834,12 @@ class Runner:
 
     def run(self) -> int:
         with single_run(self.state):
-            return self.run_locked()
+            if self.train is not None:
+                return self.run_locked()
+            with agh_kept_in(self.state) as self.agh:
+                if self.agh is not None:
+                    self.env["PATH"] = first_on_path(self.agh["directory"], self.env.get("PATH", os.defpath))
+                return self.run_locked()
 
     def resume(self, action: Callable[["Runner"], None]) -> None:
         """Run `action` in a new invocation of this state root's staged cut, with its commit and host.
@@ -2452,6 +3123,325 @@ def remove_tree(path: Path) -> None:
     shutil.rmtree(path)
 
 
+class TrainSourceObjects:
+    """One latest DATA-only donor per explicitly declared first-party child.
+
+    Agh still admits and hashes every supplied cache. These records only bind
+    train-owned directories to the selected index; they are not source proofs.
+    All mutation runs under the train lock, before failed builds are retired.
+    """
+
+    def __init__(self, root: Path, owner: dict, declarations: list[str]):
+        self.root, self.owner = root, owner
+        self.paths = []
+        for declaration in declarations:
+            path, separator, _location = declaration.partition("=")
+            if (not separator or not path.startswith("first-party/")
+                    or any(part in {"", ".", ".."} for part in path.split("/"))
+                    or path in self.paths or len(self.paths) >= 4096):
+                raise Refused("train object retention requires distinct declared first-party paths")
+            self.paths.append(path)
+
+    def optional(self, operation: Callable, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except InterruptedError:
+            raise
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
+            print("train: retained child object advice unavailable; keeping the declared external source", file=sys.stderr)
+            return None
+
+    def directory(self, path: Path, *, create: bool = False) -> None:
+        try:
+            parts = path.relative_to(self.root).parts
+        except ValueError as error:
+            raise Refused("train object directory escapes its state root") from error
+        current = self.root
+        for part in (None, *parts):
+            current = current / part if part is not None else current
+            if create and not os.path.lexists(current):
+                current.mkdir(mode=0o700)
+            metadata = current.lstat()
+            if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o022):
+                raise Refused("train objects require physical owned non-writable directories")
+
+    def git(self, path: Path, *args: str) -> str:
+        return self.owner["_local_submodule_git"](["-C", str(path), *args]).stdout.decode().strip()
+
+    def repository(self, path: Path, row: dict) -> Path:
+        self.directory(path)
+        identity = self.owner["_submodule_file_identity"](path)
+        self.owner["_validate_staged_submodule"](path, identity)
+        git_dir = path / ".git"
+        if (list(self.owner["_submodule_file_identity"](git_dir)[:2]) != row["git_identity"]
+                or any(os.path.lexists(git_dir / name) for name in ("info/grafts", "refs/replace"))
+                or self.git(path, "rev-parse", "--verify", "HEAD^{commit}") != row["pin"]
+                or self.git(path, "config", "--local", "--get", "remote.origin.url") != row["url"]):
+            raise Refused("train object repository no longer binds its captured repository and pin")
+        return path
+
+    def capture(self, source: Path, build: Path, caches: dict[str, Path]) -> None:
+        """Only a completed, inspected acquisition produces retention advice."""
+        self.directory(build)
+        indexed = {entry.path.as_posix(): entry for entry in self.owner["_indexed_submodules"](source)}
+        children = []
+        for path in self.paths:
+            if path not in caches or path not in indexed:
+                raise Refused("train object acquisition lost a declared indexed child")
+            entry, child = indexed[path], source / path
+            row = {"path": path, "url": entry.url, "pin": entry.oid,
+                   "git_identity": list(self.owner["_submodule_file_identity"](child / ".git")[:2])}
+            self.repository(child, row)
+            children.append(row)
+        atomic_json(build / "source-object-pins.json", {
+            "schema": TRAIN_SOURCE_PINS, "source": str(source),
+            "source_identity": list(self.owner["_submodule_file_identity"](source)[:2]),
+            "commit": self.git(source, "rev-parse", "--verify", "HEAD^{commit}"), "children": children})
+
+    def captured(self, build: Path, *, retained_good: bool = False) -> dict[str, dict]:
+        if build.parent != self.root / "builds":
+            raise Refused("train object capture is not in a train build")
+        self.directory(build)
+        if read_json(build / "train-build.json").get("schema") != TRAIN_SCHEMA:
+            raise Refused("train object capture has no train build owner")
+        source = build / "source"
+        self.directory(source)
+        indexed = {entry.path.as_posix(): entry for entry in self.owner["_indexed_submodules"](source)}
+        if retained_good and not os.path.lexists(build / "source-object-pins.json"):
+            # A last-good independent snapshot predating retention is already
+            # kept by retirement. Read it in place; never rewrite its metadata.
+            marker = read_json(build / "source.owner.json")
+            if (marker.get("schema") != SCHEMA or marker.get("snapshot_kind") != "independent-git-v1"
+                    or marker.get("path") != str(source)):
+                raise Refused("retained last-good source has no independent snapshot owner")
+            return {path: {"path": path, "url": indexed[path].url, "pin": indexed[path].oid,
+                           "git_identity": list(self.owner["_submodule_file_identity"](source / path / ".git")[:2])}
+                    for path in self.paths if path in indexed}
+        record = read_json(build / "source-object-pins.json")
+        if (record.get("schema") != TRAIN_SOURCE_PINS or record.get("source") != str(source)
+                or record.get("source_identity") != list(self.owner["_submodule_file_identity"](source)[:2])
+                or record.get("commit") != self.git(source, "rev-parse", "--verify", "HEAD^{commit}")
+                or not isinstance(record.get("children"), list) or len(record["children"]) > 4096):
+            raise Refused("train source capture no longer binds its owned snapshot")
+        children = {}
+        for row in record["children"]:
+            path = row.get("path") if isinstance(row, dict) else None
+            if path not in self.paths or path in children or path not in indexed:
+                raise Refused("train source capture contains an undeclared or repeated child")
+            entry = indexed[path]
+            if row.get("pin") != entry.oid or row.get("url") != entry.url:
+                raise Refused("train source capture differs from its original indexed declaration")
+            children[path] = row
+        return children
+
+    def slot(self, path: str, *, create: bool = False) -> Path:
+        slot = self.root / "source-objects-v1" / hashlib.sha256(path.encode()).hexdigest()
+        if create or os.path.lexists(slot):
+            self.directory(slot, create=create)
+        return slot
+
+    def descriptor(self, slot: Path, row: dict, *, bound: bool = True) -> Path:
+        if (not isinstance(row, dict) or row.get("schema") != TRAIN_SOURCE_OBJECTS
+                or row.get("path") not in self.paths
+                or slot != self.slot(row["path"])
+                or not self.owner["_submodule_url_is_allowed"](row.get("url", ""))
+                or not re.fullmatch(r"[0-9a-f]{40}", row.get("pin", ""))
+                or row.get("directory") not in {"donor-0", "donor-1"}
+                or not isinstance(row.get("git_identity"), list)
+                or len(row["git_identity"]) != 2
+                or not all(type(value) is int for value in row["git_identity"])):
+            raise Refused("invalid train object donor descriptor")
+        if bound and (not isinstance(row.get("directory_identity"), list)
+                      or len(row["directory_identity"]) != 2
+                      or not all(type(value) is int for value in row["directory_identity"])):
+            raise Refused("train object donor has no physical directory binding")
+        source = Path(row.get("source", ""))
+        if (not source.is_absolute() or source.parts[-len(Path(row["path"]).parts):] != Path(row["path"]).parts
+                or source.parents[len(Path(row["path"]).parts)].parent != self.root / "builds"):
+            raise Refused("train object donor source is not a declared child of a train build")
+        return slot / row["directory"]
+
+    def entry(self, slot: Path, row: dict) -> Path:
+        directory = self.descriptor(slot, row)
+        self.directory(directory)
+        if list(self.owner["_submodule_file_identity"](directory)[:2]) != row["directory_identity"]:
+            raise Refused("train object donor directory changed")
+        return directory
+
+    def current(self, slot: Path, *, match: tuple[str, str] | None = None) -> dict | None:
+        if not os.path.lexists(slot / "current.json"):
+            return None
+        row = read_json(slot / "current.json")
+        self.descriptor(slot, row)
+        if match is not None and (row["url"], row["pin"]) != match:
+            return None  # No object traversal for a pin that cannot be selected.
+        self.repository(self.entry(slot, row), row)
+        return row
+
+    def select(self, entries, caches: dict[str, Path], good: dict | None) -> dict[str, Path]:
+        """Match donor data to gitlinks validated by the checkout's owner."""
+        selected = dict(caches)
+        indexed = {entry.path.as_posix(): entry for entry in entries}
+        good_build, good_children = None, {}
+        if good and good.get("build_dir"):
+            good_build = Path(good["build_dir"])
+            good_children = self.optional(self.captured, good_build, retained_good=True) or {}
+        for path in self.paths:
+            entry = indexed[path]
+            old = good_children.get(path)
+            if old and (old["url"], old["pin"]) == (entry.url, entry.oid):
+                candidate = good_build / "source" / path
+                if self.optional(self.repository, candidate, old) is not None:
+                    selected[path] = candidate
+                    continue
+            candidate = self.optional(self.retained, path, entry.url, entry.oid)
+            if candidate is not None:
+                selected[path] = candidate
+        return selected
+
+    def retained(self, path: str, url: str, pin: str) -> Path | None:
+        slot = self.slot(path)
+        if os.path.lexists(slot):
+            row = self.current(slot, match=(url, pin))
+            if row is not None:
+                return self.entry(slot, row)
+        return None
+
+    def cleanup_retiring(self, slot: Path) -> None:
+        transaction = read_json(slot / "retiring.json")
+        if transaction.get("schema") != TRAIN_SOURCE_OBJECTS:
+            raise Refused("unknown train object retirement")
+        row = transaction["entry"]
+        directory = self.descriptor(slot, row)
+        current = self.current(slot)
+        if current is None or current["directory"] == row["directory"]:
+            raise Refused("train object retirement cannot remove its current donor")
+        if os.path.lexists(directory):
+            # The durable intent predates deletion. Its physical binding survives
+            # missing Git contents or a deleted marker after interrupted rmtree.
+            self.entry(slot, row)
+            remove_tree(directory)
+        if read_json(slot / "retiring.json") != transaction:
+            raise Refused("train object retirement intent changed")
+        (slot / "retiring.json").unlink()
+
+    def complete_transfer(self, slot: Path) -> None:
+        transaction = read_json(slot / "pending.json")
+        if transaction.get("schema") != TRAIN_SOURCE_OBJECTS:
+            raise Refused("unknown train object transfer")
+        row, previous = transaction["entry"], transaction["previous"]
+        directory = self.entry(slot, row)
+        child = Path(row["source"])
+        current = self.current(slot)
+        if current not in (None, previous, row):
+            raise Refused("train object donor changed during its transfer")
+        if os.path.lexists(child / ".git"):
+            if os.path.lexists(directory / ".git"):
+                raise Refused("train object transfer has two Git directories; retaining both")
+            self.repository(child, row)
+            move, close = self.owner["_source_object_exclusive_move"](child, directory)
+            try:
+                move(child / ".git", directory / ".git")
+            finally:
+                close()
+        self.repository(directory, row)
+        atomic_json(slot / "current.json", row)
+        if previous is not None and previous != row:
+            if os.path.lexists(slot / "retiring.json"):
+                if read_json(slot / "retiring.json").get("entry") != previous:
+                    raise Refused("another train object retirement is pending")
+            elif os.path.lexists(self.descriptor(slot, previous)):
+                old = self.entry(slot, previous)
+                self.repository(old, previous)
+                if {item.name for item in old.iterdir()} != {".git"}:
+                    raise Refused("unknown files appeared in the previous train object donor")
+                atomic_json(slot / "retiring.json", {"schema": TRAIN_SOURCE_OBJECTS, "entry": previous})
+            if os.path.lexists(slot / "retiring.json"):
+                self.cleanup_retiring(slot)
+        if read_json(slot / "pending.json") != transaction:
+            raise Refused("train object transfer intent changed")
+        (slot / "pending.json").unlink()
+
+    def complete_creation(self, slot: Path) -> None:
+        transaction = read_json(slot / "creating.json")
+        if transaction.get("schema") != TRAIN_SOURCE_OBJECTS:
+            raise Refused("unknown train object creation")
+        row, previous = transaction["entry"], transaction["previous"]
+        directory = self.descriptor(slot, row, bound=False)
+        current = self.current(slot)
+        if current is not None and {key: value for key, value in current.items()
+                                    if key != "directory_identity"} == row:
+            (slot / "creating.json").unlink()
+            return
+        if current != previous:
+            raise Refused("train object donor changed before its replacement was created")
+        if not os.path.lexists(directory):
+            directory.mkdir(mode=0o700)
+        self.directory(directory)
+        if list(directory.iterdir()):
+            raise Refused("unknown files appeared before train object transfer; preserving them")
+        # A durable creation intent precedes mkdir. After a crash, an empty
+        # physical owned directory can be used without deleting/adopting files.
+        bound = {**row, "directory_identity": list(self.owner["_submodule_file_identity"](directory)[:2])}
+        atomic_json(slot / "pending.json", {"schema": TRAIN_SOURCE_OBJECTS,
+                                           "entry": bound, "previous": previous})
+        if read_json(slot / "creating.json") != transaction:
+            raise Refused("train object creation intent changed")
+        (slot / "creating.json").unlink()
+        self.complete_transfer(slot)
+
+    def recover(self, slot: Path) -> bool:
+        if os.path.lexists(slot / "retiring.json"):
+            self.cleanup_retiring(slot)
+        if os.path.lexists(slot / "pending.json"):
+            self.complete_transfer(slot)
+        if os.path.lexists(slot / "creating.json"):
+            self.complete_creation(slot)
+        return True
+
+    def retain_failed(self, last: dict | None, good: dict | None) -> None:
+        """Finish an interrupted transfer before deleting any failed build."""
+        blocked = set()
+        for path in self.paths:
+            slot = self.optional(self.slot, path)
+            if slot is None or (os.path.lexists(slot) and self.optional(self.recover, slot) is None):
+                blocked.add(path)
+        if (not last or last.get("status") not in {"failed", "interrupted"}
+                or not last.get("build_dir") or (good and last["build_dir"] == good.get("build_dir"))):
+            return
+        build = Path(last["build_dir"])
+        if not os.path.lexists(build / "source-object-pins.json"):
+            return
+        children = self.optional(self.captured, build) or {}
+        good_children = {}
+        if good and good.get("build_dir"):
+            good_children = self.optional(self.captured, Path(good["build_dir"]), retained_good=True) or {}
+        for path, row in children.items():
+            if path in blocked:
+                continue
+            good_row = good_children.get(path)
+            if good_row and (good_row["url"], good_row["pin"]) == (row["url"], row["pin"]):
+                if self.optional(self.repository, Path(good["build_dir"]) / "source" / path, good_row) is not None:
+                    continue
+            self.optional(self.retain_child, build, path, row)
+
+    def retain_child(self, build: Path, path: str, row: dict) -> None:
+        slot = self.slot(path, create=True)
+        previous = self.current(slot)
+        if previous and (previous["url"], previous["pin"]) == (row["url"], row["pin"]):
+            return
+        child = build / "source" / path
+        self.repository(child, row)
+        directory = "donor-1" if previous and previous["directory"] == "donor-0" else "donor-0"
+        if os.path.lexists(slot / directory):
+            raise Refused("inactive train object slot is unknown; preserving it")
+        descriptor = {**row, "schema": TRAIN_SOURCE_OBJECTS, "source": str(child), "directory": directory}
+        atomic_json(slot / "creating.json", {"schema": TRAIN_SOURCE_OBJECTS,
+                                            "entry": descriptor, "previous": previous})
+        self.complete_creation(slot)
+
+
 def retire_builds(root: Path, keep: Path | None) -> list[str]:
     """Remove every build directory of the train but `keep`; return what could not go.
 
@@ -2663,6 +3653,7 @@ class Train:
         self.github = github
         self.tools = tools or {}
         self.state: dict = {}
+        self.agh: dict | None = None
 
     def save(self) -> None:
         atomic_json(self.root / "train.json", self.state)
@@ -2670,6 +3661,13 @@ class Train:
     def note(self, **fields) -> None:
         self.state["last"].update(fields)
         self.save()
+
+    def source_objects(self) -> TrainSourceObjects:
+        if not hasattr(self, "_source_objects"):
+            owner = runpy.run_path(str(Path(__file__).with_name("recreate_bootstrap.py")),
+                                   run_name="train_source_objects")
+            self._source_objects = TrainSourceObjects(self.root, owner, self.args.source_object_cache)
+        return self._source_objects
 
     def tool(self, name: str) -> str:
         # Not resolved: agh and the targo shim are links that choose their program by name.
@@ -2713,14 +3711,18 @@ class Train:
             if not owned:
                 print("train: nothing started: " + train_activity(load_train(self.root), True))
                 return 0
-            if not self.args.dry_run and TRAIN_ADVANCED not in os.environ and self.advance():
-                # The tick runs the runner main now holds. The lock's descriptor is not
-                # inherited, so exec releases it and the new process takes it again.
-                print(f"train: {Path(__file__).name} changed on main; this tick runs the new one", flush=True)
-                sys.stderr.flush()
-                os.environ[TRAIN_ADVANCED] = "1"
-                os.execv(sys.executable, [sys.executable, *sys.argv])
-            return self.locked()
+            # One Agh for the whole tick: the GitHub reader, the cut's acquisitions and the
+            # publisher's steps (keep_agh), including the runner's own source update.
+            kept = contextlib.nullcontext() if "agh" in self.tools else agh_kept_in(self.root)
+            with kept as self.agh:
+                if self.args.dry_run or TRAIN_ADVANCED in os.environ or not self.advance():
+                    return self.locked()
+            # Restore the installed Agh search path before exec. The new runner takes the
+            # lock again and can keep or reuse Agh under its own code.
+            print(f"train: {Path(__file__).name} changed on main; this tick runs the new one", flush=True)
+            sys.stderr.flush()
+            os.environ[TRAIN_ADVANCED] = "1"
+            os.execv(sys.executable, [sys.executable, *sys.argv])
 
     def advance(self) -> bool:
         """Fast-forward --repo to origin's main between ticks; whether this runner's bytes changed.
@@ -2732,28 +3734,107 @@ class Train:
         the checkout as it is. The source a tick cuts comes from origin either way.
         """
         repo, runner = self.args.repo.resolve(strict=True), Path(__file__).resolve()
+        # The private intake, with Agh's scratch inside it, is made in the state root and
+        # removed after the fetch. One left here belongs to an advance whose process was
+        # killed with it; the caller holds the lock, so none is running.
+        for stale in sorted(self.root.glob("controller-intake-*.noindex")):
+            try:
+                if stale.is_dir() and not stale.is_symlink():
+                    remove_tree(stale)
+            except OSError as error:
+                print(f"train: the controller intake {stale} was not removed: {error}")
 
-        def git(*argv: str, timeout: int = 600) -> subprocess.CompletedProcess:
-            return subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, text=True,
-                                  timeout=timeout, stdin=subprocess.DEVNULL)
-        branch = git("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
-        if branch != "main":
-            print(f"train: {repo} is on {branch or 'a detached HEAD'}, not main; the tick runs it as it is")
+        def git(*argv: str, directory: Path = repo, environment: dict | None = None,
+                required: bool = False) -> subprocess.CompletedProcess:
+            result = subprocess.run([fixed_git, "-C", str(directory), "-c", "submodule.recurse=false", *argv],
+                                    env=git_environment if environment is None else environment, capture_output=True, text=True,
+                                    timeout=600, stdin=subprocess.DEVNULL)
+            if required and result.returncode:
+                raise Refused(f"controller update: git {argv[0]} failed ({result.stderr.strip()[-500:]})")
+            return result
+
+        def clean_main() -> str:
+            branch = git("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+            if branch != "main":
+                raise Refused(f"is on {branch or 'a detached HEAD'}, not main")
+            status = git("status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all")
+            if status.returncode:
+                raise Refused("could not check whether the checkout is clean")
+            if status.stdout.strip():
+                raise Refused("has uncommitted changes")
+            head = git("rev-parse", "--verify", "HEAD")
+            if head.returncode:
+                raise Refused("could not read main's local commit")
+            return head.stdout.strip()
+
+        try:
+            recreator = runpy.run_path(str(runner.with_name("recreate_bootstrap.py")),
+                                       run_name="daily_managed_git_owner")
+            git_environment = recreator["_provenance_git_environment"]()
+            git_environment.update(GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1", GIT_ALLOW_PROTOCOL="")
+            fixed_git = str(recreator["_require_fixed_git"]())
+            head = clean_main()
+            urls = [value for _, key, value in recreator["_repository_git_config_records"](repo)
+                    if key == "remote.origin.url"]
+            if len(urls) != 1:
+                raise Refused("needs one literal GitHub origin for its source update")
+            slug = github_slug(urls[0])
+            github = self.remote()
+            if github.slug.lower() != slug.lower():
+                raise Refused("the selected GitHub repository differs from the checkout's origin")
+            tip = github.main()
+            tracking = "refs/remotes/origin/main"
+            tracked = git("rev-parse", "--verify", "--quiet", tracking)
+            if tracked.returncode not in (0, 1):
+                raise Refused("could not read the local origin/main ref")
+            previous = tracked.stdout.strip()
+            if head == tip == previous:
+                return False
+
+            before = file_hash(runner)
+            # The controller needs its pre-push hook. Agh admits a private intake
+            # with a literal origin and negotiates complete history against local objects.
+            url = f"https://github.com/{slug}.git"
+            private_ref = "refs/agh/trust-train/advance"
+            self.root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="controller-intake-", suffix=".noindex", dir=self.root) as temp:
+                intake, bundle = Path(temp) / "source", Path(temp) / "incoming.bundle"
+                git("clone", "--local", "--no-checkout", "--no-recurse-submodules", "--single-branch",
+                    "--branch", "main", "--no-tags", "--template=", "--", str(repo), str(intake),
+                    directory=Path(temp), environment={**git_environment, "GIT_ALLOW_PROTOCOL": "file"}, required=True)
+                git("remote", "set-url", "origin", url, directory=intake, required=True)
+                recreator["_agh_source_fetch"](url, intake, tip, private_ref, native_exact=True,
+                                               scratch_parent=Path(temp))
+                if git("merge-base", "--is-ancestor", head, tip, directory=intake).returncode:
+                    raise Refused("local main does not fast-forward to the authenticated origin tip")
+                # NativeExact also repairs missing historical objects in its intake.
+                # Excluding head from the bundle is valid only if the controller
+                # already has everything reachable from that commit.
+                raw_graph = {**git_environment, "GIT_GRAFT_FILE": os.devnull, "GIT_SHALLOW_FILE": os.devnull}
+                graph_args = ("-c", "core.commitGraph=false")
+                complete = git(*graph_args, "rev-list", "--objects", "--quiet", "--missing=error", head,
+                               environment=raw_graph).returncode == 0
+                if tip != head or not complete:
+                    exclusions = ["^" + head] if complete else []
+                    git(*graph_args, "bundle", "create", str(bundle), private_ref, *exclusions, directory=intake,
+                        environment=raw_graph, required=True)
+                    git("bundle", "unbundle", str(bundle), required=True)
+            if clean_main() != head:
+                raise Refused("local main changed during the Agh acquisition")
+            if git("merge-base", "--is-ancestor", head, tip).returncode:
+                raise Refused("local main does not fast-forward to the authenticated origin tip")
+            if previous != tip:
+                if previous and git("merge-base", "--is-ancestor", previous, tip).returncode:
+                    raise Refused("local origin/main does not fast-forward to the authenticated origin tip")
+                if git("update-ref", tracking, tip, previous or "0" * len(tip)).returncode:
+                    raise Refused("local origin/main changed during the Agh acquisition")
+            merged = git("merge", "--quiet", "--ff-only", tip)
+            if merged.returncode:
+                raise Refused(f"could not fast-forward local main ({merged.stderr.strip()[-300:]})")
+            return file_hash(runner) != before
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            print(f"train: {repo} {error}; the tick runs it as it is")
             return False
-        if git("status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all").stdout.strip():
-            print(f"train: {repo} has uncommitted changes; the tick runs it as it is")
-            return False
-        before = file_hash(runner)
-        fetched = git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "origin", "main", timeout=1800)
-        if fetched.returncode:
-            print(f"train: main was not fetched into {repo} ({fetched.stderr.strip()[-300:]}); the tick runs it as it is")
-            return False
-        merged = git("merge", "--quiet", "--ff-only", "FETCH_HEAD")
-        if merged.returncode:
-            print(f"train: {repo}'s main does not fast-forward to origin's ({merged.stderr.strip()[-300:]}); "
-                  "the tick runs it as it is")
-            return False
-        return file_hash(runner) != before
 
     def locked(self) -> int:
         if not self.args.aterm_repo:
@@ -2812,6 +3893,8 @@ class Train:
                   f"comparison; what they find is\n     {TRAIN_ISSUE} in {TRAIN_ISSUE_FILE}, landed the same way")
             return 0
         good = self.state.get("good")
+        if self.args.source_object_cache:
+            self.source_objects().retain_failed(self.state.get("last"), good)
         for problem in retire_builds(self.root, Path(good["build_dir"]) if good else None):
             print(f"train: {problem}", file=sys.stderr)
         build = self.root / "builds" / (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + tip[:12])
@@ -2824,6 +3907,8 @@ class Train:
         try:
             arguments = copy.copy(self.args)
             arguments.state_root, arguments.mode = build, "stage"
+            # The snapshot rechecks that the tick's chosen commit still belongs to main.
+            arguments.source_commit = tip
             runner = Runner(arguments, self.execute, train=self)
             result = runner.run()
         except BaseException as error:
@@ -3132,6 +4217,10 @@ class Train:
         # The landing worktree at the cut commit, its submodules at the cut's pins: a Mac that
         # cannot materialize them ends the tick here, before the mint and before step 4 pushes
         # the seed re-pin, rather than at a red push gate after it.
+        # Source materialization can outlast the host checks, especially while
+        # synchronizing large pinned children. Name that work before it starts;
+        # credential readiness is already answered and does not describe it.
+        self.note(phase="materializing landing source")
         landing = self.landing_checkout(runner)
         self.clear_landing(runner, "landing", landing)
         self.git_here(runner, "landing-fetch-cut", landing, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
@@ -3430,6 +4519,10 @@ def train_plist(args: argparse.Namespace) -> dict:
         argv += ["--seed-dylib-path", str(directory.resolve(strict=True))]
     for declaration in args.source_object_cache:
         argv += ["--source-object-cache", declaration]
+    for declaration in args.owned_object_cache:
+        argv += ["--owned-object-cache", declaration]
+    for declaration in args.dependency_checkout_cache:
+        argv += ["--dependency-checkout-cache", declaration]
     if elan_home is not None:
         argv += ["--elan-home", str(elan_home)]
     for name, repository in sorted(consumer_mappings(args.consumer).items()):
@@ -3535,8 +4628,18 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--source-object-cache", action="append", default=[], metavar="GITLINK=REPOSITORY",
                         help="a local repository Agh reads one first-party gitlink's exact checkout objects from "
                              "(first-party/NAME=/absolute/repository, outside the snapshot); the commit history "
-                             "still comes from origin; exact regular working bytes are also optional native CoW DATA "
-                             "hints, and without one the complete sibling is fetched")
+                             "still comes from origin, and Git checks the child out from those objects: no working "
+                             "file of the repository is read. Without one the complete sibling is fetched")
+    result.add_argument("--owned-object-cache", action="append", default=[], metavar="GITLINK=REPOSITORY",
+                        help="an object cache this runner owns: a bare repository (first-party/NAME=/absolute/repository, "
+                             "outside the snapshot) that Agh brings up to the gitlink's pin before the snapshot acquires "
+                             "it, with HEAD set to that pin, and that is then read as a --source-object-cache is. Only "
+                             "objects, one refs/agh ref and HEAD are written there; a refresh that fails is recorded and "
+                             "the cache is read as it is")
+    result.add_argument("--dependency-checkout-cache", action="append", default=[],
+                        metavar="URL#COMMIT=/absolute/repository",
+                        help="stage/train: let Agh read exact checkout objects for one locked dependency or "
+                             "active dependency Gitlink from this local repository")
     result.add_argument("--publisher-host", choices=("agh-staging", "agh", "gh"), default="agh-staging",
                         help="train: the host aterm's publisher stage-uploads through (default: agh-staging, all a stage-upload needs)")
     result.add_argument("--index-host", choices=("agh", "none"), default="agh",
@@ -3588,8 +4691,29 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if len(argv) < 7:
                 raise Refused("dependency prewarm needs source, work, native host, receipt, cache input and config policy owner")
-            prewarm_dependencies(Path(argv[1]), Path(argv[2]), argv[3], Path(argv[4]),
-                                 [Path(p) for p in argv[7:]], None if argv[5] == "-" else Path(argv[5]), Path(argv[6]))
+            providers, caches, specs, options, rest = [], {}, [], {}, argv[7:]
+            while rest:
+                word = rest.pop(0)
+                if word == "--object-cache" and rest:
+                    url, separator, path = rest.pop(0).partition("=")
+                    if not separator or url in caches or not Path(path).is_absolute():
+                        raise Refused("dependency prewarm --object-cache needs one URL=ABSOLUTE-REPOSITORY per URL")
+                    caches[url] = Path(path)
+                elif word == "--ceiling-seconds" and rest and rest[0].isdecimal() and "ceiling_seconds" not in options:
+                    options["ceiling_seconds"] = int(rest.pop(0))
+                elif word.startswith("--dependency-checkout-cache="):
+                    specs.append(word.partition("=")[2])
+                elif word == "--dependency-checkout-cache" and rest:
+                    specs.append(rest.pop(0))
+                elif word == "--ceiling-only" and "ceiling_only" not in options:
+                    options["ceiling_only"] = True
+                elif word.startswith("-"):
+                    raise Refused(f"dependency prewarm option is unsupported: {word}")
+                else:
+                    providers.append(Path(word))
+            prewarm_dependencies(Path(argv[1]), Path(argv[2]), argv[3], Path(argv[4]), providers,
+                                 None if argv[5] == "-" else Path(argv[5]), Path(argv[6]),
+                                 object_caches=caches, checkout_cache_specs=specs, **options)
             return 0
         except (Exception, KeyboardInterrupt) as error:
             print(f"dependency prewarm refused: {error}", file=sys.stderr)

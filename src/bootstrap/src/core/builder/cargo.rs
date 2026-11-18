@@ -1785,6 +1785,11 @@ impl Builder<'_> {
         cmd_kind: Kind,
         input: CargoInput,
     ) -> Cargo {
+        // Trust: discover source needs through the maintained graph. This is
+        // selection DATA only; availability is checked after SelfCheck closes.
+        if mode == Mode::Std && matches!(self.config.get_dry_run(), DryRun::SelfCheck) {
+            self.selected_std_sources.set(true);
+        }
         let program = self.build_cargo_program(input);
         let mut cargo =
             self.bare_cargo_with_program(compiler, mode, target, cmd_kind, &program, input);

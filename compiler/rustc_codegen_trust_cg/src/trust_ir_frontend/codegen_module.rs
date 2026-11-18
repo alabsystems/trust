@@ -82,7 +82,7 @@
 //!    * `Ignore` argument (a zero-sized one): dropped at both ends; the body gets its value back
 //!      from a constant at entry.
 //!    Everything else refuses `[unsupported-abi]` for all of 5.4: `Cast`, by-value stack, any
-//!    extension other than the `bool` result's, unaudited slots (`&mut T`, raw pointers, floats,
+//!    extension other than the `bool` result's, unvalidated scalar transport (including floats,
 //!    `&str`), `bool` parameters, and `Pair` enums (rebuilding one needs an enum
 //!    `MakeAggregate`, which trust-cg does not lower: INC5.4-PAIR-ENUM). Producer bodies are
 //!    NOT touched: legalization rewrites only M_cg's copy, and the gate reads the producer.
@@ -1430,8 +1430,8 @@ fn kinds_agree(producer: ScalarKind, rustc: ScalarKind) -> bool {
 const LEGAL_NOTE: &str = "rule 9 legalizes a `Direct` scalar of the audited register lane, a \
     `Direct` newtype, a `Pair` of a two-field struct or tuple or of a shared slice reference, an \
     `Indirect` by-value struct, an sret result and an `Ignore` argument; `Cast`, by-value stack, \
-    an extension other than the `bool` result's, unaudited slots (`&mut T`, raw pointers, \
-    floats), `bool` parameters and `Pair` enums stay refused for all of 5.4";
+    an extension other than the `bool` result's, unvalidated scalar transport (including \
+    floats), `bool` parameters and `Pair` enums stay refused";
 
 fn scalar_agrees(ty: &Ty, bits: u32, kind: ScalarKind) -> Result<(), String> {
     let Some((width, producer_kind)) = producer_scalar(ty) else {
@@ -1732,8 +1732,8 @@ fn direct_slot(p: &Module, ty: &Ty, shape: &ArgShape) -> Result<DirectLegal, Abi
     if producer_scalar(ty).is_some() {
         if !*audited {
             return Err(outside(format!(
-                "{ty:?} is passed as {shape:?}, outside the audited register lane (floats, raw \
-                 pointers and `&mut T` among them); {LEGAL_NOTE}"
+                "{ty:?} is passed as {shape:?}, outside the audited register lane (its physical \
+                 scalar transport was not validated); {LEGAL_NOTE}"
             )));
         }
         scalar_agrees(ty, *bits, *kind).map_err(mismatch)?;
@@ -1757,8 +1757,8 @@ fn direct_slot(p: &Module, ty: &Ty, shape: &ArgShape) -> Result<DirectLegal, Abi
         return Ok(DirectLegal::Newtype { lane: lane.clone() });
     }
     Err(outside(format!(
-        "{ty:?} is passed as {shape:?}, outside the audited register lane (floats, raw \
-         pointers and `&mut T` among them); {LEGAL_NOTE}"
+        "{ty:?} is passed as {shape:?}, outside the audited register lane (its physical \
+         scalar transport was not validated); {LEGAL_NOTE}"
     )))
 }
 

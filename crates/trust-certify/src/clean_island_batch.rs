@@ -63,7 +63,8 @@ use clean_parser::SurfaceDecl;
 
 use crate::clean_island::{
     CleanIslandDeclaration, CleanIslandDiagnostic, CleanIslandOutcome, point_diagnostic_span,
-    reserved_namespace_error, standin_imports_in, strict_registered_pre_reference_error,
+    reserved_namespace_error, standin_imports_in, strict_registered_declaration_policy_error,
+    strict_registered_pre_reference_error,
 };
 
 /// One declaration on a dependency cycle, with the island it was written in.
@@ -133,7 +134,7 @@ pub(crate) fn check_islands_batched(
     file_ctx: &mut FileContext,
     sources: &[&str],
 ) -> CleanIslandBatch {
-    check_islands_batched_impl(env, file_ctx, sources, &[], false)
+    check_islands_batched_impl(env, file_ctx, sources, &[], false, None)
 }
 
 /// [`check_islands_batched`] with a PARSER PRELUDE per island (empty for
@@ -149,7 +150,7 @@ pub(crate) fn check_islands_batched_with_preludes(
     sources: &[&str],
     parser_preludes: &[String],
 ) -> CleanIslandBatch {
-    check_islands_batched_impl(env, file_ctx, sources, parser_preludes, false)
+    check_islands_batched_impl(env, file_ctx, sources, parser_preludes, false, None)
 }
 
 pub(crate) fn check_islands_batched_with_census(
@@ -157,7 +158,60 @@ pub(crate) fn check_islands_batched_with_census(
     file_ctx: &mut FileContext,
     sources: &[&str],
 ) -> CleanIslandBatch {
-    check_islands_batched_impl(env, file_ctx, sources, &[], true)
+    check_islands_batched_impl(env, file_ctx, sources, &[], true, None)
+}
+
+/// The opt-in source path retains its genuine producer baseline separately.
+/// It closes every actual eager addition and original anonymous judgment;
+/// ordinary Rust islands keep their existing whole-base reference entry.
+pub(crate) fn check_pinned_sources_batched(
+    env: &mut Environment,
+    file_ctx: &mut FileContext,
+    sources: &[&str],
+    parser_preludes: &[String],
+    collect_census: bool,
+    baseline: &std::collections::BTreeSet<Name>,
+) -> CleanIslandBatch {
+    check_islands_batched_impl(
+        env,
+        file_ctx,
+        sources,
+        parser_preludes,
+        collect_census,
+        Some(baseline),
+    )
+}
+
+enum BatchReference<'a> {
+    Island(crate::reference_mint::IslandReference),
+    PinnedSource(crate::lean_source_batch::pinned_reference::PinnedSourceReference<'a>),
+}
+
+impl BatchReference<'_> {
+    fn base_error(&self) -> Option<String> {
+        match self {
+            Self::Island(reference) => reference.base_error(),
+            Self::PinnedSource(reference) => reference.base_error(),
+        }
+    }
+
+    fn check_registered(&self, name: &Name) -> Result<(), String> {
+        match self {
+            Self::Island(reference) => reference.check_registered(name).map(|_| ()),
+            Self::PinnedSource(reference) => reference.check_registered(name),
+        }
+    }
+
+    fn check_judgment(
+        &self,
+        goal: &clean_kernel::Expr,
+        value: &clean_kernel::Expr,
+    ) -> Result<(), String> {
+        match self {
+            Self::Island(reference) => reference.check_judgment(goal, value).map(|_| ()),
+            Self::PinnedSource(reference) => reference.check_judgment(goal, value),
+        }
+    }
 }
 
 fn check_islands_batched_impl(
@@ -166,6 +220,7 @@ fn check_islands_batched_impl(
     sources: &[&str],
     parser_preludes: &[String],
     collect_census: bool,
+    source_baseline: Option<&std::collections::BTreeSet<Name>>,
 ) -> CleanIslandBatch {
     let before = collect_census.then(|| crate::clean_census::owned_names(env));
     let mut outcomes = vec![CleanIslandOutcome::default(); sources.len()];
@@ -259,7 +314,13 @@ fn check_islands_batched_impl(
                 let mut refused = false;
                 let mut messages: Vec<String> = checked
                     .iter()
-                    .filter_map(|name| strict_registered_pre_reference_error(env, name))
+                    .filter_map(|name| {
+                        if source_baseline.is_some() {
+                            strict_registered_declaration_policy_error(env, name)
+                        } else {
+                            strict_registered_pre_reference_error(env, name)
+                        }
+                    })
                     .collect();
                 // TG16: the compiler's reserved namespaces are refused for EVERY constant the
                 // declaration introduced (an inductive's constructors, recursors and
@@ -326,7 +387,35 @@ fn check_islands_batched_impl(
     // Transactional import recovery reruns ALL survivors against its restored
     // base; that final batch cannot succeed without passing this gate.
     if !batch.is_rejected() {
-        let reference = crate::reference_mint::IslandReference::new(env);
+        let reference = if let Some(baseline) = source_baseline {
+            let current = crate::clean_census::owned_names(env);
+            let owned = current.difference(baseline).cloned().collect();
+            // This denominator comes from actual kernel records, independently
+            // of the lossy registered-head list and optional diagnostic census.
+            for name in &owned {
+                if let Some(error) = strict_registered_declaration_policy_error(env, name) {
+                    if let Some(outcome) = batch.outcomes.first_mut() {
+                        outcome.errors.push(CleanIslandDiagnostic {
+                            start: 0, end: 0,
+                            message: format!("{UNRECOVERABLE_BATCH_PREFIX} source policy refused `{name}`: {error}"),
+                        });
+                    }
+                }
+            }
+            let judgments: Vec<_> = module
+                .decls
+                .iter()
+                .flat_map(|decl| decl.checked_judgments.iter())
+                .map(|judgment| (&judgment.type_, &judgment.value))
+                .collect();
+            BatchReference::PinnedSource(
+                crate::lean_source_batch::pinned_reference::PinnedSourceReference::new(
+                    env, &owned, &judgments,
+                ),
+            )
+        } else {
+            BatchReference::Island(crate::reference_mint::IslandReference::new(env))
+        };
         // Even an import-only batch must not silently accept an ineligible
         // base. Such a whole-base refusal cannot be attributed to one proof;
         // recovery must not turn it into an accepted partial environment.

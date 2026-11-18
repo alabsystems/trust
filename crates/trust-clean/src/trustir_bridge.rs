@@ -6202,10 +6202,15 @@ fn typecheck_elab_result(
 ) -> Result<(), String> {
     use clean_elab::ElabResult;
     match result {
-        // Source diagnostics do not revoke registration. This mathematical
-        // bridge must still recheck the actual enclosed declaration.
+        // A diagnostic wrapper never substitutes for checking its declaration.
         ElabResult::Diagnosed { result, .. } => typecheck_elab_result(result, tc, env),
-        ElabResult::Skipped | ElabResult::Command(_) | ElabResult::Multiple(_) => Ok(()),
+        ElabResult::Multiple(results) => {
+            for inner in results {
+                typecheck_elab_result(inner, tc, env)?;
+            }
+            Ok(())
+        }
+        ElabResult::Skipped | ElabResult::Command(_) => Ok(()),
         ElabResult::Failed { name, error, .. } => Err(format!("{name}: {error}")),
         // Trust: `Example` claims its `val` was already kernel-checked against
         // `ty` upstream — this function's job is to RE-check, so it gets the
@@ -6256,6 +6261,74 @@ fn typecheck_elab_result(
     }
 }
 
+/// A registered block is a container, not an administrative command. Clean's
+/// resilient namespace/section driver retains failed children beside registered
+/// siblings; its diagnostics and trust warnings belong to individual leaves.
+fn recheck_bridge_result(
+    result: &clean_elab::ElabResult,
+    tc: &TypeChecker<'_>,
+    env: &Environment,
+    trust_closure: &mut clean_kernel::env::DomainAxiomClosure,
+    names: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    observe_error: &mut impl FnMut(&clean_elab::ElabError, bool),
+) {
+    use clean_elab::ElabResult;
+    match result {
+        ElabResult::Multiple(results) => {
+            for inner in results {
+                recheck_bridge_result(inner, tc, env, trust_closure, names, errors, observe_error);
+            }
+            return;
+        }
+        ElabResult::Diagnosed { result, diagnostics } => {
+            for diagnostic in diagnostics {
+                let error = format!("{}: source diagnostics: {}",
+                    elab_result_name(result), diagnostic.error);
+                observe_error(&clean_elab::ElabError::SourceWorld(error.clone()),
+                    clean_kernel::tc::declaration_budget_exhausted());
+                errors.push(error);
+            }
+            recheck_bridge_result(result, tc, env, trust_closure, names, errors, observe_error);
+            return;
+        }
+        ElabResult::Failed { name, error, .. } => {
+            // Preserve the original typed failure for semantic-refutation
+            // classification, just as for a top-level elaboration error.
+            observe_error(error, clean_kernel::tc::declaration_budget_exhausted());
+            errors.push(format!("{name}: {error}"));
+            return;
+        }
+        ElabResult::Command(_) | ElabResult::Skipped => return,
+        _ => {}
+    }
+    let name = elab_result_name(result);
+    let error = match typecheck_elab_result(result, tc, env) {
+        Err(error) => Some(format!("{name}: {error}")),
+        Ok(()) => {
+            let warning = clean_elab::register::registration_warning_for_leaf_in(
+                trust_closure, env, result);
+            if warning.as_ref().is_some_and(|w| matches!(w.kind,
+                clean_elab::RegistrationWarningKind::ExplicitSorry
+                    | clean_elab::RegistrationWarningKind::SyntheticSorry
+                    | clean_elab::RegistrationWarningKind::TrustedArith
+                    | clean_elab::RegistrationWarningKind::TrustedAy)) {
+                Some(format!("{name}: carries trust debt (sorry/trusted marker)"))
+            } else {
+                names.push(name);
+                None
+            }
+        }
+    };
+    if let Some(error) = error {
+        // A failed recheck or trust obligation is not a typed elaborator
+        // refutation of the requested proposition.
+        observe_error(&clean_elab::ElabError::SourceWorld(error.clone()),
+            clean_kernel::tc::declaration_budget_exhausted());
+        errors.push(error);
+    }
+}
+
 /// Elaborate + kernel-check one source fragment against the imported
 /// environment. Returns the registered declaration names, or the per-decl
 /// failure report. `sorry` is a failure (there is no allow_sorry here: a
@@ -6282,8 +6355,8 @@ fn load_bridge_source_with_budget(
     load_bridge_source_with_budget_observed(env, source, budget, |_, _| {})
 }
 
-/// Observe the original typed elaboration failure before rendering it. The
-/// observer runs under the same elaboration lock and receives the declaration
+/// Observe typed elaboration failures and explicit source-diagnostic refusals
+/// before rendering them. The observer runs under the same elaboration lock and receives the declaration
 /// budget latch, so tests can distinguish a semantic refutation from an
 /// incomplete check without parsing diagnostics or changing admission.
 fn load_bridge_source_with_budget_observed(
@@ -6332,37 +6405,19 @@ fn load_bridge_source_with_budget_observed(
         let processed = preprocess_decl_with_context(decl, &mut file_ctx);
         match elaborate_decl_and_register_with_warning(env, &processed) {
             Ok(registered) => {
-                let name = elab_result_name(&registered.result);
-                if let Some(error) = registered.result.source_error_message() {
-                    errors.push(format!("{name}: source diagnostics: {error}"));
-                }
-                if name == "(skipped)" {
-                    note_declaration_budget(&label, &mut errors);
-                    continue;
-                }
                 let tc = TypeChecker::with_mode(env, env.mode());
-                match typecheck_elab_result(&registered.result, &tc, env) {
-                    Ok(()) => {
-                        let kernel_delta =
-                            kernel_check_failure_count().saturating_sub(kernel_failures_before);
-                        if kernel_delta > 0 {
-                            errors.push(format!("{name}: kernel check failures: {kernel_delta}"));
-                        } else if registered.warning.as_ref().is_some_and(|w| {
-                            matches!(
-                                w.kind,
-                                clean_elab::RegistrationWarningKind::ExplicitSorry
-                                    | clean_elab::RegistrationWarningKind::SyntheticSorry
-                                    | clean_elab::RegistrationWarningKind::TrustedArith
-                                    | clean_elab::RegistrationWarningKind::TrustedAy
-                            )
-                        }) {
-                            errors
-                                .push(format!("{name}: carries trust debt (sorry/trusted marker)"));
-                        } else {
-                            names.push(name);
-                        }
-                    }
-                    Err(e) => errors.push(format!("{name}: {e}")),
+                // This declaration's entire subtree borrows the same immutable
+                // environment; share the upstream trust-closure memo across its leaves.
+                let mut trust_closure = clean_kernel::env::DomainAxiomClosure::new();
+                recheck_bridge_result(&registered.result, &tc, env, &mut trust_closure,
+                    &mut names, &mut errors, &mut observe_error);
+                let kernel_delta = kernel_check_failure_count()
+                    .saturating_sub(kernel_failures_before);
+                if kernel_delta > 0 {
+                    let error = format!("{label}: kernel check failures: {kernel_delta}");
+                    observe_error(&clean_elab::ElabError::SourceWorld(error.clone()),
+                        clean_kernel::tc::declaration_budget_exhausted());
+                    errors.push(error);
                 }
             }
             Err(e) => {
@@ -8605,6 +8660,125 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnosed_source_error_cannot_hide_beside_a_semantic_forgery() {
+        let source = r#"
+            /-- error: deliberately absent diagnostic -/
+            #guard_msgs in
+            def bridge_diag_registered : Type := Prop
+
+            theorem bridge_mixed_false (p q : Prop) (hp : p) : q := by exact hp
+        "#;
+        let mut env = Environment::default();
+        let mut classified = Vec::new();
+        let error = load_bridge_source_with_budget_observed(
+            &mut env,
+            source,
+            BRIDGE_DECL_BUDGET,
+            |error, incomplete| classified.push((semantic_type_mismatch(error), incomplete)),
+        )
+        .expect_err("a failed source assertion and a false proof must both remain failures");
+        assert!(env.get_const(&Name::from_string("bridge_diag_registered")).is_some(),
+            "the guard must surround a real successfully registered declaration");
+        assert!(error.contains("source diagnostics") && error.contains("#guard_msgs"), "{error}");
+        assert_eq!(classified, [(false, false), (true, false)],
+            "source failure must remain visible beside the actual semantic rejection: {error}");
+
+        let outcome = check_semantic_forgery_with_budget(
+            &mut Environment::default(), "mixed source failure", source, BRIDGE_DECL_BUDGET,
+        );
+        assert!(matches!(outcome,
+            Err(BridgeGateError::ForgeryUnqualified { incomplete: false, .. })), "{outcome:?}");
+        check_semantic_forgery_with_budget(
+            &mut Environment::default(), "semantic-only control",
+            "theorem bridge_mixed_false (p q : Prop) (hp : p) : q := by exact hp",
+            BRIDGE_DECL_BUDGET,
+        ).expect("one actual type mismatch without other failures remains a refutation");
+    }
+
+    #[test]
+    fn composite_bridge_blocks_recheck_and_return_each_registered_child() {
+        let mut env = Environment::default();
+        let names = load_bridge_source(&mut env, "namespace BridgeChildren\ndef first : Type := Prop\nsection\ndef second : Type := Prop\nend\nend BridgeChildren")
+            .expect("every actual registered child is checked");
+        assert_eq!(names, vec!["BridgeChildren.first", "BridgeChildren.second"]);
+        for name in names {
+            assert!(env.get_const(&Name::from_string(&name)).is_some());
+        }
+    }
+
+    #[test]
+    fn composite_bridge_blocks_preserve_failed_namespace_and_section_children() {
+        for source in [
+            "namespace BridgeBad\ndef good : Type := Prop\ndef bad : Prop := Prop\nend BridgeBad",
+            "section\ndef bridge_good : Type := Prop\ndef bridge_bad : Prop := Prop\nend",
+        ] {
+            let mut env = Environment::default();
+            let mut observed = Vec::new();
+            let error = load_bridge_source_with_budget_observed(&mut env, source,
+                BRIDGE_DECL_BUDGET, |error, incomplete| {
+                    observed.push((semantic_type_mismatch(error), incomplete));
+                }).expect_err("a retained Failed child is not an administrative block");
+            assert!(error.contains("bad"), "{error}");
+            assert!(!observed.is_empty() && observed.iter().all(|(_, incomplete)| !incomplete));
+            assert!(env.get_const(&Name::from_string("BridgeBad.good")).is_some()
+                || env.get_const(&Name::from_string("bridge_good")).is_some());
+        }
+    }
+
+    #[test]
+    fn composite_bridge_blocks_refuse_leaf_specific_theorem_and_example_trust_debt() {
+        for (source, registered_name) in [
+            ("namespace BridgeDebt\ntheorem debt (p : Prop) : p := by sorry\nend BridgeDebt", Some("BridgeDebt.debt")),
+            ("section\ntheorem bridge_debt (p : Prop) : p := by sorry\nend", Some("bridge_debt")),
+            ("namespace BridgeExample\nexample (p : Prop) : p := by sorry\nend BridgeExample", None),
+        ] {
+            // The ordinary prelude supplies the real sorry axiom. A missing
+            // axiom would exercise failed elaboration rather than trust debt.
+            let mut env = Environment::with_prelude();
+            let error = load_bridge_source(&mut env, source)
+                .expect_err("each leaf, including an anonymous example, pays its trust obligation");
+            if let Some(name) = registered_name {
+                assert!(env.get_const(&Name::from_string(name)).is_some(),
+                    "the actual sorry proof must register before its trust warning is checked: {error}");
+            }
+            assert!(error.contains("trust debt"), "{error}");
+        }
+    }
+
+    #[test]
+    fn composite_bridge_recheck_recurses_through_diagnosed_untrusted_values() {
+        use clean_elab::ElabResult;
+        use clean_kernel::{Expr, Level};
+        let env = Environment::default();
+        let tc = TypeChecker::with_mode(&env, env.mode());
+        let invalid = ElabResult::Diagnosed {
+            result: Box::new(ElabResult::Multiple(vec![ElabResult::Multiple(vec![
+                ElabResult::Example { ty: Expr::sort(Level::zero()),
+                    val: Expr::sort(Level::zero()) },
+            ])])), diagnostics: Vec::new(),
+        };
+        assert!(typecheck_elab_result(&invalid, &tc, &env).is_err(),
+            "wrapping an invalid Prop:Prop value cannot remove the actual kernel recheck");
+    }
+
+    #[test]
+    fn composite_bridge_blocks_preserve_diagnostics_beside_typed_semantic_failures() {
+        let source = "namespace BridgeMixed\n/-- error: deliberately absent diagnostic -/\n#guard_msgs in\ndef good : Type := Prop\ntheorem bad (p q : Prop) (hp : p) : q := by exact hp\nend BridgeMixed";
+        let mut env = Environment::default();
+        let mut observed = Vec::new();
+        let error = load_bridge_source_with_budget_observed(&mut env, source,
+            BRIDGE_DECL_BUDGET, |error, incomplete| {
+                observed.push((semantic_type_mismatch(error), incomplete));
+            }).expect_err("a source diagnostic cannot disappear inside a composite");
+        assert!(error.contains("source diagnostics") && error.contains("BridgeMixed.bad"), "{error}");
+        assert!(env.get_const(&Name::from_string("BridgeMixed.good")).is_some());
+        assert!(observed.contains(&(false, false)) && observed.contains(&(true, false)), "{observed:?}");
+        let mut env = Environment::default();
+        assert!(matches!(check_semantic_forgery_with_budget(&mut env, "mixed block", source,
+            BRIDGE_DECL_BUDGET), Err(BridgeGateError::ForgeryUnqualified { incomplete: false, .. })));
+    }
 
     /// The step budget bounds EACH step, not the run: six steps of 0.5 s under a
     /// 2 s per-step budget spend 3 s in total and still complete. (A whole-run

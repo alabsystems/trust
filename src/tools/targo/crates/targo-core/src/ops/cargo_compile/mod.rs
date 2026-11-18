@@ -357,6 +357,37 @@ fn compile_ws<'a>(
     exec: &Arc<dyn Executor>,
     tests: Option<crate::ops::cargo_test::graph::TestGraphOptions>,
 ) -> CargoResult<Compilation<'a>> {
+    use crate::compiler::shared_dependencies::Attempt;
+    // Trust (DC-18b): an attempt that refused to share a workspace member
+    // (its metadata needs its real path, its shared compile failed, its
+    // sources moved, or its store slot holds other bytes) stops as on a
+    // failure, and the build is planned again with that member private. Each
+    // attempt makes at least one more member private or withdraws members
+    // altogether, so the attempts end.
+    loop {
+        let attempt = Attempt::begin();
+        let result = compile_ws_once(ws, options, exec, tests.clone());
+        // Trust (DC-18c): the slots this attempt could not yet name.
+        crate::compiler::shared_dependencies::remove_waiting_slots();
+        if result.is_err() && attempt.replan() {
+            ws.gctx().shell().verbose(|shell| {
+                shell.status(
+                    "Replanning",
+                    "a workspace member is compiled privately, or waited for its keyed inputs",
+                )
+            })?;
+            continue;
+        }
+        return result;
+    }
+}
+
+fn compile_ws_once<'a>(
+    ws: &Workspace<'a>,
+    options: &CompileOptions,
+    exec: &Arc<dyn Executor>,
+    tests: Option<crate::ops::cargo_test::graph::TestGraphOptions>,
+) -> CargoResult<Compilation<'a>> {
     with_bcx(ws, options, |bcx| {
         if options.build_config.unit_graph {
             unit_graph::emit_serialized_unit_graph(&bcx.roots, &bcx.unit_graph, ws.gctx())?;

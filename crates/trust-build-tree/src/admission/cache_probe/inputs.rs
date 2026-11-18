@@ -44,6 +44,9 @@ fn directory(root: BorrowedFd<'_>, relative: &Path) -> io::Result<File> {
 fn identity(meta: &std::fs::Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
+pub(super) fn original_identities(inputs: &[StdInput]) -> impl Iterator<Item = (u64, u64)> + '_ {
+    inputs.iter().map(|input| identity(&input.before))
+}
 fn same_content(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     identity(before) == identity(after)
         && before.is_file()

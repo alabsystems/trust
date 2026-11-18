@@ -87,6 +87,17 @@ INDIRECT: dict[str, str] = {
     # scripts/tests/produce_vf5_proposal_test.py loads the driver from its path
     # and runs its functions; the aggregate globs scripts/tests/*_test.py.
     "scripts/produce_vf5_proposal.py": "scripts/check_script_tests.sh",
+    # These production helpers are loaded and exercised by the aggregate's
+    # *_test.py modules: bootstrap_dependency_closure,
+    # derive_vf5_expected_books, qualify_targo_resource, sdk_diagnostic,
+    # source_working_cache and trust_verify_cost respectively. This records their
+    # unit controls, not a claim that live qualification ran.
+    "scripts/bootstrap_dependency_preparation.py": "scripts/check_script_tests.sh",
+    "scripts/derive_vf5_expected_books.py": "scripts/check_script_tests.sh",
+    "scripts/qualify_targo_resource.py": "scripts/check_script_tests.sh",
+    "scripts/sdk_diagnostic.py": "scripts/check_script_tests.sh",
+    "scripts/source_working_cache.py": "scripts/check_script_tests.sh",
+    "scripts/trust_verify_cost.py": "scripts/check_script_tests.sh",
     # trust_core_specr_regen_test.py runs the real regeneration driver and
     # mutations of its pinned inputs, translator and generated outputs. The
     # driver executes the converter/selectors and imports the lowering modules

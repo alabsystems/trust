@@ -65,6 +65,8 @@ pub enum TestTarget {
     DocOnly,
     /// Only run unit and integration tests.
     Tests,
+    /// Only run library unit tests.
+    Lib,
 }
 
 impl TestTarget {
@@ -103,7 +105,7 @@ fn compiler_unit_test_cargo_input(
 ) -> builder::CargoInput {
     if mode == Mode::Rustc
         && kind == Kind::Test
-        && target == TestTarget::Tests
+        && matches!(target, TestTarget::Tests | TestTarget::Lib)
         && native
         && supported_platform
         && !remote
@@ -595,6 +597,13 @@ impl CommandLineStep for Cargo {
         }
 
         cargo.env("TEST_TRUST_SHIM_DIR", &test_shim_dir).env("TRUST_TARGO_TEST_NO_VERIFY", "1");
+        // Trust: `tests/native_improvement_workload.rs` is a genuine-compiler regression
+        // that admits no wrapper. Its inherited RUSTC and RUSTC_WRAPPER are this tool
+        // build's shim, whose RUSTC_REAL is the build compiler (the stage-0 seed); the
+        // tested compiler's RUSTC_REAL lives only in the shim sidecar above. Name the
+        // tested compiler so that test compiles its fixture with it, wrapper-free.
+        // Fixture commands drop every TRUST_* key (cargo-test-support).
+        cargo.env("TRUST_TARGO_TEST_TESTED_RUSTC", &tested_rustc);
         // Some fixtures intentionally capture and later restore the parent's
         // PATH. It must already name the dedicated compiler shims. A genuinely
         // authored later PATH override remains authoritative.
@@ -1118,6 +1127,7 @@ impl CommandLineStep for CargoMiri {
             TestTarget::Default => &mut cargo,
             TestTarget::DocOnly => cargo.arg("--doc"),
             TestTarget::Tests => cargo.arg("--tests"),
+            TestTarget::Lib => cargo.arg("--lib"),
         };
         cargo.arg("--").args(builder.config.test_args());
 
@@ -4283,6 +4293,7 @@ fn prepare_cargo_test_for_target(
             TestTarget::Default => &mut cargo,
             TestTarget::DocOnly => cargo.arg("--doc"),
             TestTarget::Tests => cargo.arg("--tests"),
+            TestTarget::Lib => cargo.arg("--lib"),
         };
     }
 

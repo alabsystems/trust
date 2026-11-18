@@ -329,7 +329,8 @@ fn fail_unknown(
 }
 impl ProcessExecutor for Queries {
     fn status(&self, process: &ProcessBuilder) -> io::Result<ExitStatus> {
-        self.execute(process).map(|output| output.status)
+        self.execute(process)
+            .and_then(|output| process.report_captured_status(output))
     }
     fn output(&self, process: &ProcessBuilder) -> io::Result<Output> {
         self.execute(process)

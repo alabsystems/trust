@@ -489,15 +489,59 @@ count_status_plus_modules() {
         | awk '/^\+/ { n++ } END { print n + 0 }'
 }
 
+# Leading-`-` modules: never checked out.
+count_status_absent_modules() {
+    git -C "$BUILD_DIR" submodule status --recursive 2>/dev/null \
+        | awk '/^-/ { n++ } END { print n + 0 }'
+}
+
+# Checked-out modules that are linked worktrees of another checkout's
+# repository: the ones `git submodule update` must never touch (see below).
+count_linked_submodule_checkouts() {
+    git -C "$BUILD_DIR" submodule status --recursive 2>/dev/null \
+        | awk '!/^-/ { print $2 }' \
+        | while IFS= read -r _path; do
+              _sub_git_dir=$(git -C "$BUILD_DIR/$_path" rev-parse --absolute-git-dir 2>/dev/null) || continue
+              if [ -f "$_sub_git_dir/commondir" ]; then echo linked; fi
+          done \
+        | awk 'END { print NR + 0 }'
+}
+
+# A build tree made by `git worktree add` (this script makes one when --build-dir
+# does not exist) shares each submodule's repository with the first checkout:
+# its first-party/* checkouts are linked worktrees of
+# <common git dir>/modules/first-party/<name>. `git submodule update` there, even
+# one that moves nothing, rewrites core.worktree in that shared repository's
+# config to a path relative to the build tree's side of it, and the first
+# checkout's git then fails in that submodule (measured on git 2.54.0 and
+# 2.56.0: `fatal: cannot chdir to ...`). So such a tree is populated by the classifier's own
+# --restore, which creates or moves each linked checkout without writing that
+# config, and never by the blanket update. One case keeps the blanket update:
+# the classifier cannot run (no bash) and no submodule checkout of the tree is
+# a linked one. The update then clones a store of the tree's own for each
+# absent submodule, as it did before the shared shape, and writes no config
+# another checkout reads.
+build_dir_is_linked_worktree() {
+    _git_dir=$(git -C "$BUILD_DIR" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+    [ -f "$_git_dir/commondir" ]
+}
+
 if [ "$LINK_ONLY" = 1 ]; then
     step "submodules — skipped (--link-only)"
 else
     step "submodules: classify drift FIRST, then init first-party/ and the rest"
     if [ "$DRY_RUN" = 1 ]; then
         say "  would run: bash $SYNC_SCRIPT --root $BUILD_DIR   (classification, BEFORE any mutation)"
-        say "  would run: git -C $BUILD_DIR submodule update --init --recursive"
+        # A build dir that does not exist yet is the worktree step 2 would add.
+        if [ ! -e "$BUILD_DIR" ] || build_dir_is_linked_worktree; then
+            say "  would run: bash $SYNC_SCRIPT --root $BUILD_DIR --restore   (a linked worktree: only when the classification finds drift)"
+        else
+            say "  would run: git -C $BUILD_DIR submodule update --init --recursive"
+        fi
     else
         sync_rc=0
+        blanket_update=1
+        build_dir_is_linked_worktree && blanket_update=0
         if command -v bash >/dev/null 2>&1; then
             printf '  + bash %s --root %s\n' "$SYNC_SCRIPT" "$BUILD_DIR"
             bash "$SYNC_SCRIPT" --root "$BUILD_DIR" || sync_rc=$?
@@ -511,10 +555,9 @@ else
   touched, so nothing here has been initialised, checked out or moved.
 
   At least one submodule worktree is AHEAD of or DIVERGENT from the pin recorded
-  at superproject HEAD, holding commits that no durable ref holds. The
-  'git submodule update --init --recursive' this step was about to run would move
-  HEAD off exactly those commits. The report above names each module and the
-  commits at stake.
+  at superproject HEAD, holding commits that no durable ref holds. The restore
+  this step was about to run would move HEAD off exactly those commits. The
+  report above names each module and the commits at stake.
 
   Resolve it, then re-run this script:
       bash $SYNC_SCRIPT --root $BUILD_DIR            # the same report
@@ -537,10 +580,34 @@ else
       bash $SYNC_SCRIPT --root $BUILD_DIR"
                 fi
                 warn "the submodule classifier could not run (exit $sync_rc); \`git submodule status\`"
-                warn "reports no worktree differing from its pin, so the init below can lose nothing."
+                if [ "$blanket_update" = 1 ]; then
+                    warn "reports no worktree differing from its pin, so the init below can lose nothing."
+                elif [ "$(count_linked_submodule_checkouts)" -eq 0 ]; then
+                    warn "reports no worktree differing from its pin, and no submodule of this linked"
+                    warn "build tree shares another checkout's repository, so the init below clones for"
+                    warn "this tree alone and writes nothing another checkout reads."
+                    blanket_update=1
+                else
+                    _absent=$(count_status_absent_modules)
+                    [ "$_absent" -eq 0 ] || die "the submodule classifier could not run (exit $sync_rc), and $_absent
+  submodule(s) of this linked build tree are not checked out beside others that
+  share the first checkout's repositories. \`git submodule update\` there would
+  break the first checkout's git in those, so only the classifier populates
+  such a tree. Nothing has been touched. Run it yourself (it needs bash):
+      bash $SYNC_SCRIPT --root $BUILD_DIR --restore"
+                    warn "reports no worktree differing from its pin, and every submodule of this"
+                    warn "linked build tree is checked out, so they are left as they are."
+                fi
                 ;;
         esac
-        run git -C "$BUILD_DIR" submodule update --init --recursive
+        if [ "$blanket_update" = 1 ]; then
+            run git -C "$BUILD_DIR" submodule update --init --recursive
+        elif [ "$sync_rc" = 1 ]; then
+            run bash "$SYNC_SCRIPT" --root "$BUILD_DIR" --restore \
+                || die "submodule_sync.sh --restore exited $? in the linked build tree
+  $BUILD_DIR (1 = a restore failed, 2 = a module needs review, 4 = a build is
+  running there). Its output above names the module."
+        fi
     fi
 fi
 

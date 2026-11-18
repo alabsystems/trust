@@ -7649,6 +7649,7 @@ class HooklessTests(unittest.TestCase):
                 mock.patch.object(build_slot, "NCPU", 18), mock.patch.object(build_slot, "DIR", None), \
                 mock.patch.object(build_slot, "cpu_capacity_directory", return_value=os.path.join(tmp, "native-cpu")), \
                 mock.patch.object(build_slot, "available_gib", return_value=100), \
+                mock.patch.object(build_slot, "ledger_discovery", return_value=None), \
                 mock.patch.object(build_slot, "worktree_lock_path", return_value=None), \
                 mock.patch.object(build_slot.signal, "signal"), \
                 mock.patch.object(build_slot.subprocess, "Popen") as child, \
@@ -14463,6 +14464,7 @@ class DiscoverySnapshotTests(unittest.TestCase):
                 mock.patch.object(build_slot, "NCPU", 18), mock.patch.object(build_slot, "DIR", None), \
                 mock.patch.object(build_slot, "cpu_capacity_directory", return_value=os.path.join(tmp, "native-cpu")), \
                 mock.patch.object(build_slot, "available_gib", return_value=100), \
+                mock.patch.object(build_slot, "ledger_discovery", return_value=None), \
                 mock.patch.object(build_slot, "worktree_lock_path", return_value=None), \
                 mock.patch.object(build_slot.signal, "signal"), \
                 mock.patch.object(build_slot.subprocess, "Popen") as child, \
@@ -20345,6 +20347,7 @@ class ScalerTests(unittest.TestCase):
                 mock.patch.object(build_slot, "NCPU", 18), mock.patch.object(build_slot, "DIR", None), \
                 mock.patch.object(build_slot, "cpu_capacity_directory", return_value=os.path.join(tmp, "native-cpu")), \
                 mock.patch.object(build_slot, "available_gib", return_value=100), \
+                mock.patch.object(build_slot, "ledger_discovery", return_value=None), \
                 mock.patch.object(build_slot.signal, "signal"), \
                 mock.patch.object(build_slot.subprocess, "Popen") as child, \
                 mock.patch.object(build_slot, "original_child_exit_observer") as exit_observer:
@@ -27415,7 +27418,10 @@ class CheckoutWorkerTests(unittest.TestCase):
         leaves `ran` behind when it runs."""
         forger = top / "fakepy"
         forger.write_text(
-            f"#!{sys.executable} -I\n"
+            # A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces
+            # (atpkg's python lives under `Application Support/`); this sh/python polyglot
+            # execs it quoted and keeps argv[0] as the forger's own path.
+            f'#!/bin/sh\n""":"\nexec "{sys.executable}" -I "$0" "$@"\n":"""\n'
             "import hashlib, hmac, marshal, os, sys\n"
             f"open({str(top / 'ran')!r}, 'w').close()\n"
             "stdin, stdout = sys.stdin.buffer, sys.stdout.buffer\n"

@@ -4,6 +4,12 @@
 use run_make_support::{cmd, rfs, rustc_path, serde_json, trust_ir};
 use trust_ir::reference::{Ty, binary::deserialize_module, interpret::{InterpretValue, Interpreter}};
 
+/// Run the same complete-module assertions under the owning libtest harness.
+#[test]
+fn concrete_nested_once_captures_preserve_effects_failure_and_escape() {
+    main();
+}
+
 fn main() {
     if std::env::var_os("__COMPILETEST_TRUST_VANILLA_REAL_RUSTC").is_some() { return; }
     rfs::write("native.rs", format!("{}\n{}", rfs::read_to_string("subject.rs"),
@@ -80,10 +86,58 @@ fn main() {
         panic!("once_guard_local: unchanged complete emitted module failed: {error:?}"));
     assert_eq!(result.host_calls, 0, "once_guard_local: no opaque host-call substitution");
     assert_eq!(result.returns, vec![InterpretValue::int(Ty::U32, 7).unwrap()]);
+    for (name, expected) in [("nested_once_effects", 10), ("nested_once_failure", 51),
+        ("distinct_nested_once_targets", 417), ("zero_capture_once", 41),
+        ("zero_capture_once_receiver_effects", 141), ("zero_capture_direct_fn", 43),
+        ("zero_capture_direct_fn_mut_request", 47)] {
+        let caller = rows.iter().find(|row| row["def_path"] == name).unwrap();
+        assert_eq!(caller["lowered"], true, "{name}: {caller}");
+        assert!(caller["unsupported"].as_array().unwrap().is_empty(), "{name}: {caller}");
+        assert_eq!(caller["spliced"], true, "{name}: original caller must be assembled: {caller}");
+        assert!(caller["splice_refusal"].is_null(), "{name}: {caller}");
+        let function = module.functions.iter()
+            .find(|function| function.display_path.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("{name}: original lowered caller is missing: {caller}"));
+        let result = interpreter.execute_func(function.id, []).unwrap();
+        assert_eq!(result.host_calls, 0, "{name}: no substituted callable");
+        assert_eq!(result.returns, vec![InterpretValue::int(Ty::U32, expected).unwrap()], "{name}");
+        // Query the actual assembled module, including its real adapter body.
+        // Capture layout or a source-origin label alone cannot supply code.
+        let mut constructors = 0;
+        for node in function.blocks.iter().flat_map(|block| &block.body) {
+            if let trust_ir::reference::Inst::MakeClosure { ty, func, .. } = &node.inst {
+                constructors += 1;
+                let binding = module.closure_storage_binding(*ty).unwrap_or_else(|reason|
+                    panic!("{name}: original closure frame lacks checked target: {reason}"));
+                assert_eq!(binding.target, *func);
+                assert!(binding.layout.origin.is_some(), "{name}: concrete source origin missing");
+            }
+        }
+        assert!(constructors > 0, "{name}: no actual closure constructors checked");
+        if name == "distinct_nested_once_targets" {
+            let homes = function.blocks.iter().flat_map(|block| &block.body)
+                .filter_map(|node| match &node.inst {
+                    trust_ir::reference::Inst::Alloca { ty: Ty::Closure(_), .. } => node.results.first().copied(),
+                    _ => None,
+                }).collect::<Vec<_>>();
+            assert_eq!(homes.len(), 1, "one lifetime-long original environment home");
+            assert!(function.blocks.iter().flat_map(|block| &block.body).any(|node|
+                matches!(&node.inst, trust_ir::reference::Inst::Store {
+                    ty: Ty::Closure(_), ptr, ..
+                } if *ptr == homes[0])), "the actual closure image initializes its home");
+        }
+    }
+    let escaped = rows.iter().find(|row| row["def_path"] == "nested_once_escape_guard").unwrap();
+    assert_eq!(escaped["lowered"], false, "nested environment must preserve stack provenance");
+    let escaped = rows.iter().find(|row| row["def_path"] == "once_home_address_escape_guard").unwrap();
+    assert_eq!(escaped["lowered"], false, "a closure's local home cannot escape its frame");
     for (name, tag) in [
         ("projected_guard", "Call(closure env unsupported)"),
         ("by_value_array_guard", "Call(closure env unsupported)"),
         ("ordinary_tuple_guard", "Promote(non-scalar &mut local)"),
+        ("mutable_once_home_guard", "Promote(non-scalar &mut local)"),
+        ("once_home_address_binding_guard", "Promote(non-scalar &mut local)"),
+        ("once_home_other_comparison_guard", "Promote(non-scalar &mut local)"),
     ] {
         let found: Vec<_> = rows.iter().filter(|row| row["def_path"] == name).collect();
         assert_eq!(found.len(), 1, "{name}");

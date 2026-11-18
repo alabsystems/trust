@@ -81,6 +81,26 @@ impl State {
         self.run(consumer, side, exit, |record| record["obligations"] = json!("obligations"));
     }
 
+    fn tested(&self, side: &str, exit: i32, arguments: Value, observations: &[Value]) {
+        self.verified("ty", side, exit, &[at("f", "src/lib.rs", 10, PROVED)]);
+        let path = self.run_dir("ty", side).join("obligations/tla-cli.ndjson");
+        let text = fs::read_to_string(&path).unwrap();
+        let (header, proofs) = text.split_once('\n').unwrap();
+        let mut header: Value = serde_json::from_str(header).unwrap();
+        header["concluded"] = json!(true);
+        header["tests"] = arguments;
+        let mut text = format!("{header}\n");
+        for observation in observations {
+            text.push_str(&format!("{observation}\n"));
+        }
+        text.push_str(proofs);
+        fs::write(path, text).unwrap();
+        self.run("ty", side, exit, |record| {
+            record["obligations"] = json!("obligations");
+            record["command"] = json!("rustup run trust targo trust test --locked -p tla-cli");
+        });
+    }
+
     fn compare(&self, extra: &[&str]) -> (u8, String) {
         let mut args = vec!["--state".to_string(), self.path().display().to_string()];
         args.extend(extra.iter().map(|argument| (*argument).to_string()));
@@ -321,6 +341,93 @@ fn a_failing_test_only_the_candidate_names_is_a_new_red() {
     assert!(!text.contains(&format!("named red\t{shared}")), "{text}");
 }
 
+fn libtest_case(outcome: &str) -> [Value; 2] {
+    [
+        json!({"test_harness": "test/tla-cli", "concluded": true, "reason": null}),
+        json!({"test": "test/tla-cli::cases::smoke", "outcome": outcome}),
+    ]
+}
+
+#[test]
+fn concluded_native_test_rows_are_compared_alongside_proofs() {
+    let state = State::new();
+    state.tested("deployed", 101, json!([]), &libtest_case("failed"));
+    state.tested("candidate", 101, json!([]), &libtest_case("failed"));
+    let (code, out) = state.compare(&[]);
+    assert_eq!(code, 0, "{out}");
+    assert!(line(&out, "ty").contains("SHARED_RED"), "{out}");
+
+    // Both commands still exit red. The test case regressed independently.
+    state.tested("deployed", 101, json!([]), &libtest_case("passed"));
+    let (code, out) = state.compare(&[]);
+    assert_eq!(code, 1, "{out}");
+    let verdict = state.verdict("ty").unwrap();
+    assert_eq!(verdict["new_reds"], json!(["failed test\ttla-cli\ttest/tla-cli::cases::smoke"]));
+    assert_eq!(verdict["disclosures"]["proved_candidate"], json!(1));
+
+    // A later step can leave the enclosing shell command successful.
+    state.tested("candidate", 0, json!([]), &libtest_case("failed"));
+    let (code, out) = state.compare(&[]);
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(state.verdict("ty").unwrap()["new_reds"], verdict["new_reds"]);
+}
+
+#[test]
+fn test_measurement_must_conclude_for_the_same_population() {
+    let state = State::new();
+    state.tested("deployed", 0, json!([]), &libtest_case("passed"));
+    let mut incomplete = libtest_case("passed");
+    incomplete[0]["concluded"] = json!(false);
+    incomplete[0]["reason"] = json!("interrupted");
+    for (exit, arguments, observations, reason) in [
+        (0, json!([]), incomplete.as_slice(), "did not report clean completion"),
+        (0, json!([]), libtest_case("not concluded").as_slice(), "has not concluded"),
+        (0, json!([]), libtest_case("ignored").as_slice(), "different test populations"),
+        (0, json!([]), &libtest_case("passed")[..1], "different test populations"),
+        (0, json!(["--ignored"]), libtest_case("passed").as_slice(), "different test populations"),
+    ] {
+        state.tested("candidate", exit, arguments, observations);
+        let (code, out) = state.compare(&[]);
+        assert_eq!(code, 3, "{out}");
+        assert!(out.contains(reason), "wanted {reason:?} in {out}");
+        assert!(state.verdict("ty").is_none());
+    }
+}
+
+#[test]
+fn empty_test_populations_can_accompany_measured_obligations() {
+    let state = State::new();
+    for side in ["deployed", "candidate"] {
+        state.tested(side, 0, json!([]), &[]);
+    }
+    let (code, out) = state.compare(&[]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(state.verdict("ty").unwrap()["verdict"], "PASS");
+
+    let path = state.run_dir("ty", "candidate").join("obligations/tla-cli.ndjson");
+    let text = fs::read_to_string(&path).unwrap();
+    let (header, _) = text.split_once('\n').unwrap();
+    let mut header: Value = serde_json::from_str(header).unwrap();
+    let mut text = format!("{header}\n");
+    for observation in libtest_case("passed") {
+        text.push_str(&format!("{observation}\n"));
+    }
+    fs::write(&path, text).unwrap();
+    let (code, out) = state.compare(&[]);
+    assert_eq!(code, 3, "{out}");
+    assert!(out.contains("hold no trust.obligations.v1 obligation row"), "{out}");
+
+    // Keep valid proofs, but omit evidence present under the other seal.
+    state.tested("candidate", 0, json!([]), &[]);
+    let text = fs::read_to_string(&path).unwrap();
+    let (_, proofs) = text.split_once('\n').unwrap();
+    header.as_object_mut().unwrap().remove("tests");
+    fs::write(path, format!("{header}\n{proofs}")).unwrap();
+    let (code, out) = state.compare(&[]);
+    assert_eq!(code, 3, "{out}");
+    assert!(out.contains("report test evidence for different packages"), "{out}");
+}
+
 #[test]
 fn a_worse_ending_is_a_new_red_and_the_same_ending_is_shared() {
     let stopped = |record: &mut Value| record["stopped_at_bound"] = json!(true);
@@ -430,6 +537,29 @@ fn a_recorded_verdict_is_not_kept_once_a_run_changes() {
 }
 
 #[test]
+fn a_recorded_verdict_cannot_override_the_same_runs() {
+    let state = State::new();
+    state.verified("ty", "deployed", 0, &[at("ty::a", "src/a.rs", 3, PROVED)]);
+    state.verified("ty", "candidate", 0, &[at("ty::a", "src/a.rs", 3, RUNTIME)]);
+    assert_eq!(state.compare(&[]).0, 1);
+    let path = state.path().join("ty/verdict.json");
+    let original = fs::read(&path).unwrap();
+
+    // Leave the input digests untouched while changing the recorded result.
+    for (field, replacement) in [("verdict", json!("PASS")), ("new_reds", json!([]))] {
+        let mut recorded: Value = serde_json::from_slice(&original).unwrap();
+        recorded[field] = replacement;
+        fs::write(&path, serde_json::to_vec_pretty(&recorded).unwrap()).unwrap();
+
+        let (code, text) = state.compare(&[]);
+        assert_eq!(code, 1, "{field}: {text}");
+        assert!(line(&text, "ty").starts_with("NEW_RED\t"), "{field}: {text}");
+        assert!(!text.contains("(recorded verdict kept)"), "{field}: {text}");
+        assert_eq!(fs::read(&path).unwrap(), original, "{field}");
+    }
+}
+
+#[test]
 fn a_new_red_decides_the_exit_while_another_consumer_is_pending() {
     let state = State::new();
     state.run("aterm", "deployed", 0, |_| {});
@@ -441,6 +571,81 @@ fn a_new_red_decides_the_exit_while_another_consumer_is_pending() {
 }
 
 #[test]
+fn explicit_incomplete_coverage_refuses_an_otherwise_green_comparison() {
+    for side in ["deployed", "candidate"] {
+        for (coverage, reason) in [
+            (None, None),
+            (Some(json!(true)), None),
+            (Some(json!(false)), Some("obligation coverage is incomplete")),
+            (Some(json!("true")), Some("coverage_complete must be a boolean")),
+            (Some(Value::Null), Some("coverage_complete must be a boolean")),
+        ] {
+            let state = State::new();
+            let measured = [at("ty::a", "src/a.rs", 3, PROVED)];
+            for measured_side in ["deployed", "candidate"] {
+                state.verified("ty", measured_side, 0, &measured);
+                let path = state.run_dir("ty", measured_side).join("obligations/tla-cli.ndjson");
+                let text = fs::read_to_string(&path).unwrap();
+                let (header, rows) = text.split_once('\n').unwrap();
+                let mut header: Value = serde_json::from_str(header).unwrap();
+                header["concluded"] = json!(true);
+                if measured_side != side {
+                    header["coverage_complete"] = json!(true);
+                } else if let Some(coverage) = &coverage {
+                    header["coverage_complete"] = coverage.clone();
+                }
+                fs::write(path, format!("{header}\n{rows}")).unwrap();
+            }
+            let (code, text) = state.compare(&["--require", "ty"]);
+            if let Some(reason) = reason {
+                assert_eq!(code, 3, "{side}: {coverage:?}: {text}");
+                assert!(line(&text, "ty").contains("tla-cli.ndjson"), "{text}");
+                assert!(line(&text, "ty").contains(reason), "{text}");
+                assert!(state.verdict("ty").is_none());
+            } else {
+                assert_eq!(code, 0, "{side}: {coverage:?}: {text}");
+                assert_eq!(state.verdict("ty").unwrap()["verdict"], "PASS");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unconcluded_package_is_never_compared_as_empty() {
+    for side in ["deployed", "candidate"] {
+        for concluded in [json!(false), json!("true"), Value::Null] {
+            let state = State::new();
+            let measured = [at("ty::a", "src/a.rs", 3, PROVED)];
+            state.verified("ty", "deployed", 1, &measured);
+            state.verified("ty", "candidate", 1, &measured);
+
+            // The command ended and another package measured its obligations,
+            // but this package never reached verification.
+            let record = state.run_dir("ty", side).join("obligations/other-package.ndjson");
+            let mut header = json!({
+                "schema": "trust.obligations.v1",
+                "package": "other-package",
+                "concluded": concluded,
+            });
+            fs::write(&record, format!("{header}\n")).unwrap();
+            let (code, text) = state.compare(&["--require", "ty"]);
+            assert_eq!(code, 3, "{side}: {header}: {text}");
+            assert!(line(&text, "ty").contains("other-package.ndjson"), "{text}");
+            assert!(line(&text, "ty").contains("concluded"), "{text}");
+            assert!(state.verdict("ty").is_none());
+
+            // A measured package can have zero obligations. The declared
+            // completion and the measured sibling make the runs comparable.
+            header["concluded"] = json!(true);
+            fs::write(&record, format!("{header}\n")).unwrap();
+            let (code, text) = state.compare(&["--require", "ty"]);
+            assert_eq!(code, 0, "{text}");
+            assert!(line(&text, "ty").starts_with("SHARED_RED\t"), "{text}");
+        }
+    }
+}
+
+#[test]
 fn malformed_evidence_is_refused_not_read_as_empty() {
     // Obligations are named and hold no row.
     let state = State::new();
@@ -448,7 +653,7 @@ fn malformed_evidence_is_refused_not_read_as_empty() {
     state.verified("ty", "candidate", 1, &[]);
     let (code, text) = state.compare(&[]);
     assert_eq!(code, 3, "{text}");
-    assert!(line(&text, "ty").contains("hold no trust.obligations.v1 row"), "{text}");
+    assert!(line(&text, "ty").contains("hold no trust.obligations.v1 obligation row"), "{text}");
 
     // A row without a status.
     let state = State::new();

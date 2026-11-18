@@ -2,9 +2,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::compiler_input_capture::CompilerInputCapture;
-
-const INPUT: &[u8] = include_bytes!("../compiler_frame_inputs/actual-b8-caller-input.json");
+use crate::compiler_input_capture::historical_b8_data_for_tests;
 
 #[test]
 fn actual_compiler_entry_store_has_retained_conditional_reference_evidence() {
@@ -16,7 +14,7 @@ fn check_actual() {
     let directory = PathBuf::from(
         std::env::var_os("TRUST_FRAME_STEP_COHORT").expect("qualified cohort directory required"),
     );
-    let data = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    let data = historical_b8_data_for_tests();
     let report = crate::call_event::verify_compiled_module(&data.input()).unwrap();
     let caller = report.certificates.iter().find(|c| c.symbol == "source_memory_caller").unwrap();
     assert!(!caller.verdict.is_proven());
@@ -73,7 +71,7 @@ fn check_actual() {
     assert!(actual_step(&data.input(), &wrong).is_err());
     // Relabeling public report fields cannot replace the private source/P
     // custody sealed alongside the actual entry observation.
-    let mut other = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    let mut other = historical_b8_data_for_tests();
     let placement = other.placements.get_mut("source_memory_caller").unwrap();
     placement.params.swap(0, 1);
     let mut relabeled = caller.clone();
@@ -110,7 +108,7 @@ fn copy_bundle(from: &std::path::Path, to: &std::path::Path) {
 #[test]
 fn actual_caller_retains_authentic_save_call_restore_states() {
     std::thread::Builder::new().stack_size(32 << 20).spawn(|| {
-        let data=CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+        let data=historical_b8_data_for_tests();
         let report=crate::original_conjunction_certificate::without_production(||
             crate::call_event::observe_compiled_module_for_frame(&data.input()).unwrap());
         let caller=report.certificates.iter().find(|row|row.symbol=="source_memory_caller").unwrap();

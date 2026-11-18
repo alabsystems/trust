@@ -10,7 +10,7 @@
   },
   "readers": {
     "scripts/check_crates_tests_scoped.py": "d2f98627d3c949f5e8cce3df78fa2781a7fd5e2f",
-    "scripts/check_ir_cohort.py": "84bb5f1e48ce2b50bf7b899e2f98345fa40a5ac5",
+    "scripts/check_ir_cohort.py": "385e4b4b34078e8d861064a908e798673d879b84",
     "scripts/land_gate.py": "b739d2e66f93b2ab497f09d81ca54bfc08f2b1bf",
     "scripts/lib/checkout_inputs.py": "c39665bf9094b0a23e83dcc6998801e9c8cedd65",
     "scripts/lib/crates_lane_members.py": "9a29c0499c6a1d139b457d87beab0c820af20a16",

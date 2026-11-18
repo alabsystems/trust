@@ -20,6 +20,12 @@ LIB_DIAG = "error: Trust strict verification failed for `lib::double`: 1 obligat
 BIN_DIAG = "error: Trust strict verification failed for `main::main`: 1 obligation(s) were not fully verified\n"
 
 
+# A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces (atpkg's python
+# lives under `Application Support/`): exec splits it and the fake never runs. This sh/python
+# polyglot execs the interpreter quoted and keeps argv[0] as the fake's own path.
+PYTHON_SHEBANG = f'#!/bin/sh\n""":"\nexec "{sys.executable}" "$0" "$@"\n":"""\n'
+
+
 def wire(function="lib::double", kind="postcondition", outcome="failed", summary=True):
     rows = [{"type": "function_result", "function": function,
              "results": [{"obligation_id": "vc:fixture:" + kind,
@@ -47,7 +53,7 @@ class BatteryRefusals(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             executable = temp / "fake-tool"
-            executable.write_text("#!" + sys.executable + "\n" + '''
+            executable.write_text(PYTHON_SHEBANG + '''
 import json, os, sys
 from pathlib import Path
 scenario = json.loads(Path(os.environ["BATTERY_SCENARIO"]).read_text())

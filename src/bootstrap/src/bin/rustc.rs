@@ -39,6 +39,13 @@ use shim_utils::{
 #[path = "../utils/proc_macro_deps.rs"]
 mod proc_macro_deps;
 
+// Trust: the note of the incremental folder a unit's compile wrote, which bootstrap's prune
+// reads (DC-12c). The prune exists on Unix alone; the module also holds the prune's reader.
+#[cfg(unix)]
+#[allow(dead_code)]
+#[path = "../utils/trust_prune/incremental.rs"]
+mod trust_incremental;
+
 #[cfg(test)]
 #[path = "rustc/tests.rs"]
 mod tests;
@@ -564,6 +571,12 @@ fn main() {
     // Trust: retain the caller's scheduling policy. Promoting every compiler
     // worker can starve other admitted builds when the host's capacity is limited.
 
+    // Trust: what the call's incremental directory holds of its crate before the compiler
+    // runs, so a compile that succeeds notes the folder it wrote (DC-12c). Reading or noting
+    // never changes the compile's result.
+    #[cfg(unix)]
+    let incremental_before = trust_incremental::Before::read(&args);
+
     let start = Instant::now();
     let (child, status) = {
         let errmsg = format!("\nFailed to run:\n{cmd:?}\n-------------");
@@ -595,6 +608,10 @@ fn main() {
     }
 
     if status.success() {
+        #[cfg(unix)]
+        if let Some(before) = &incremental_before {
+            let _ = before.note();
+        }
         std::process::exit(0);
         // NOTE: everything below here is unreachable. do not put code that
         // should run on success, after this block.

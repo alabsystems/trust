@@ -17,6 +17,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "prepare_vf5_inputs"
+path = "src/bin/prepare_vf5_inputs.rs"
+
 [lints]
 workspace = true
 
@@ -75,7 +79,7 @@ tracing = { workspace = true }
 # turns it on (rustc_mir_transform's), so it reaches test builds only (resolver
 # 2), never the compiler that links this crate.
 calculus-row-test-support = []
-# Explicit real-example subprocess qualification. The selected test refuses
+# Explicit real-binary subprocess qualification. The selected test refuses
 # without the Cargo-emitted prepare_vf5_inputs executable; no runtime test door.
 vf5-resource-command-tests = []
 

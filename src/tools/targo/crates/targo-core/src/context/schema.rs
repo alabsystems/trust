@@ -422,8 +422,9 @@ pub struct CargoBuildConfig {
     /// Trust: seconds a test plan's whole invocation may take, over the
     /// plan's `[run] wall-seconds`.
     pub test_wall_seconds: Option<u64>,
-    /// Trust: seconds a running test executable of a test plan may print
-    /// nothing, over the plan's `[run] stall-seconds`.
+    /// Trust: a plan's output-stall seconds, over `[run] stall-seconds`.
+    /// Without a plan, inactivity seconds of each actual test process tree:
+    /// both output and native complete-tree CPU/I/O must remain inactive.
     pub test_stall_seconds: Option<u64>,
     /// Trust: per-target admission weight and exclusivity for native test
     /// execution, keyed by package name, then target kind, then target name.

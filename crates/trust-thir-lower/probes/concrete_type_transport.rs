@@ -74,8 +74,27 @@ impl rustc_driver::Callbacks for Probe {
             let direct = lower(tcx, instance, &types[1..2]).unwrap();
             assert_eq!(keyed.roots(), direct.roots());
             assert_eq!(keyed.module().stable_digest(), direct.module().stable_digest(), "actual nominal key resolution");
+            // An actual source fn-pointer now has a complete type-table image. This
+            // carries no callable body, physical ABI record, admission or proof token.
+            let signature = tcx.fn_sig(named(tcx, "bad_callable")).instantiate_identity().skip_normalization();
+            let callable_source = tcx.instantiate_bound_regions_with_erased(signature).inputs()[0];
+            let callable = lower(tcx, instance, &[callable_source]).expect("actual fn(u8)->u8 type image");
+            assert_eq!(callable.sources(), &[callable_source]);
+            let [trust_ir::Ty::Func(callable_id)] = callable.roots() else {
+                panic!("actual function pointer lost its checked signature");
+            };
+            let expected_callable = trust_ir::FuncTy {
+                params: vec![trust_ir::Ty::U8], returns: vec![trust_ir::Ty::U8],
+                is_vararg: false, abi: None,
+            };
+            assert_eq!(callable.module().func_type(*callable_id), Some(&expected_callable));
+            assert!(callable.module().functions.is_empty() && callable.module().globals.is_empty()
+                && callable.module().blobs.is_empty() && callable.module().proof_obligations.is_empty()
+                && callable.module().proof_certificates.is_empty()
+                && callable.module().obligation_diagnostics.is_empty()
+                && callable.module().spec_modules.is_empty());
             let mut refusals = Vec::new();
-            for name in ["bad_union", "bad_fat", "bad_callable"] {
+            for name in ["bad_union", "bad_fat"] {
                 let sig = tcx.fn_sig(named(tcx, name)).instantiate_identity().skip_normalization();
                 let bad = tcx.instantiate_bound_regions_with_erased(sig).inputs()[0];
                 let error = match lower(tcx, instance, &[bad]) { Ok(_) => panic!("hostile type {name} was accepted"), Err(e) => e };
@@ -101,7 +120,7 @@ impl rustc_driver::Callbacks for Probe {
             refusals.push(serde_json::json!({"case":"callee-key-as-type","reason":error}));
             let repeated = lower(tcx, instance, &types).unwrap();
             assert_eq!(image.module().stable_digest(), repeated.module().stable_digest(), "failed requests cannot alter a later type image");
-            rows.push(serde_json::json!({"actual_type":format!("{}",instance.args[1].as_type().unwrap()),"roots":image.roots().len(),"struct_rows":image.module().structs.len(),"array_tuple_rows":image.module().types.len(),"tuple_layouts":image.module().tuple_layouts.len(),"actual_concrete_producer_tables_equal":true,"owner_is_local":owner.is_local(),"official_S_admission":false,"refusals":refusals}));
+            rows.push(serde_json::json!({"actual_type":format!("{}",instance.args[1].as_type().unwrap()),"roots":image.roots().len(),"struct_rows":image.module().structs.len(),"array_tuple_rows":image.module().types.len(),"tuple_layouts":image.module().tuple_layouts.len(),"actual_concrete_producer_tables_equal":true,"actual_callable_type_image":true,"owner_is_local":owner.is_local(),"official_S_admission":false,"refusals":refusals}));
         }
         println!("{}", serde_json::to_string_pretty(&rows).unwrap());
         rustc_driver::Compilation::Continue

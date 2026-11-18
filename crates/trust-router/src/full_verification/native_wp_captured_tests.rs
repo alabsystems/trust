@@ -29,7 +29,7 @@ macro_rules! u64_capture {
 fn current_requests_for_historical_module(
     historical: &NativeVerificationBundle,
 ) -> NativeVerificationBundle {
-    historical.validate().expect("valid historical compiler input");
+    assert_archived_schema8_input(historical);
     let [owner] = historical.compiler_facts.monomorphizations.as_slice() else {
         panic!("these complete captures must have exactly one original owner");
     };
@@ -49,6 +49,7 @@ fn current_requests_for_historical_module(
         function,
     )
     .expect("the current production planner must retain the entire original input");
+    planned.validate().expect("the current planner must produce the synchronized handshake");
     assert_eq!(planned.module, historical.module, "no body or contract may change");
     assert_eq!(planned.trust_ir_module_digest, historical.trust_ir_module_digest);
     assert_eq!(planned.input, historical.input);

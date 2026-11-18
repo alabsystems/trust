@@ -215,7 +215,7 @@ fn enum_constant(
 /// the target block that holds only them. Binding is simultaneous: every argument is read from
 /// the incoming `env`.
 pub(super) fn bind_edge(
-    cx: &SpecCx<'_>,
+    cx: &mut SpecCx<'_>,
     target: BlockId,
     args: &[ValueId],
     env: &SpecEnv,
@@ -223,6 +223,7 @@ pub(super) fn bind_edge(
     let block = cx
         .blocks
         .get(&target.index())
+        .copied()
         .ok_or_else(|| format!("branch to bb{} which the function lacks", target.index()))?;
     if block.params.len() != args.len() {
         return Err(format!(
@@ -236,6 +237,11 @@ pub(super) fn bind_edge(
     let mut view = trust_ir::Block::new(target);
     let mut scalar_args = Vec::new();
     for ((param, ty), arg) in block.params.iter().zip(args) {
+        if *ty == IrTy::Unit || env.units.contains(*arg) {
+            cx.unit_type(*arg)?;
+            env.units.require(*arg, ty)?;
+            continue;
+        }
         match env.aggs.get(arg) {
             Some(agg) if agg.ty == *ty => {
                 aggs.insert(*param, agg.clone());
@@ -294,9 +300,13 @@ impl SpecCx<'_> {
         if self.value_tys.is_none() {
             let function =
                 self.module.function_by_id(self.func).ok_or("source function is missing")?;
-            self.value_tys = Some(
-                function.typed_values(self.module).into_iter().map(|t| (t.value, t.ty)).collect(),
-            );
+            let mut types = HashMap::new();
+            for metadata in function.typed_values(self.module) {
+                if types.insert(metadata.value, metadata.ty).is_some() {
+                    return Err("source function has duplicate typed SSA identities".into());
+                }
+            }
+            self.value_tys = Some(types);
         }
         self.value_tys
             .as_ref()

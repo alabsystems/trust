@@ -21,6 +21,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 // Trust: opt-in raw failure evidence shares this module's lifecycle owner.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod activity_supervision;
 mod capture;
 // Trust: retained lifecycle for synchronous compiler queries.
 mod owned_output;
@@ -48,6 +50,52 @@ pub struct StreamingOutputLimits {
     child_exit_cleanup: bool,
     // Trust: see `with_long_lines_cut`.
     cut_long_lines: bool,
+    child_supervision: Option<ChildSupervision>,
+}
+
+/// Narrowing execution policy, never a resource claim or process identity.
+/// Inactivity requires silence in output AND a complete native process-tree
+/// CPU/I/O observation. A resident ceiling applies to the observed whole tree;
+/// neither expected duration nor reserved memory supplies either limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildSupervision {
+    inactivity: Duration,
+    resident_bytes: Option<std::num::NonZeroU64>,
+}
+
+impl ChildSupervision {
+    pub fn new(
+        inactivity: Duration,
+        resident_bytes: Option<std::num::NonZeroU64>,
+    ) -> io::Result<Self> {
+        if inactivity.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child inactivity window must be positive",
+            ));
+        }
+        Ok(Self {
+            inactivity,
+            resident_bytes,
+        })
+    }
+    /// Compose independent narrowing policies without removing either bound.
+    pub fn narrowed_by(self, other: Self) -> Self {
+        Self {
+            inactivity: self.inactivity.min(other.inactivity),
+            resident_bytes: match (self.resident_bytes, other.resident_bytes) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            },
+        }
+    }
+
+    pub fn inactivity(self) -> Duration {
+        self.inactivity
+    }
+    pub fn resident_bytes(self) -> Option<std::num::NonZeroU64> {
+        self.resident_bytes
+    }
 }
 
 impl StreamingOutputLimits {
@@ -68,6 +116,7 @@ impl StreamingOutputLimits {
             timeout: None,
             child_exit_cleanup: false,
             cut_long_lines: false,
+            child_supervision: None,
         }
     }
 
@@ -94,6 +143,16 @@ impl StreamingOutputLimits {
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
+    }
+
+    pub const fn with_child_supervision(mut self, policy: ChildSupervision) -> Self {
+        self.child_supervision = Some(policy);
+        self.child_exit_cleanup = true;
+        self
+    }
+
+    pub const fn child_supervision(self) -> Option<ChildSupervision> {
+        self.child_supervision
     }
 
     /// Trust: stop this child's isolated group when its leader exits, without
@@ -951,6 +1010,54 @@ impl ProcessBuilder {
             .map_or_else(std::process::Stdio::inherit, Stdio::to_std)
     }
 
+    /// Trust: complete a status-only call whose existing owner captured its output.
+    /// Preserve raw inherited streams and the actual exit; explicitly piped
+    /// or null streams remain private. This never executes or retries a child.
+    pub fn report_captured_status(&self, output: Output) -> io::Result<ExitStatus> {
+        let delivered = self.report_captured_streams(&output.stdout, &output.stderr);
+        captured_status_delivery(output.status, delivered)
+    }
+
+    /// Trust: report an owning capture without erasing its original failure.
+    /// Both selected streams are attempted before the original capture refusal
+    /// is propagated. An unobserved exit never becomes a successful status.
+    pub fn report_captured_completion(
+        &self,
+        capture: CapturedProcess,
+        missing_exit: &'static str,
+    ) -> io::Result<ExitStatus> {
+        let delivered = self.report_captured_streams(&capture.stdout, &capture.stderr);
+        if let Some(failure) = capture.failure {
+            return Err(io::Error::other(failure));
+        }
+        let status = capture
+            .status
+            .ok_or_else(|| io::Error::other(missing_exit))?;
+        captured_status_delivery(status, delivered)
+    }
+
+    fn report_captured_streams(&self, stdout: &[u8], stderr: &[u8]) -> io::Result<()> {
+        let mut delivered = Ok(());
+        if self
+            .stdout
+            .as_ref()
+            .is_none_or(|stdio| matches!(stdio, Stdio::Inherit))
+        {
+            let mut sink = io::stdout().lock();
+            delivered = sink.write_all(stdout).and_then(|()| sink.flush());
+        }
+        let mut stderr_delivered = Ok(());
+        if self
+            .stderr
+            .as_ref()
+            .is_none_or(|stdio| matches!(stdio, Stdio::Inherit))
+        {
+            let mut sink = io::stderr().lock();
+            stderr_delivered = sink.write_all(stderr).and_then(|()| sink.flush());
+        }
+        delivered.and(stderr_delivered)
+    }
+
     /// The existing execution group's cancellation flag, never global PID state.
     pub fn execution_cancellation(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
         self.execution_cancel.clone()
@@ -1394,6 +1501,14 @@ impl ProcessBuilder {
             capture.limits = limits;
         }
         if let Some(executor) = self.executor() {
+            if limits.is_some_and(|limits| limits.child_supervision.is_some()) {
+                return (
+                    ExecStats::default(),
+                    Err(anyhow!(
+                        "hosted executor cannot silently omit native child activity supervision"
+                    )),
+                );
+            }
             if captured.is_some() {
                 return (
                     ExecStats::default(),
@@ -1638,7 +1753,13 @@ impl ProcessBuilder {
                 Read2Action::Continue
             };
             let read_result = match child_exit.as_mut() {
-                Some(owner) => owner.read(out, err, deadline, &mut on_data),
+                Some(owner) => owner.read(
+                    out,
+                    err,
+                    deadline,
+                    limits.and_then(|limits| limits.child_supervision),
+                    &mut on_data,
+                ),
                 None => read2_interruptible(out, err, deadline, &mut on_data),
             };
             drop(on_data);
@@ -2233,6 +2354,19 @@ impl<'a> StreamingChildExit<'a> {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn observed_completion(&mut self) -> io::Result<bool> {
+        self.join_observer();
+        let observation = self
+            .observed
+            .as_ref()
+            .expect("original observer joined once");
+        if let Some(error) = &observation.error {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
+        Ok(observation.exited)
+    }
+
     fn finish(&mut self, cancel: bool) -> io::Result<ExitStatus> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -2279,6 +2413,7 @@ impl<'a> StreamingChildExit<'a> {
         mut out: std::process::ChildStdout,
         mut err: std::process::ChildStderr,
         deadline: Option<Instant>,
+        supervision: Option<ChildSupervision>,
         data: &mut dyn FnMut(bool, &mut Vec<u8>, bool) -> Read2Action,
     ) -> io::Result<Read2Action> {
         use std::io::Read as _;
@@ -2294,6 +2429,8 @@ impl<'a> StreamingChildExit<'a> {
         let mut buffers = [Vec::new(), Vec::new()];
         let mut done = [false; 2];
         let mut exited = false;
+        let mut activity = supervision
+            .map(|policy| activity_supervision::ActivitySupervision::new(self.child.id(), policy));
         let mut fds = [
             libc::pollfd {
                 fd: out.as_raw_fd(),
@@ -2315,6 +2452,23 @@ impl<'a> StreamingChildExit<'a> {
             if exited && done.iter().all(|done| *done) {
                 return Ok(Read2Action::Continue);
             }
+            if !exited && let Some(activity) = activity.as_mut() {
+                // Observation alone does not reap or signal. The existing
+                // exit observer remains the sole group-retirement owner.
+                if !unreaped_streaming_child_exit(self.child.id() as libc::pid_t)? {
+                    if let activity_supervision::ActivityPoll::Exited(unavailable) =
+                        activity.poll()?
+                    {
+                        if !unreaped_streaming_child_exit(self.child.id() as libc::pid_t)? {
+                            return Err(unavailable.unwrap_or_else(|| io::Error::other(
+                                "terminal activity observation lacks the original owned-child exit",
+                            )));
+                        }
+                        exited = self.observed_completion()?;
+                        fds[2].fd = -1;
+                    }
+                }
+            }
             let timeout = if exited {
                 0 // Drain already-written bytes; never await an escaped holder.
             } else if let Some(deadline) = deadline {
@@ -2332,6 +2486,11 @@ impl<'a> StreamingChildExit<'a> {
             } else {
                 -1
             };
+            let timeout = if activity.is_some() && !exited {
+                if timeout < 0 { 100 } else { timeout.min(100) }
+            } else {
+                timeout
+            };
             // SAFETY: fds is a live three-element pollfd array.
             let count = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
             if count < 0 {
@@ -2342,18 +2501,13 @@ impl<'a> StreamingChildExit<'a> {
                 return Err(error);
             }
             if fds[2].revents != 0 {
-                self.join_observer();
-                let observation = self
-                    .observed
-                    .as_ref()
-                    .expect("observer joined on notification");
-                if let Some(error) = &observation.error {
-                    return Err(io::Error::new(error.kind(), error.to_string()));
-                }
-                exited = observation.exited;
+                exited = self.observed_completion()?;
                 fds[2].fd = -1;
             }
             if count == 0 && !exited {
+                if activity.is_some() && !deadline.is_some_and(|end| Instant::now() >= end) {
+                    continue;
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "streaming process exceeded its wall-clock timeout",
@@ -2375,6 +2529,9 @@ impl<'a> StreamingChildExit<'a> {
                         self.stream_ends[index] = CaptureStreamEnd::Eof;
                     }
                     Ok(size) => {
+                        if let Some(activity) = activity.as_mut() {
+                            activity.output();
+                        }
                         buffers[index]
                             .try_reserve_exact(size)
                             .map_err(io::Error::other)?;
@@ -2406,6 +2563,7 @@ impl<'a> StreamingChildExit<'a> {
         _out: std::process::ChildStdout,
         _err: std::process::ChildStderr,
         _deadline: Option<Instant>,
+        _supervision: Option<ChildSupervision>,
         _data: &mut dyn FnMut(bool, &mut Vec<u8>, bool) -> Read2Action,
     ) -> io::Result<Read2Action> {
         Err(io::Error::new(
@@ -2623,6 +2781,39 @@ pub enum Stdio {
     Piped,
     Inherit,
     Null,
+}
+
+// Trust: reporting failure retains the first IO cause and the observed exit.
+#[derive(Debug)]
+struct CapturedStatusReportError {
+    status: ExitStatus,
+    source: io::Error,
+}
+
+impl fmt::Display for CapturedStatusReportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "captured child output delivery failed (original {}): {}",
+            self.status, self.source
+        )
+    }
+}
+
+impl std::error::Error for CapturedStatusReportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn captured_status_delivery(
+    status: ExitStatus,
+    delivered: io::Result<()>,
+) -> io::Result<ExitStatus> {
+    delivered.map_err(|source| {
+        io::Error::new(source.kind(), CapturedStatusReportError { status, source })
+    })?;
+    Ok(status)
 }
 
 impl Stdio {
@@ -3584,6 +3775,7 @@ mod imp {
 // boundary.
 #[cfg(test)]
 mod tests {
+    mod activity_supervision;
     mod deadline_custody;
     #[test]
     fn resource_capabilities_are_redacted_without_changing_child_environment() {

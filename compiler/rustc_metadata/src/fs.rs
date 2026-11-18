@@ -56,7 +56,21 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> Result<EncodedMetadata, Err
         };
 
     if tcx.needs_metadata() {
+        // Trust (DC-18a): `-Ztrust-path-free` refuses a host-path environment read before
+        // anything is encoded or reused, and a host path in what was encoded after; either
+        // way nothing encoded is left, `-Csave-temps` or not.
+        use crate::trust_path_free::{refuse_after_encoding, refuse_before_encoding};
+        let written: Vec<&Path> =
+            std::iter::once(&*metadata_filename).chain(metadata_stub_filename.as_deref()).collect();
+        if let Some(guar) = refuse_before_encoding(tcx.sess) {
+            crate::trust_path_free::remove_outputs(&written, metadata_tmpdir.as_ref());
+            return Err(guar);
+        }
         encode_metadata(tcx, &metadata_filename, metadata_stub_filename.as_deref());
+        if let Some(guar) = refuse_after_encoding(tcx.sess, &written) {
+            crate::trust_path_free::remove_outputs(&written, metadata_tmpdir.as_ref());
+            return Err(guar);
+        }
     } else {
         // Always create a file at `metadata_filename`, even if we have nothing to write to it.
         // This simplifies the creation of the output `out_filename` when requested.

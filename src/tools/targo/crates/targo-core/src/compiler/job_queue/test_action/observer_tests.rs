@@ -161,7 +161,8 @@ fn observer_driver() {
             let send = send.clone();
             workers.spawn(move || {
                 let _token = token;
-                let result = graph::execute(&command, None, None, &signals, graph::OutputSink::Raw);
+                let result =
+                    graph::execute(&command, None, None, &signals, graph::OutputSink::Raw, None);
                 send.send((index, result)).unwrap();
             });
         }

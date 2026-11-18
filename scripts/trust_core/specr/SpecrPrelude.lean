@@ -286,14 +286,17 @@ def SInt.shr (a n : Int) : SOut Int :=
     | Int.ofNat x => SOut.ok (Int.ofNat (SNat.shr x k))
     | Int.negSucc nx => SOut.ok (Int.negSucc (SNat.shr nx k))
 
-/-- libspecr `Int::pow`: exponent through `to_u32().unwrap()`. -/
+/-- libspecr `Int::pow`: `to_u32().unwrap()` runs before exponentiation.
+Negative exponents and values above `u32::MAX` both fail that conversion. -/
 def SInt.pow (a n : Int) : SOut Int :=
   match n with
-  | Int.negSucc _ => SOut.panic "called `Option::unwrap()` on a `None` value (exponent)"
+  | Int.negSucc _ => SOut.panic "called `Option::unwrap()` on a `None` value"
   | Int.ofNat k =>
-    match a with
-    | Int.ofNat x => SOut.ok (Int.ofNat (Nat.pow x k))
-    | Int.negSucc nx => SOut.ok (SInt.ofSignedNat (decide (k % 2 = 1)) (Nat.pow (nx + 1) k))
+    if k < 4294967296 then
+      match a with
+      | Int.ofNat x => SOut.ok (Int.ofNat (Nat.pow x k))
+      | Int.negSucc nx => SOut.ok (SInt.ofSignedNat (decide (k % 2 = 1)) (Nat.pow (nx + 1) k))
+    else SOut.panic "called `Option::unwrap()` on a `None` value"
 
 /-- libspecr `Int::is_power_of_two` -/
 def SNat.isPow2Aux : Nat → Nat → Bool

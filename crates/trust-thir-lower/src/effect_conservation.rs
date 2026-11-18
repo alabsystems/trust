@@ -183,6 +183,8 @@ pub enum Equivalence {
     TryResidual,
     /// `PartialEq::eq` / `ne` on a primitive scalar, `()`, `str`, or a slice / array of
     /// primitive scalars: the std comparison (a string-pattern `match` is lowered byte-wise).
+    /// Also the exact source-owned real core `ptr::eq` over two thin pointers,
+    /// recognized by the SAME version/signature/target guard as its lowering.
     BuiltinEq,
     /// Core's `From<bool>` for primitive integers: exactly the total cast `b as Self`.
     BoolFromInteger,
@@ -2136,6 +2138,14 @@ fn audited_equivalence<'tcx>(
         return PURE_INTRINSICS
             .contains(&intrinsic.name.as_str())
             .then_some(Equivalence::PureIntrinsic);
+    }
+    if let Some(comparison) = crate::core_ptr_eq::recognize(tcx, def_id, generic_args) {
+        let input = comparison.input();
+        if call_args.len() == 2
+            && call_args.iter().all(|arg| arg.node.ty(&body.local_decls, tcx) == input)
+        {
+            return Some(Equivalence::BuiltinEq);
+        }
     }
     if crate::core_bool_from_output_ty(tcx, def_id, generic_args).is_some() {
         return Some(Equivalence::BoolFromInteger);

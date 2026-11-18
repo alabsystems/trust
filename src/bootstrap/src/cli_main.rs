@@ -527,6 +527,8 @@ pub(crate) enum StepOwners<'a> {
 // Trust: one maintained Session::build/Step graph for both actual owner paths.
 pub(crate) fn run_session_steps(sess: &mut Session, owners: StepOwners<'_>) -> Result<(), String> {
     let seeding = crate::utils::trust_stage1_seed::begin(sess);
+    // Trust: name this run's tab, checkout and build directory for aterm (DC-12c).
+    build_start::for_run(&sess.config);
     sess.build();
     // Trust: never publish a reusable output fact after its ownership namespace
     // changed. Only whole-tree clean --all without selected crate paths may
@@ -610,3 +612,367 @@ fn check_version(config: &Config) -> Option<String> {
 
     Some(msg)
 }
+
+/// Trust: the line an `x.py` run started in an aterm tab leaves for aterm before its steps run
+/// (DC-12c), so aterm's `sys disk` shows a Trust build directory with the tab that built it.
+/// The line and its place are aterm's build-start record (aterm `crates/atpkg/src/build_start.rs`,
+/// DC-01), which a tool that does not link aterm writes with one append:
+///
+/// * **Place.** `build-starts.log` in aterm's state folder: on macOS
+///   `$HOME/Library/Application Support/aterm`, on other Unix systems `$XDG_STATE_HOME/aterm`
+///   where that is an absolute path, else `$HOME/.local/state/aterm`. The folder is never made
+///   (where aterm made none, no window reads a line), and one this process's effective user does
+///   not own gets no line (a `sudo -E` build). Bootstrap writes nowhere else (the record's
+///   lock and stage beside it, below), and on no other system.
+/// * **Line.** One JSON object and a `\n`, at most [`build_start::MAX_LINE`] bytes, written by one
+///   append to a file opened `O_APPEND | O_CREAT` (mode 0600), never through a link:
+///   `{"v":1,"session":…,"workspace":…,"build":…,"pid":…,"at_ms":…}`. `session` is
+///   `ATERM_PARENT_SESSION_ID`, the tab's own session (a tab ID, `t` and 10 Crockford base-32
+///   characters, or a legacy `s-` and 20 hex digits); `ATERM_SESSION_ID` is a nested aterm's
+///   and is never read. `workspace` is the checkout (`config.src`) and `build` the build
+///   directory (`config.out`), each absolute with its links resolved.
+/// * **Never in the run's way.** A run outside a tab, a dry run, a `clean`, `setup`, `format`
+///   or `vendor` (no build output; the prune's `gate` in `utils/trust_prune.rs` skips the
+///   same) and a line that cannot be written write nothing and print nothing, and the run goes
+///   on as before.
+/// * **Bound.** A run whose line leaves the record over [`build_start::CAP`] bytes rewrites it
+///   as aterm's own writers do ([`build_start::compact`]), so the record stays bounded where no
+///   aterm writer runs (aterm writes lines on macOS alone, and only for builds through its
+///   front): only while it holds the lock of `build-starts.log.lock` beside it, taken without
+///   waiting (the same `flock` aterm's rewrite takes, so the two never rewrite at once), it keeps
+///   of the last [`build_start::READ_MAX`] bytes the newest line of each workspace and the
+///   newest of each session and workspace younger than a week, sheds the second kind and then
+///   the first, oldest first, to half the cap, stages them in `build-starts.log.new`, renames
+///   that over the record and appends the whole lines written to the old file after its read.
+pub(crate) mod build_start {
+    // Off Unix no line is written, and what forms and bounds one goes unused.
+    #![cfg_attr(not(unix), allow(dead_code))]
+
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    use crate::core::builder::Kind;
+    use crate::core::config::Config;
+
+    /// The record's file name inside aterm's state folder.
+    pub(crate) const RECORD: &str = "build-starts.log";
+    /// The longest line, its `\n` included.
+    pub(crate) const MAX_LINE: usize = 4096;
+    /// The variable that holds the tab's own session.
+    pub(crate) const SESSION_ENV: &str = "ATERM_PARENT_SESSION_ID";
+    /// The file beside the record whose lock a rewrite holds.
+    pub(crate) const LOCK: &str = "build-starts.log.lock";
+    /// The file beside the record a rewrite stages its lines in.
+    pub(crate) const STAGE: &str = "build-starts.log.new";
+    /// The size past which a writer rewrites the record.
+    pub(crate) const CAP: u64 = 256 << 10;
+    /// The most a rewrite keeps: half the cap, so rewrites are at least that much growth apart.
+    pub(crate) const KEEP_MAX: u64 = CAP / 2;
+    /// How much of the record's end a rewrite keeps from.
+    pub(crate) const READ_MAX: u64 = 1 << 20;
+    /// How long a rewrite keeps a session's newest line of a workspace a later session built in.
+    pub(crate) const KEEP_PAIR_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+    /// A tab ID's characters after its `t`.
+    const ALPHABET: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+    /// Whether `text` is a tab's session: `t` and 10 characters of [`ALPHABET`], or `s-` and 20
+    /// lower-case hex digits.
+    pub(crate) fn is_session(text: &str) -> bool {
+        let b = text.as_bytes();
+        let tab = b.len() == 11 && b[0] == b't' && b[1..].iter().all(|c| ALPHABET.contains(c));
+        let legacy = b.len() == 22
+            && b.starts_with(b"s-")
+            && b[2..].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c));
+        tab || legacy
+    }
+
+    /// aterm's state folder for the environment `env`, as aterm's release build resolves it on
+    /// macOS (`macos`) or another Unix system. `None` without a home.
+    pub(crate) fn state_dir(
+        env: &dyn Fn(&str) -> Option<OsString>,
+        macos: bool,
+    ) -> Option<PathBuf> {
+        if !macos
+            && let Some(state) = env("XDG_STATE_HOME").map(PathBuf::from)
+            && state.is_absolute()
+        {
+            return Some(state.join("aterm"));
+        }
+        let home = PathBuf::from(env("HOME").filter(|home| !home.is_empty())?);
+        if !home.is_absolute() {
+            return None;
+        }
+        Some(if macos {
+            home.join("Library/Application Support/aterm")
+        } else {
+            home.join(".local/state/aterm")
+        })
+    }
+
+    /// Whether a run of `kind` leaves a line: one that is no dry run and may write build output.
+    pub(crate) fn wanted(dry_run: bool, kind: Kind) -> bool {
+        !dry_run && !matches!(kind, Kind::Clean | Kind::Setup | Kind::Format | Kind::Vendor)
+    }
+
+    /// The line for a run of the tab `session` on `workspace` into `build`: `None` for a session
+    /// that is no session, a path that is relative or not UTF-8, and a line that is too long.
+    pub(crate) fn line(
+        session: &str,
+        workspace: &Path,
+        build: &Path,
+        pid: u32,
+        at_ms: u64,
+    ) -> Option<String> {
+        let text = |path: &Path| path.to_str().filter(|_| path.is_absolute()).map(str::to_owned);
+        if !is_session(session) {
+            return None;
+        }
+        let mut line = serde_json::json!({
+            "v": 1,
+            "session": session,
+            "workspace": text(workspace)?,
+            "build": text(build)?,
+            "pid": pid,
+            "at_ms": at_ms,
+        })
+        .to_string();
+        line.push('\n');
+        (line.len() <= MAX_LINE).then_some(line)
+    }
+
+    /// Appends the line of a run on `workspace` into `build` to the record of the tab the
+    /// environment `env` names, with one write. Whether a line was written: `false` outside a
+    /// tab, without a state folder this effective user owns, for a workspace or build directory
+    /// that cannot be resolved, and when the record cannot be opened or written (a link, no
+    /// regular file, no room).
+    #[cfg(unix)]
+    pub(crate) fn append(
+        env: &dyn Fn(&str) -> Option<OsString>,
+        workspace: &Path,
+        build: &Path,
+        pid: u32,
+        at_ms: u64,
+    ) -> bool {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let Some(session) = env(SESSION_ENV).and_then(|s| s.into_string().ok()) else {
+            return false;
+        };
+        let Some(state) = state_dir(env, cfg!(target_os = "macos")) else { return false };
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if !std::fs::metadata(&state).is_ok_and(|meta| meta.is_dir() && meta.uid() == euid) {
+            return false;
+        }
+        let (Ok(workspace), Ok(build)) = (workspace.canonicalize(), build.canonicalize()) else {
+            return false;
+        };
+        let Some(line) = line(&session, &workspace, &build, pid, at_ms) else { return false };
+        let record = state.join(RECORD);
+        let Ok(mut file) = open_private(&record, true) else { return false };
+        if file.write_all(line.as_bytes()).is_err() {
+            return false;
+        }
+        let over = file.metadata().is_ok_and(|meta| meta.len() > CAP);
+        drop(file);
+        if over {
+            compact(&record, at_ms);
+        }
+        true
+    }
+
+    /// `path` opened for writing, made private (0600) where it is new, never through a link and
+    /// never waiting on a FIFO; `append` for appending, else truncated. An error for anything
+    /// but a regular file.
+    #[cfg(unix)]
+    fn open_private(path: &Path, append: bool) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("the build-start record is not a regular file"));
+        }
+        Ok(file)
+    }
+
+    /// What a line of the record says that a rewrite keeps by: its session, its workspace and
+    /// its time. `None` for a line aterm's reader skips: too long, no JSON object, another
+    /// version, a session that is no session, a relative workspace or build directory, or one
+    /// that lacks the session, the workspace, the process id or the time.
+    pub(crate) fn parse(line: &str) -> Option<(String, String, u64)> {
+        if line.len() >= MAX_LINE {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let absolute = |text: &str| Path::new(text).is_absolute();
+        if value.get("v")?.as_u64()? != 1 {
+            return None;
+        }
+        let session = value.get("session")?.as_str().filter(|s| is_session(s))?;
+        match value.get("build") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(build) => {
+                build.as_str().filter(|b| absolute(b))?;
+            }
+        }
+        let workspace = value.get("workspace")?.as_str().filter(|w| absolute(w))?;
+        u32::try_from(value.get("pid")?.as_u64()?).ok()?;
+        let at_ms = value.get("at_ms")?.as_u64()?;
+        Some((session.to_owned(), workspace.to_owned(), at_ms))
+    }
+
+    /// Which of `lines` (oldest first) a rewrite at `now` keeps, by what they say alone: the
+    /// newest line of each workspace, and the newest of each session and workspace whose time is
+    /// at or before `now` and less than [`KEEP_PAIR_MS`] before it; then, oldest first, it drops
+    /// lines of the second kind only, then any, until the kept lines with their `\n`s fit in
+    /// [`KEEP_MAX`] bytes. aterm's rewrite keeps the same (`kept` in aterm's
+    /// `crates/atpkg/src/build_start.rs`).
+    pub(crate) fn kept(lines: &[(String, (String, String, u64))], now: u64) -> Vec<bool> {
+        let mut newest_of_workspace: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut newest_of_pair: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        for (at, (_, (session, workspace, _))) in lines.iter().enumerate() {
+            newest_of_workspace.insert(workspace, at);
+            newest_of_pair.insert((session, workspace), at);
+        }
+        let last_of_workspace: Vec<bool> = lines
+            .iter()
+            .enumerate()
+            .map(|(at, (_, (_, workspace, _)))| {
+                newest_of_workspace.get(workspace.as_str()) == Some(&at)
+            })
+            .collect();
+        let mut keep: Vec<bool> = lines
+            .iter()
+            .enumerate()
+            .map(|(at, (_, (session, workspace, at_ms)))| {
+                let young = *at_ms <= now && now - at_ms < KEEP_PAIR_MS;
+                last_of_workspace[at]
+                    || (young
+                        && newest_of_pair.get(&(session.as_str(), workspace.as_str())) == Some(&at))
+            })
+            .collect();
+        let size = |at: usize| lines[at].0.len() as u64 + 1;
+        let mut total: u64 = (0..lines.len()).filter(|&at| keep[at]).map(size).sum();
+        for workspaces_too in [false, true] {
+            for at in 0..lines.len() {
+                if total <= KEEP_MAX {
+                    return keep;
+                }
+                if keep[at] && (workspaces_too || !last_of_workspace[at]) {
+                    keep[at] = false;
+                    total -= size(at);
+                }
+            }
+        }
+        keep
+    }
+
+    /// Rewrites `record`, past [`CAP`], to the lines a rewrite at `now` keeps ([`kept`]), in
+    /// their order, while this process holds the lock of [`LOCK`] beside it, taken without
+    /// waiting: a lock another holds, or a record at or under the cap once it is held (a rewrite
+    /// just ran), is no rewrite. The kept lines are staged in [`STAGE`] and renamed over the
+    /// record; then the whole lines written to the old file after its read, up to [`READ_MAX`]
+    /// bytes of them, are appended to the new one. It reads nothing a line names, never waits,
+    /// and leaves the record as it is where any step fails.
+    #[cfg(unix)]
+    pub(crate) fn compact(record: &Path, now: u64) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let Some(folder) = record.parent() else { return };
+        let Ok(lock) = open_private(&folder.join(LOCK), true) else { return };
+        // SAFETY: `lock` is an open descriptor for the call's whole length; flock has no other
+        // precondition. The lock belongs to the open description, so it goes when `lock` drops
+        // unless a process another thread is starting still holds a copy; a lock held on that
+        // way only makes a concurrent rewrite skip, and a later line rewrites.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return;
+        }
+        let old = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(record);
+        let Ok(mut old) = old else { return };
+        let Ok(meta) = old.metadata() else { return };
+        let end = meta.len();
+        if !meta.is_file() || end <= CAP {
+            return;
+        }
+        let from = end.saturating_sub(READ_MAX);
+        let mut bytes = Vec::new();
+        if old.seek(SeekFrom::Start(from)).is_err()
+            || (&mut old).take(end - from).read_to_end(&mut bytes).is_err()
+        {
+            return;
+        }
+        let mut text = bytes.as_slice();
+        if from > 0 {
+            let first = text.iter().position(|b| *b == b'\n').map_or(text.len(), |at| at + 1);
+            text = &text[first..];
+        }
+        let lines: Vec<(String, (String, String, u64))> = text
+            .split(|b| *b == b'\n')
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter_map(|line| parse(line).map(|said| (line.to_owned(), said)))
+            .collect();
+        let mut kept_text = String::new();
+        for ((line, _), keep) in lines.iter().zip(kept(&lines, now)) {
+            if keep {
+                kept_text.push_str(line);
+                kept_text.push('\n');
+            }
+        }
+        let stage = folder.join(STAGE);
+        let staged =
+            open_private(&stage, false).and_then(|mut file| file.write_all(kept_text.as_bytes()));
+        if staged.and_then(|()| std::fs::rename(&stage, record)).is_err() {
+            let _ = std::fs::remove_file(&stage);
+            return;
+        }
+        let mut late = Vec::new();
+        if old.seek(SeekFrom::Start(end)).is_err()
+            || (&mut old).take(READ_MAX).read_to_end(&mut late).is_err()
+        {
+            return;
+        }
+        let whole = late.iter().rposition(|b| *b == b'\n').map_or(0, |at| at + 1);
+        if whole > 0
+            && let Ok(mut new) = open_private(record, true)
+        {
+            let _ = new.write_all(&late[..whole]);
+        }
+        drop(lock);
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn append(
+        _env: &dyn Fn(&str) -> Option<OsString>,
+        _workspace: &Path,
+        _build: &Path,
+        _pid: u32,
+        _at_ms: u64,
+    ) -> bool {
+        false
+    }
+
+    /// The line of this run, where [`wanted`] and [`append`] write one.
+    pub(crate) fn for_run(config: &Config) -> bool {
+        if !wanted(config.dry_run(), config.cmd.kind()) {
+            return false;
+        }
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+        append(&|name| std::env::var_os(name), &config.src, &config.out, std::process::id(), at_ms)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests;

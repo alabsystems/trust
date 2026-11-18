@@ -1914,6 +1914,76 @@ pub(crate) fn is_ascii_environment_name(name: &str) -> bool {
     name.is_ascii()
 }
 
+/// The canonical producer's pairing observation belongs to the frontend
+/// compiler input, never to package build-script code or its output channel.
+pub(crate) const NATIVE_PAIRING_INPUT: &str = "TRUST_TARGO_PAIRED_COMPILER_PROFILE";
+const MAX_NATIVE_PAIRING_INPUT_BYTES: usize = 64 * 1024;
+
+pub(crate) fn is_native_pairing_input(name: &str) -> bool {
+    name.eq_ignore_ascii_case(NATIVE_PAIRING_INPUT)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NativePairingInputRole {
+    Compiler,
+    BuildScript,
+}
+
+/// Validate the original effective input without changing its captured owner.
+/// Only script compiler/runtime commands withhold it. Ordinary target compiler
+/// commands retain the SAME value and environment-dependency fingerprint.
+pub(crate) fn prepare_native_pairing_input(
+    command: &mut ProcessBuilder,
+    role: NativePairingInputRole,
+) -> CargoResult<()> {
+    #[cfg(unix)]
+    let values = command
+        .get_effective_envs()?
+        .into_iter()
+        .filter(|(name, _)| name.to_str().is_some_and(is_native_pairing_input))
+        .collect::<Vec<_>>();
+    #[cfg(not(unix))]
+    let values = {
+        let names = command
+            .get_envs()
+            .keys()
+            .filter(|name| is_native_pairing_input(name))
+            .cloned()
+            .chain(std::iter::once(NATIVE_PAIRING_INPUT.to_owned()))
+            .collect::<std::collections::BTreeSet<_>>();
+        names
+            .into_iter()
+            .filter_map(|name| {
+                command
+                    .get_env(&name)
+                    .map(|value| (OsString::from(name), value))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (_, value) in &values {
+        let value = value
+            .to_str()
+            .context("native compiler pairing input must be Unicode")?;
+        anyhow::ensure!(
+            value.len() <= MAX_NATIVE_PAIRING_INPUT_BYTES
+                && !value.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0')),
+            "invalid native compiler pairing input"
+        );
+    }
+    if matches!(role, NativePairingInputRole::BuildScript) {
+        for (name, _) in values {
+            // Every matching name is ASCII; this records a child-local
+            // removal and never mutates the inherited compiler snapshot.
+            command.env_remove(
+                name.to_str()
+                    .context("native pairing input name is not ASCII")?,
+            );
+        }
+        command.env_remove(NATIVE_PAIRING_INPUT);
+    }
+    Ok(())
+}
+
 /// Whether an environment name is one of Cargo, rustc, rustdoc, or Bootstrap's
 /// compiler-flag channels. Match ASCII case and private/target suffixes.
 pub(crate) fn is_compiler_flag_environment(name: &str) -> bool {
@@ -2673,6 +2743,99 @@ pub(crate) use tests::{caller_clean_fixture_root, caller_owned_toolchain_fixture
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pairing_input_stays_in_compiler_snapshot_but_not_script_compiler_or_runtime() {
+        use super::{NATIVE_PAIRING_INPUT, NativePairingInputRole, prepare_native_pairing_input};
+        use cargo_util::{EnvironmentInputs, ProcessBuilder};
+        use std::ffi::{OsStr, OsString};
+
+        // Opaque fixture data, not an encoded runtime profile or an admission.
+        let captured = EnvironmentInputs::from_variables([
+            (
+                OsString::from(NATIVE_PAIRING_INPUT),
+                OsString::from("compiler-input-one"),
+            ),
+            (
+                OsString::from("SAFE_SCRIPT_MODE"),
+                OsString::from("retained"),
+            ),
+        ])
+        .unwrap();
+        let digest = captured.digest().to_owned();
+        let mut compiler = ProcessBuilder::new("trustc");
+        compiler.environment_snapshot(captured.clone());
+        let mut script = compiler.clone();
+        prepare_native_pairing_input(&mut compiler, NativePairingInputRole::Compiler).unwrap();
+        prepare_native_pairing_input(&mut script, NativePairingInputRole::BuildScript).unwrap();
+        assert_eq!(
+            compiler.get_env(NATIVE_PAIRING_INPUT).as_deref(),
+            Some(OsStr::new("compiler-input-one"))
+        );
+        assert_eq!(script.get_env(NATIVE_PAIRING_INPUT), None);
+        assert_eq!(
+            script.get_env("SAFE_SCRIPT_MODE").as_deref(),
+            Some(OsStr::new("retained"))
+        );
+        assert_eq!(
+            captured.get(OsStr::new(NATIVE_PAIRING_INPUT)).as_deref(),
+            Some(OsStr::new("compiler-input-one"))
+        );
+        assert_eq!(captured.digest(), digest);
+        let changed = EnvironmentInputs::from_variables([
+            (
+                OsString::from(NATIVE_PAIRING_INPUT),
+                OsString::from("compiler-input-two"),
+            ),
+            (
+                OsString::from("SAFE_SCRIPT_MODE"),
+                OsString::from("retained"),
+            ),
+        ])
+        .unwrap();
+        assert_ne!(
+            captured.digest(),
+            changed.digest(),
+            "compiler input remains part of actual identity"
+        );
+    }
+
+    #[test]
+    fn invalid_pairing_input_refuses_before_withholding_or_compiler_execution() {
+        use super::{NATIVE_PAIRING_INPUT, NativePairingInputRole, prepare_native_pairing_input};
+        for value in [
+            "x".repeat(super::MAX_NATIVE_PAIRING_INPUT_BYTES + 1),
+            "line\nbreak".into(),
+            "line\rbreak".into(),
+            "zero\0byte".into(),
+        ] {
+            for role in [
+                NativePairingInputRole::Compiler,
+                NativePairingInputRole::BuildScript,
+            ] {
+                let mut command = cargo_util::ProcessBuilder::new("unstarted");
+                command.env(NATIVE_PAIRING_INPUT, &value);
+                assert!(prepare_native_pairing_input(&mut command, role).is_err());
+                assert_eq!(
+                    command.get_env(NATIVE_PAIRING_INPUT),
+                    Some(value.clone().into())
+                );
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut command = cargo_util::ProcessBuilder::new("unstarted");
+            command.env(
+                NATIVE_PAIRING_INPUT,
+                std::ffi::OsString::from_vec(vec![0xff]),
+            );
+            assert!(
+                prepare_native_pairing_input(&mut command, NativePairingInputRole::Compiler)
+                    .is_err()
+            );
+        }
+    }
+
     /// A candidate that vanished between the listing and the stat is skipped
     /// (`Ok(None)`), never fatal — cargo's transient `rmeta*` files did this to
     /// a real verified build; anything else stays an error.

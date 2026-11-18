@@ -18,6 +18,12 @@ fn arguments(line: &str, callee: usize) -> Option<Vec<String>> {
         .map(|arg| arg.trim().to_owned()).collect())
 }
 
+/// Run the same source, storage-identity and refusal controls under libtest.
+#[test]
+fn shared_raw_parameter_homes_preserve_original_addresses_and_refusals() {
+    main();
+}
+
 fn main() {
     if std::env::var_os("__COMPILETEST_TRUST_VANILLA_REAL_RUSTC").is_some() {
         return;
@@ -75,6 +81,22 @@ fn main() {
             line.starts_with("store ") && line.ends_with(&format!(", ptr {address}"))
         }).count(), 1, "one initialization, no fresh snapshot at either borrow: {body:?}");
     }
+    let raw = row(&coverage, "shared_raw_pointer_parameter");
+    assert_eq!(raw["lowered"], true, "{raw}");
+    assert!(raw["unsupported"].as_array().unwrap().is_empty(), "{raw}");
+    let body = &bodies[index("shared_raw_pointer_parameter")];
+    let calls: Vec<_> = body.iter().filter_map(|line|
+        arguments(line, index("same_raw_pointer_location"))).collect();
+    assert_eq!(calls.len(), 2, "{body:?}");
+    let address = &calls[0][0];
+    assert!(calls.iter().all(|call| call.len() == 2 && call.iter().all(|arg| arg == address)),
+        "all shared pointer borrows use the original parameter home: {body:?}");
+    assert_eq!(body.iter().filter(|line| line.starts_with(&format!("{address} = alloca "))).count(), 1);
+    rfs::write("native.rs", format!("{}\nfn main() {{ assert!(shared_raw_pointer_parameter(std::ptr::null())); }}",
+        rfs::read_to_string("subject.rs").replace("#![crate_type = \"lib\"]", "")));
+    rustc().input("native.rs").edition("2021").arg("-Ztrust-verify=off")
+        .arg("-Ztrust-ir-lower=off").run();
+    run_make_support::cmd("./native").run();
     let output = rustc().input("refusals.rs").crate_name("reborrow_refusals").edition("2021")
         .arg("-Ztrust-verify=off").arg("-Ztrust-ir-lower=on")
         .arg("-Ztrust-dump=ir:negative").run();
@@ -83,6 +105,7 @@ fn main() {
         &rfs::read_to_string("negative/reborrow_refusals.coverage.json")).unwrap();
     for (name, tag) in [
         ("same_root_reborrow", "Promote(non-scalar &mut param)"),
+        ("raw_parameter_with_mutable_borrow", "Promote(non-scalar &mut param)"),
         ("unknown_root_reborrow", "Promote(non-scalar &mut param)"),
         ("raw_root", "Promote(non-scalar &mut param)"),
         ("ref_mut_pattern", "Promote(non-scalar &mut param)"),
@@ -93,6 +116,9 @@ fn main() {
         assert_eq!(row["spliced"], false, "{name}: {row}");
         assert!(row["unsupported"].to_string().contains(tag), "{name} must retain {tag}: {row}");
     }
+    let escaped = row(&coverage, "raw_parameter_address_escape");
+    assert_eq!(escaped["lowered"], false, "a parameter's local home must not escape: {escaped}");
+    assert_eq!(escaped["spliced"], false, "{escaped}");
     // Trust: c5e73dac73 (THIR-FLOAT-REFERENCE-STORAGE-1) moved primitive f32/f64 locals and
     // by-value parameters onto the owned homes integers use, so the bounded shared-float lane's
     // no-mutable-borrow condition no longer applies to them; the empty-array lane keeps it above.

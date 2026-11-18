@@ -21,6 +21,12 @@ use super::discovery::discover_native_trust_toolchain_checked;
 use crate::bounded_process;
 use crate::cli::parse_subcommand_args;
 
+/// The `--config` the trust-cg unit-graph preflight passes last, so the
+/// verified lane's unverified child runs as with the shared dependency cache
+/// key unset (DC-17a).
+pub(crate) const PREFLIGHT_SHARED_DEPENDENCY_CACHE_OFF: &str =
+    "build.shared-dependency-cache=false";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CargoSelectionArgs {
     packages: Vec<String>,
@@ -586,7 +592,17 @@ pub(crate) fn preflight_trust_cg_cargo_targets_with_targo(
     }
     let mut dry_args = args.to_vec();
     let separator = dry_args.iter().position(|arg| arg == "--").unwrap_or(dry_args.len());
-    dry_args.insert(separator, "--unit-graph".to_string());
+    // DC-17a: the verified lane never reads or writes the shared dependency
+    // store, and this unverified child resolves the verified build's graph.
+    // A project that checks `build.shared-dependency-cache` in would otherwise
+    // have this plan-only run create and judge the store (a plan-only build
+    // applies the key), so the preflight runs as with the key unset. Cargo
+    // merges `--config` left to right, so this one, after the caller's own,
+    // decides.
+    dry_args.splice(
+        separator..separator,
+        ["--unit-graph", "--config", PREFLIGHT_SHARED_DEPENDENCY_CACHE_OFF].map(str::to_string),
+    );
 
     // `selection_probe_command` pins the authenticated compiler and disables
     // wrappers as the real build does: branded Targo otherwise falls back to a

@@ -139,6 +139,158 @@ BASE=$(total)
 $(bash "$R/scripts/check_tcb_panic_freedom.sh" --print)"
 ok "the unplanted fixture counts 0"
 
+# A raw identifier names the same method; its spelling must not hide a site.
+for call in 'None::<u8>.r#unwrap()' 'None::<u8>.r#expect("required")'; do
+  printf 'pub fn probe() -> u8 { %s }\n' "$call" >"$S/raw_method_probe.rs"
+  [ "$(total)" = 1 ] || fail "raw method $call evaded the count"
+  listed=$(bash "$R/scripts/check_tcb_panic_freedom.sh" --list)
+  grep -qF '.r#' <<<"$listed" || fail "--list lost raw method $call"
+  printf '0\n' >"$R/scripts/check_tcb_panic_freedom.baseline"
+  rc=0
+  bash "$R/scripts/check_tcb_panic_freedom.sh" >"$TMP/raw-method.log" 2>&1 || rc=$?
+  [ "$rc" = 1 ] || fail "raw method $call evaded baseline zero (exit $rc)"
+  printf '100\n' >"$R/scripts/check_tcb_panic_freedom.baseline"
+  rm "$S/raw_method_probe.rs"
+  ok "raw method $call is listed, counted and fails baseline zero"
+done
+cat >"$S/raw_method_probe.rs" <<'EOF'
+pub fn probe() {
+    let _ = ".r#unwrap()";
+    let _ = r#".r#expect("required")"#;
+    // None::<u8>.r#unwrap()
+}
+EOF
+[ "$(total)" = 0 ] || fail "raw method prose was counted"
+rm "$S/raw_method_probe.rs"
+ok "raw method spellings in literals and comments stay excluded"
+
+# Paths are data, not colon-delimited metadata. Numeric colon segments and
+# spaces must not change the gate's counted population or its display paths.
+for name in 'a:b.rs' 'a:17:b.rs' 'a:b spaced.rs' 'é:中.rs'; do
+  printf '%s\n' "$PLANT" >"$S/$name"
+  got=$(total)
+  [ "$got" = 1 ] || fail "colon path $name: expected 1, counted $got"
+  listed=$(bash "$R/scripts/check_tcb_panic_freedom.sh" --list)
+  grep -qF "crates/trust-vcgen/src/$name:1:" <<<"$listed" \
+    || fail "--list lost the exact colon path $name"
+  printf '0\n' >"$R/scripts/check_tcb_panic_freedom.baseline"
+  rc=0
+  bash "$R/scripts/check_tcb_panic_freedom.sh" >"$TMP/colon.log" 2>&1 || rc=$?
+  [ "$rc" = 1 ] || fail "colon path $name evaded baseline 0 (exit $rc)"
+  printf '100\n' >"$R/scripts/check_tcb_panic_freedom.baseline"
+  rm "$S/$name"
+  ok "colon path $name is counted and fails baseline zero"
+done
+
+cp "$S/lib.rs" "$TMP/colon-lib.saved"
+printf '\n#[cfg(test)]\n#[path = "a:b.rs"]\nmod colon;\n' >>"$S/lib.rs"
+printf '%s\n' "$PLANT" >"$S/a:b.rs"
+[ "$(total)" = 0 ] || fail "test-only colon path was counted"
+report=$(bash "$R/scripts/check_tcb_panic_freedom.sh" --print)
+grep -qE '^  crates/trust-vcgen/src/a:b.rs +1$' <<<"$report" \
+  || fail "test-only colon path lost its diagnostic count"
+printf '\n#[path = "a:b.rs"]\nmod production_colon;\n' >>"$S/lib.rs"
+[ "$(total)" = 1 ] || fail "production declaration did not keep the colon path"
+cp "$TMP/colon-lib.saved" "$S/lib.rs"
+rm "$S/a:b.rs"
+ok "colon path test ancestry and mixed production declarations remain distinct"
+
+# A single Unicode scalar is one Rust char even when awk sees several bytes.
+# Its closing quote must not consume the next literal's opening quote.
+for char in 'e' 'é' '中' '😀'; do
+  cat >"$S/char_probe.rs" <<EOF
+pub fn probe() { let _ = ('$char','"'); None::<u8>.unwrap(); let _ = "s"; }
+EOF
+  got=$(total)
+  [ "$got" = 1 ] || fail "char literal $char hid the following unwrap (count $got)"
+  rm "$S/char_probe.rs"
+  ok "char literal $char preserves the following panic site"
+done
+for encoded in '\340\240\200' '\355\237\277' '\356\200\200' \
+               '\360\220\200\200' '\361\200\200\200' '\364\217\277\277'; do
+  char=$(printf '%b' "$encoded")
+  cat >"$S/char_probe.rs" <<EOF
+pub fn probe() { let _ = ('$char','"'); None::<u8>.unwrap(); let _ = "s"; }
+EOF
+  [ "$(total)" = 1 ] || fail "UTF-8 scalar boundary $encoded hid the unwrap"
+  rm "$S/char_probe.rs"
+  ok "UTF-8 scalar boundary $encoded preserves the following panic site"
+done
+cat >"$S/char_probe.rs" <<'EOF'
+pub fn probe() { let _ = ('\'','"'); None::<u8>.unwrap(); let _ = "s"; }
+EOF
+[ "$(total)" = 1 ] || fail "escaped quote hid the following unwrap"
+rm "$S/char_probe.rs"
+ok "escaped quote preserves the following panic site"
+cat >"$S/lifetime_probe.rs" <<'EOF'
+pub fn probe<'é>(x: Option<&'é str>) -> &'é str { x.unwrap() }
+EOF
+[ "$(total)" = 1 ] || fail "a Unicode lifetime was mistaken for a char literal"
+rm "$S/lifetime_probe.rs"
+ok "Unicode lifetimes remain code"
+
+for receiver in 'myself' 'other_self' 'éself'; do
+  for method in expect 'r#expect'; do
+    cat >"$S/receiver_probe.rs" <<EOF
+struct Parser;
+impl Parser {
+    fn expect(&self, _: &str) {}
+    fn probe(&self) -> u8 {
+        let $receiver: Option<u8> = None;
+        self.expect("token"); let value = $receiver.$method("required"); self.expect("last"); value
+    }
+}
+EOF
+    [ "$(total)" = 1 ] || fail "receiver $receiver.$method was mistaken for literal self"
+    rm "$S/receiver_probe.rs"
+    ok "receiver $receiver.$method remains counted beside literal self calls"
+  done
+done
+cat >"$S/receiver_probe.rs" <<'EOF'
+struct Parser;
+impl Parser {
+    fn expect(&self, _: &str) {}
+    fn probe(&self) { self.expect("token"); self.r#expect("middle"); self.expect("last"); }
+}
+EOF
+[ "$(total)" = 0 ] || fail "literal self parser calls stopped using the heuristic"
+rm "$S/receiver_probe.rs"
+ok "multiple ordinary/raw literal self calls retain the existing parser heuristic"
+for method in expect 'r#expect'; do
+  cat >"$S/receiver_probe.rs" <<EOF
+struct Parser;
+impl Parser {
+    fn expect(&self, _: &str) {}
+    fn probe(&self) { self.$method(panic!("required")); }
+}
+EOF
+  [ "$(total)" = 1 ] || fail "literal self.$method hid its panicking argument"
+  rm "$S/receiver_probe.rs"
+  ok "literal self.$method retains its panicking argument"
+done
+cat >"$S/receiver_probe.rs" <<'EOF'
+struct Parser;
+impl Parser {
+    fn expect(&self, _: &str) {}
+}
+macro_rules! use_receiver { ($self:expr) => { $self.expect("required") } }
+pub fn probe() -> u8 { use_receiver!(None::<u8>) }
+EOF
+[ "$(total)" = 1 ] || fail "a macro receiver was mistaken for literal self"
+rm "$S/receiver_probe.rs"
+ok "macro receivers are not masked as literal self"
+cat >"$S/receiver_probe.rs" <<'EOF'
+struct Parser;
+impl Parser {
+    fn expect(&self, _: &str) {}
+}
+macro_rules! use_receiver { ($self:expr) => { $self.r#expect("required") } }
+pub fn probe() -> u8 { use_receiver!(None::<u8>) }
+EOF
+[ "$(total)" = 1 ] || fail "a raw-method macro receiver was mistaken for literal self"
+rm "$S/receiver_probe.rs"
+ok "raw-method macro receivers are not masked as literal self"
+
 # The compiler pass is split across a root file and production child modules.
 # A counter that scans only trust_verify.rs silently misses the child sites.
 for spec in compiler_prod.rs:1 compiler_cfg_only.rs:0 nested/deep.rs:1 \

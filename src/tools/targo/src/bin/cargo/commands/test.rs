@@ -1,3 +1,6 @@
+#[path = "test/child_policy.rs"]
+mod child_policy;
+
 use crate::command_prelude::*;
 use targo::ops;
 use targo::util::CargoResult;
@@ -20,6 +23,14 @@ pub fn cli() -> Command {
                 .last(true),
         )
         .arg(flag("no-run", "Compile, but don't run tests"))
+        .arg(
+            Arg::new("resource-child-policy")
+                .long("resource-child-policy")
+                .hide(true)
+                .num_args(1)
+                .conflicts_with_all(["doc", "__retained-test-session"])
+                .value_parser(clap::builder::ValueParser::new(child_policy::parse)),
+        )
         .arg(
             flag(
                 "__retained-test-session",
@@ -75,6 +86,7 @@ pub fn cli() -> Command {
         // Trust: one invocation for several requests; only the branded
         // frontend has it (`targo::ops::test_plan`).
         command
+            .mut_arg("resource-child-policy", |arg| arg.conflicts_with("plan"))
             .arg_parallel()
             .arg(
                 opt(
@@ -248,9 +260,10 @@ pub(crate) enum NativeBudgetCheck {
     ExistingBoundary,
 }
 
-/// Inspect only a conflicting libtest option. Ordinary requests do not load a
-/// workspace here. Target candidates use the compiler's actual selector; no
-/// compiler, dependency resolution or execution grant is constructed.
+/// Select the same root targets and runners as execution before accepting the
+/// native argument boundary. Literal/no-cfg selection does not query a compiler;
+/// matching cfg runners use the existing metadata borrower. No dependency
+/// resolution, compilation or execution grant is constructed here.
 pub(crate) fn native_budget_check(
     gctx: &GlobalContext,
     args: &ArgMatches,
@@ -261,16 +274,25 @@ pub(crate) fn native_budget_check(
         .chain(args.get_many::<String>("args").unwrap_or_default())
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let Err(conflict) = ops::validate_native_test_arguments(&words) else {
-        return Ok(NativeBudgetCheck::Allowed);
-    };
+    let conflict = ops::validate_native_test_arguments(&words).err();
     if args.flag("no-run") || args.flag("doc") || args.value_of_path("plan", gctx).is_some() {
-        return Ok(NativeBudgetCheck::ExistingBoundary);
+        return Ok(if conflict.is_some() {
+            NativeBudgetCheck::ExistingBoundary
+        } else {
+            NativeBudgetCheck::Allowed
+        });
     }
     let ws = args.workspace(gctx)?;
     let mut options =
         args.compile_options(gctx, UserIntent::Test, Some(&ws), ProfileChecking::Custom)?;
     configure_test_filter(args, &mut options)?;
+    if ops::native_test_runner_scope(&ws, &options)? == ops::NativeTestRunnerScope::ExistingBoundary
+    {
+        return Ok(NativeBudgetCheck::ExistingBoundary);
+    }
+    let Some(conflict) = conflict else {
+        return Ok(NativeBudgetCheck::Allowed);
+    };
     let native_host = env!("RUST_HOST_TARGET");
     if options
         .build_config
@@ -282,12 +304,6 @@ pub(crate) fn native_budget_check(
                 target.rustc_target().as_str() != native_host
             }
         })
-        || gctx.target_cfg_tuple(native_host)?.runner.is_some()
-        || gctx.host_cfg_tuple(native_host)?.runner.is_some()
-        || gctx
-            .target_cfgs()?
-            .iter()
-            .any(|(_, cfg)| cfg.runner.is_some())
     {
         return Ok(NativeBudgetCheck::ExistingBoundary);
     }
@@ -317,8 +333,12 @@ fn configure_test_filter(args: &ArgMatches, options: &mut ops::CompileOptions) -
 }
 
 fn exec_tests(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
+    let child_supervision = args
+        .get_one::<cargo_util::ChildSupervision>("resource-child-policy")
+        .copied();
     // Trust: an authorized prepared plan executes without resolving or building again.
-    if ops::try_run_prepared_tests(gctx)? {
+    // A new ordinary-only policy must refuse before that early execution path.
+    if ops::try_run_prepared_tests(gctx, child_supervision)? {
         return Ok(());
     }
     // Trust: a plan owns package, feature and target selection; say so before
@@ -447,6 +467,7 @@ fn exec_tests(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
     configure_test_filter(args, &mut compile_opts)?;
 
     let ops = ops::TestOptions {
+        child_supervision,
         no_run,
         no_fail_fast: args.flag("no-fail-fast"),
         required_test_bins: args
@@ -579,6 +600,29 @@ mod budget_tests {
         assert!(matches!(
             native_budget_check(&gctx, &parse(&["--lib", "--", "--test-threads=99"])).unwrap(),
             NativeBudgetCheck::ExistingBoundary,
+        ));
+        assert!(matches!(
+            native_budget_check(&gctx, &parse(&["--lib"])).unwrap(),
+            NativeBudgetCheck::ExistingBoundary,
+        ));
+        assert!(matches!(
+            native_budget_check(&gctx, &parse(&["--lib", "--no-run"])).unwrap(),
+            NativeBudgetCheck::Allowed,
+        ));
+        let foreign = if env!("RUST_HOST_TARGET") == "aarch64-apple-darwin" {
+            "x86_64-unknown-linux-gnu"
+        } else {
+            "aarch64-apple-darwin"
+        };
+        let (_foreign_directory, foreign_gctx) =
+            fixture(&format!("[target.{foreign}]\nrunner='foreign-runner'\n"));
+        assert!(matches!(
+            native_budget_check(&foreign_gctx, &parse(&["--lib"])).unwrap(),
+            NativeBudgetCheck::Allowed,
+        ));
+        assert!(matches!(
+            native_budget_check(&gctx, &parse(&["--lib", "--target", foreign])).unwrap(),
+            NativeBudgetCheck::Allowed,
         ));
     }
 

@@ -75,9 +75,10 @@ pub(super) fn derive(
         let Some(signature) = module.func_type(body.ty) else {
             continue;
         };
-        let params: Vec<_> = std::iter::once(Ty::Closure(shape.closure))
-            .chain(apparent.params.iter().cloned())
-            .collect();
+        let params: Vec<_> =
+            std::iter::once(if shape.borrowed_zero { Ty::Ptr } else { Ty::Closure(shape.closure) })
+                .chain(apparent.params.iter().cloned())
+                .collect();
         if signature.params != params
             || signature.returns != apparent.returns
             || signature.is_vararg
@@ -205,7 +206,11 @@ mod tests {
             FuncId::new(2),
             physical,
             "adapter".into(),
-            crate::closure_adapter::Shape { closure: ClosureTyId::new(0), body: FuncId::new(1) },
+            crate::closure_adapter::Shape {
+                closure: ClosureTyId::new(0),
+                body: FuncId::new(1),
+                borrowed_zero: false,
+            },
             &m.closure_types[0],
             &m.func_types[apparent.as_usize()],
         )
@@ -217,6 +222,65 @@ mod tests {
     fn project(m: &Module, ids: &[u32]) -> BTreeMap<FuncId, Witness> {
         derive(m, 2, &ids.iter().copied().map(FuncId::new).collect(), AUTH)
     }
+    fn zero_fixture() -> Module {
+        let mut m = fixture();
+        m.closure_types[0].captures.clear();
+        m.closure_layouts[0].size = 0;
+        m.closure_layouts[0].align = 1;
+        m.closure_layouts[0].capture_offsets.clear();
+        let apparent = m.closure_types[0].func;
+        let body_ty = m.functions[0].ty;
+        m.functions[1].ty = body_ty;
+        m.functions[1].blocks[0].params[0].1 = Ty::Ptr;
+        let Inst::MakeClosure { captures, .. } = &mut m.functions[0].blocks[0].body[0].inst else {
+            unreachable!()
+        };
+        captures.clear();
+        m.functions[0].blocks[0].body[1].inst = Inst::CallIndirect {
+            callee: v(1),
+            sig: apparent,
+            args: vec![],
+            calling_conv: CallingConv::Rust,
+        };
+        let mut adapter = crate::closure_adapter::build(
+            FuncId::new(2),
+            apparent,
+            "zero_adapter".into(),
+            crate::closure_adapter::Shape {
+                closure: ClosureTyId::new(0),
+                body: FuncId::new(1),
+                borrowed_zero: true,
+            },
+            &m.closure_types[0],
+            &m.func_types[apparent.as_usize()],
+        )
+        .unwrap();
+        stamp(&mut adapter);
+        m.functions[2] = adapter;
+        m
+    }
+
+    #[test]
+    fn typed_empty_adapter_requires_the_real_borrowed_body_and_two_source_owners() {
+        let mut m = zero_fixture();
+        assert_eq!(project(&m, &[0, 1]).len(), 1);
+        assert!(project(&m, &[1]).is_empty());
+        assert!(project(&m, &[0]).is_empty());
+        m.functions[1].ty = trust_ir::FuncTyId::new(2);
+        m.functions[1].blocks[0].params[0].1 = Ty::Closure(ClosureTyId::new(0));
+        assert!(project(&m, &[0, 1]).is_empty());
+    }
+
+    #[test]
+    fn typed_empty_adapter_cannot_inherit_a_padded_or_unobserved_frame() {
+        let mut m = zero_fixture();
+        m.closure_layouts[0].size = 8;
+        m.closure_layouts[0].align = 8;
+        assert!(project(&m, &[0, 1]).is_empty());
+        m.closure_layouts.clear();
+        assert!(project(&m, &[0, 1]).is_empty());
+    }
+
     #[test]
     fn canonical_adapter_uses_separate_conserved_owner_and_body() {
         let m = fixture();

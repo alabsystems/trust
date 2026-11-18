@@ -96,6 +96,49 @@ fn admitted(request: &mut FixedCommandAdmission, memory: u64) -> FixedClaim {
 }
 
 #[test]
+fn command_admission_fence_lives_until_actual_exec_then_cpu_claim_stays_held() {
+    let root = crate::owner_only::tempdir();
+    let native = crate::owner_only::tempdir();
+    let pool = Pool::open_in(native.path(), n(8)).unwrap();
+    let mut request = open(root.path(), pool, "command.lock", FixedCpuRequest::Limit(n(1)), false);
+    let claim = admitted(&mut request, 1000);
+    let fence =
+        OpenOptions::new().read(true).write(true).open(root.path().join("admission.lock")).unwrap();
+    assert!(!try_exclusive(&fence).unwrap(), "later exclusive waiter entered before preparation");
+    let slot = claim.reservation.slots[0].path();
+    let prepared = claim.prepare_command(std::process::Command::new("/usr/bin/true")).unwrap();
+    assert!(!try_exclusive(&fence).unwrap(), "later exclusive waiter entered before exec");
+    let mut running = super::super::handoff::spawn_fixture(prepared).unwrap();
+    assert!(try_exclusive(&fence).unwrap(), "completed exec retained prelaunch exclusion");
+    assert!(
+        !crate::admission::resources::tests::released(&slot),
+        "exec released actual CPU ownership"
+    );
+    fence.unlock().unwrap();
+    assert!(running.wait().unwrap().success());
+}
+
+#[test]
+fn failed_command_exec_releases_unlaunched_fence_and_original_cpu_claim() {
+    let root = crate::owner_only::tempdir();
+    let native = crate::owner_only::tempdir();
+    let pool = Pool::open_in(native.path(), n(8)).unwrap();
+    let mut request = open(root.path(), pool, "failed.lock", FixedCpuRequest::Limit(n(1)), false);
+    let claim = admitted(&mut request, 1000);
+    let slot = claim.reservation.slots[0].path();
+    let mut command = std::process::Command::new(root.path().join("absent-payload"));
+    command.stdout(std::process::Stdio::null());
+    let prepared = claim.prepare_command(command).unwrap();
+    let error =
+        super::super::handoff::spawn_fixture(prepared).err().expect("absent executable ran");
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let fence =
+        OpenOptions::new().read(true).write(true).open(root.path().join("admission.lock")).unwrap();
+    assert!(try_exclusive(&fence).unwrap());
+    assert!(crate::admission::resources::tests::released(&slot));
+}
+
+#[test]
 fn automatic_budget_counts_only_actual_idle_leases_after_another_command_claim() {
     // The second admission and the final observation each take the pool's
     // transaction just after the one before released it, which another
@@ -408,7 +451,7 @@ fn fresh_backing_does_not_grant_execution_over_original_one_slot_whole_machine_c
         Attempt::Admitted(held) => held,
         Attempt::Waiting(reason) => panic!("original legacy actor refused: {reason:?}"),
     };
-    let original = held.publish_fixed(n(32), n(32)).unwrap();
+    let original = held.publish_fixed(n(32), n(32), FixedPublication::ExistingLease).unwrap();
     let mut request = pending(root.path(), n(32), Some(n(1)));
     assert!(matches!(
         request

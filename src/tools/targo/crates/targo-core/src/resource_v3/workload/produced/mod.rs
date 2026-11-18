@@ -76,6 +76,26 @@ fn failed(
     )
 }
 impl Executor {
+    fn output_capture(&self, process: &ProcessBuilder) -> io::Result<CapturedProcess> {
+        let timeout = self
+            .startup
+            .workload_process
+            .as_ref()
+            .ok_or_else(|| error("missing original workload inputs"))?
+            .invocation
+            .header()
+            .timeout_ns;
+        Ok(self
+            .capture_inner(
+                process,
+                StreamingOutputLimits::new(1024 * 1024, 64 * 1024 * 1024)
+                    .with_timeout(Duration::from_nanos(timeout)),
+                false,
+                None,
+            )
+            .1)
+    }
+
     fn capture_inner(
         &self,
         process: &ProcessBuilder,
@@ -395,21 +415,7 @@ impl ProcessExecutor for Executor {
         self.capture_inner(process, limits, capture_rusage, None)
     }
     fn output(&self, process: &ProcessBuilder) -> io::Result<Output> {
-        let timeout = self
-            .startup
-            .workload_process
-            .as_ref()
-            .ok_or_else(|| error("missing original workload inputs"))?
-            .invocation
-            .header()
-            .timeout_ns;
-        let (_, capture) = self.capture_inner(
-            process,
-            StreamingOutputLimits::new(1024 * 1024, 64 * 1024 * 1024)
-                .with_timeout(Duration::from_nanos(timeout)),
-            false,
-            None,
-        );
+        let capture = self.output_capture(process)?;
         if let Some(failure) = capture.failure {
             return Err(io::Error::other(failure));
         }
@@ -422,7 +428,10 @@ impl ProcessExecutor for Executor {
         })
     }
     fn status(&self, process: &ProcessBuilder) -> io::Result<ExitStatus> {
-        self.output(process).map(|output| output.status)
+        process.report_captured_completion(
+            self.output_capture(process)?,
+            "native produced output has no original exit",
+        )
     }
     fn streaming(
         &self,

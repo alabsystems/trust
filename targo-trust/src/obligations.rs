@@ -1316,18 +1316,18 @@ struct ObligationsHeader {
 /// A test-harness line.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TestHarnessLine {
-    test_harness: String,
-    concluded: bool,
-    reason: Option<String>,
+pub(crate) struct TestHarnessLine {
+    pub(crate) test_harness: String,
+    pub(crate) concluded: bool,
+    pub(crate) reason: Option<String>,
 }
 
 /// A test-case line.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TestCaseLine {
-    test: String,
-    outcome: String,
+pub(crate) struct TestCaseLine {
+    pub(crate) test: String,
+    pub(crate) outcome: String,
 }
 
 /// A function line.

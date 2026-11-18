@@ -42,7 +42,32 @@ fn source_bytes_cover_dirty_staged_untracked_ignored_and_tarball_inputs() {
     let before = observe();
     fs::remove_dir_all(source.join(".git")).unwrap();
     assert_eq!(before, observe(), "the same tarball bytes need no Git metadata");
-    assert_eq!(tree_digest(&source).unwrap(), observe(), "existing content framing is reused");
+}
+
+// DC-16c: the digest names the sources, not where a checkout keeps them, so another worktree's
+// LLVM tree (or the one atpkg's `llvm-tree` package was built from) has the same stamp.
+#[test]
+fn the_same_sources_at_another_path_have_the_same_digest() {
+    let temp = tempfile::tempdir().unwrap();
+    let lay = |checkout: &str| {
+        let source = temp.path().join(checkout).join("src/llvm-project");
+        fs::create_dir_all(source.join("llvm/lib")).unwrap();
+        fs::write(source.join("llvm/CMakeLists.txt"), b"project(LLVM)\n").unwrap();
+        fs::write(source.join("llvm/lib/Core.cpp"), b"int core;\n").unwrap();
+        std::os::unix::fs::symlink("CMakeLists.txt", source.join("llvm/Alias.txt")).unwrap();
+        source
+    };
+    let (first, second) = (lay("first"), lay("second-worktree"));
+    let digest = |source: &Path| {
+        let output = source.parent().unwrap().parent().unwrap().join("build/host/llvm");
+        own_cmake_source_digest(source, &output).unwrap().unwrap()
+    };
+    assert_eq!(digest(&first), digest(&second));
+    // Where the bytes differ, the digests do.
+    fs::write(second.join("llvm/lib/Core.cpp"), b"int other;\n").unwrap();
+    assert_ne!(digest(&first), digest(&second));
+    // A required tree still names its paths.
+    assert_ne!(tree_digest(&first).unwrap(), tree_digest(&lay("third")).unwrap());
 }
 
 #[test]

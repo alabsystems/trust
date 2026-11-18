@@ -152,6 +152,67 @@ fn incoming_environment_projects_exact_pointer_without_promoting_opaque_target()
 }
 
 #[test]
+fn ignored_empty_environment_keeps_nominal_incoming_identity() {
+    let mut module = pointer_module();
+    module.closure_types[0].captures.clear();
+    module.closure_layouts[0].size = 0;
+    module.closure_layouts[0].align = 1;
+    module.closure_layouts[0].capture_offsets.clear();
+    let nominal = ClosureTyId::new(0);
+    assert!(placement(&module, nominal, &ParamPlace::Ignore).unwrap().is_empty());
+    let incoming = ClosureValue::incoming(&module, nominal, v(7), &ParamPlace::Ignore).unwrap();
+    assert_eq!(incoming.nominal, nominal);
+    assert_eq!(incoming.target, TargetIdentity::Incoming(v(7)));
+    assert!(incoming.captures.is_empty());
+    assert!(incoming.project(&Ty::Ptr, 0).is_err());
+    for wrong in [scalar(0, 64), ParamPlace::Pair(ScalarPlace::gpr(0, 64), ScalarPlace::gpr(1, 64))] {
+        assert!(placement(&module, nominal, &wrong).is_err());
+    }
+    assert!(placement(&pointer_module(), nominal, &ParamPlace::Ignore).is_err());
+    for change in 0..4 {
+        let mut changed = module.clone();
+        match change {
+            0 => changed.closure_layouts.clear(),
+            1 => changed.closure_layouts[0].size = 8,
+            2 => changed.closure_layouts[0].align = 8,
+            _ => changed.closure_layouts[0].capture_offsets.push(0),
+        }
+        assert!(placement(&changed, nominal, &ParamPlace::Ignore).is_err(), "empty frame mutation {change}");
+    }
+}
+
+#[test]
+fn original_empty_carrier_preserves_signature_frame_and_projection_refusals() {
+    let mut module = pointer_module();
+    module.closure_types[0].captures.clear();
+    module.closure_layouts[0].size = 0;
+    module.closure_layouts[0].align = 1;
+    module.closure_layouts[0].capture_offsets.clear();
+    let apparent = module.closure_types[0].func;
+    module.func_types[apparent.as_usize()].params = vec![Ty::U64];
+    module.func_types[apparent.as_usize()].returns = vec![Ty::U64];
+    let nominal = ClosureTyId::new(0);
+    original_nominal(&module, &module, nominal).unwrap();
+    assert!(original_projection(&module, &module.functions[1], &module, v(0), 0, &Ty::Ptr).is_err(),
+        "an empty environment supplies no capture field");
+    for change in 0..6 {
+        let mut changed = module.clone();
+        match change {
+            0 => changed.closure_layouts.clear(),
+            1 => changed.closure_layouts[0].size = 8,
+            2 => changed.closure_layouts[0].align = 8,
+            3 => changed.closure_layouts[0].capture_offsets.push(0),
+            4 => changed.func_types[apparent.as_usize()].params = vec![Ty::U32],
+            _ => changed.closure_types[0].captures.push(Ty::Ptr),
+        }
+        assert!(original_nominal(&module, &changed, nominal).is_err(), "carrier mutation {change}");
+    }
+    // Matching images do not admit an apparent aggregate signature.
+    module.func_types[apparent.as_usize()].params = vec![Ty::Tuple(vec![Ty::U64])];
+    assert!(original_nominal(&module, &module, nominal).is_err());
+}
+
+#[test]
 fn physical_adapter_signature_is_not_the_logical_closure_body_signature() {
     let module = pointer_module();
     let capture = || Capture::checked(Ty::Ptr, IrValue { f: xn(0), width: 64 }).unwrap();

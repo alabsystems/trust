@@ -306,6 +306,8 @@ pub(crate) fn tree_digest(root: &Path) -> Result<String, String> {
 /// Observe package bytes only after proving that every followed namespace is
 /// disjoint from the dedicated output. Content failures disable reuse; failures
 /// to inspect the namespace refuse mutation rather than becoming a cache miss.
+/// Each entry is named relative to `root` (`OwnSourceWalk::spelling`): the digest says
+/// what the sources are, not where this checkout keeps them.
 pub(crate) fn own_cmake_source_digest(
     root: &Path,
     output: &Path,
@@ -329,7 +331,12 @@ fn own_cmake_source_digest_with_hook(
     let source_route = namespace_route_links([root], 1024)?;
     let canonical_prefix = fs::canonicalize(&existing).map_err(|e| e.to_string())?;
     let destination = canonical_prefix.join(&tail);
-    let walk = OwnSourceWalk { output: destination, unknown: std::cell::Cell::new(false) };
+    let walk = OwnSourceWalk {
+        output: destination,
+        unknown: std::cell::Cell::new(false),
+        root: root.to_owned(),
+        canonical_root: fs::canonicalize(root).map_err(|e| e.to_string())?,
+    };
     let mut hash = Sha256::new();
     hash_path(&mut hash, root, &mut BTreeSet::new(), TreeInputs::OwnSource(&walk))?;
     after_walk();
@@ -521,9 +528,29 @@ pub(crate) fn cleanup_input_namespaces(
 struct OwnSourceWalk {
     output: PathBuf,
     unknown: std::cell::Cell<bool>,
+    /// The walk's root as asked for, and as the filesystem resolves it.
+    root: PathBuf,
+    canonical_root: PathBuf,
 }
 
 impl OwnSourceWalk {
+    /// Trust (DC-16c): how the digest spells `path`: relative to the walk's root, so the same
+    /// sources in another checkout (another worktree, the tree an atpkg `llvm-tree` package was
+    /// built from) have the same digest. A path a link leads outside the root keeps its whole
+    /// spelling, under its own tag, so it never aliases a path inside.
+    fn spelling(&self, path: &Path) -> Vec<u8> {
+        for root in [&self.root, &self.canonical_root] {
+            if let Ok(relative) = path.strip_prefix(root) {
+                let mut spelled = b"root:".to_vec();
+                spelled.extend_from_slice(relative.as_os_str().as_encoded_bytes());
+                return spelled;
+            }
+        }
+        let mut spelled = b"outside:".to_vec();
+        spelled.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        spelled
+    }
+
     fn check(&self, path: &Path) -> Result<(), String> {
         let resolved = fs::canonicalize(path).map_err(|e| e.to_string())?;
         // Trust: every entry the walk visits, a followed link's target included.
@@ -618,7 +645,10 @@ fn hash_path_inner(
     if let TreeInputs::OwnSource(walk) = inputs {
         walk.check(path)?;
     }
-    add(hash, path.as_os_str().as_encoded_bytes());
+    match inputs {
+        TreeInputs::OwnSource(walk) => add(hash, walk.spelling(path)),
+        _ => add(hash, path.as_os_str().as_encoded_bytes()),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

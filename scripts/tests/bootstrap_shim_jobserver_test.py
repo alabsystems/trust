@@ -264,7 +264,9 @@ def main():
     (out / 'home').mkdir()
     DRIVER = out / 'fd-observer.py'
     source = Path(__file__).resolve().read_text()
-    DRIVER.write_text('#!' + sys.executable + '\n' + source.split('\n', 1)[1])
+    # sh/python polyglot: a shebang cannot carry an interpreter path with spaces.
+    DRIVER.write_text('#!/bin/sh\n""":"\nexec "' + sys.executable + '" "$0" "$@"\n":"""\n'
+                      + source.split('\n', 1)[1])
     DRIVER.chmod(0o755)
     (out / 'canonical-context.json').write_text(json.dumps(canonical_context(), indent=2) + '\n')
     copies = out / 'controlled-shims-no-sidecar'

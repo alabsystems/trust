@@ -810,6 +810,7 @@ impl<'a> CrateLocator<'a> {
             dll_prefix: self.target.dll_prefix.to_string(),
             dll_suffix: self.target.dll_suffix.to_string(),
             crate_rejections,
+            unread: self.filesearch.unread().to_vec(),
         }))
     }
 }
@@ -854,8 +855,18 @@ fn get_metadata_section<'p>(
     cfg_version: &'static str,
     crate_name: Option<Symbol>,
 ) -> Result<MetadataBlob, MetadataError<'p>> {
-    if !filename.exists() {
-        return Err(MetadataError::NotPresent(filename));
+    // Trust (TARGO-HOST-COMPILE-E0463-1): only a file that is not there is no candidate. A
+    // file the search listed but that cannot be inspected is reported as such, never
+    // silently dropped into a "can't find crate".
+    match filename.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Err(MetadataError::NotPresent(filename)),
+        Err(error) => {
+            return Err(MetadataError::LoadFailure(format!(
+                "cannot inspect '{}': {error}",
+                filename.display()
+            )));
+        }
     }
     let raw_bytes = match flavor {
         CrateFlavor::Rlib => {
@@ -1075,6 +1086,9 @@ pub(crate) struct CombinedLocatorError {
     dll_prefix: String,
     dll_suffix: String,
     crate_rejections: CrateRejections,
+    // Trust (TARGO-HOST-COMPILE-E0463-1): the search directories, and entries of them, that
+    // could not be read.
+    unread: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug)]
@@ -1335,6 +1349,7 @@ impl CrateError {
                         locator_triple: locator.triple,
                         is_ui_testing: sess.opts.unstable_opts.ui_testing,
                         is_tier_3: sess.target.metadata.tier == Some(3),
+                        unread: locator.unread,
                     };
                     // The diagnostic for missing core is very good, but it is followed by a lot of
                     // other diagnostics that do not add information.

@@ -21,18 +21,32 @@ Outputs (generated/):
 
 Usage:
   regen.py [check]  [--root DIR] [--from-source [--frontend BIN] [--minirust DIR]] [--clean BIN]
+                    [--repo DIR] [--sibling-git NAME=DIR ...] [--require-siblings]
   regen.py write    [--root DIR] [--from-source [--frontend BIN] [--minirust DIR]]
+  regen.py copies   [--root DIR] [--clean DIR] [--trust-ir DIR]
 
 check (the default) regenerates every output into a scratch directory and compares it with
 the committed bytes, compares every pinned input and translator file with its manifest
-digest, and fails on any file in generated/ that is not an output or the manifest. It also
-compares SpecrPrelude.lean and generated/MiniRustSlice.lean with the copies Clean's TrustSem
-fixture imports (--fixture; by default the pinned first-party/clean's
-crates/clean-olean/tests/fixtures/lean/v4.30.0-rc2/trust_sem/), where Clean proves core_wf,
-run_sound, run_ub and run_adequate over this SOut and checks the slice through the reference
-entry: a copy that differs is DRIFT; a pinned Clean that has no copies yet is reported as
-PENDING (the pin predates the fixture) and does not fail. It prints one line per file and
-exits 0 when all are identical, 1 on any drift.
+digest, and fails on any file in generated/ that is not an output or the manifest.
+
+It also compares the byte copies the sibling repositories hold (SIBLING_COPIES) AT THE
+REVISIONS THIS REPOSITORY PINS: the gitlinks `first-party/clean` and `first-party/trust-ir` in
+the HEAD commit of the Trust repository holding --root (--repo names another). Clean's TrustSem
+fixture (crates/clean-olean/tests/fixtures/lean/v4.30.0-rc2/trust_sem/) holds SpecrPrelude.lean
+and generated/MiniRustSlice.lean, where Clean proves core_wf, run_sound, run_ub and run_adequate
+over this SOut and checks the slice through the reference entry; Clean's semr fixture and
+trust-ir's lean/semr/ each hold MiniRust.lean, the wrapper `noncomputable section` + prelude +
+slice + `end`. Each blob is read with `git cat-file blob <gitlink>:<path>` from the object store
+--sibling-git NAME=DIR names, or else from first-party/NAME when that is checked out. A copy
+that differs, or a pinned revision without the file, is DRIFT; a revision the object store does
+not hold (or no store, or no Trust repository) is NOT RUN, never identical. It prints one line
+per file and exits 0 when all are identical, 1 on any drift or failure, and 2 when a sibling
+comparison is NOT RUN under --require-siblings (without it, NOT RUN is printed and exits 0).
+
+copies writes those byte copies into the sibling working trees named by --clean DIR (a Clean
+checkout) and --trust-ir DIR (a trust-ir checkout), from this directory's committed files; it
+refuses when a source file's digest differs from generated/MANIFEST.json (run `write` first).
+The sibling commits that hold them are then pinned by moving the gitlinks.
 --from-source also re-runs the front end (the K8 probe's syn front end, unchanged in v2:
 reports/2026-09-17-phase0-k8-specr/translator/frontend, built with
 `targo --unverified build --release`) on the MiniRust checkout (the trust-core source
@@ -43,7 +57,9 @@ with --from-source, the pinned AST) in place.
 --clean BIN (check only) also kernel-checks SpecrPrelude.lean, PreludeVectors.lean, the slice,
 SliceVectors.lean and the conformance theorems with `BIN check --json` and requires 0 failed
 declarations, 0 `sorry` axioms and 0 `sorry` terms minted, 0 kernel-check failures, no
-assumption, and every conformance theorem accepted. BIN must report
+assumption, and every conformance theorem accepted: present in the report's
+`timing.per_declaration` and absent from its errors (a theorem the report never mentions is not
+accepted). BIN must report
 `trust_summary.sorry_terms_minted`: a clean built from Clean 01189665c (2026-09-28) or later.
 The atpkg store's clean 0.9.0 does not report it, and the check then fails closed and says so.
 --clean-timeout SECONDS (default 1800) bounds the run: a `clean check` still running then is
@@ -82,10 +98,18 @@ OUTPUTS = (
     "generated/conformance_index.json",
 )
 PINNED = ("pinned/ast.json.gz", "pinned/records.jsonl.gz")
-# The files Clean's TrustSem fixture imports, byte for byte (its name for each, our path).
-FIXTURE_COPIES = (("SpecrPrelude.lean", "SpecrPrelude.lean"),
-                  ("MiniRustSlice.lean", "generated/MiniRustSlice.lean"))
-FIXTURE_REL = "first-party/clean/crates/clean-olean/tests/fixtures/lean/v4.30.0-rc2/trust_sem"
+# The byte copies the sibling repositories hold: (sibling, its path, what it holds). `wrapper` is
+# WRAPPER_HEAD + prelude + slice + WRAPPER_TAIL, the module Clean's rm1_trust_sem and semr_reference
+# compile and trust-ir's lean/semr/ builds on.
+CLEAN_FIXTURES = "crates/clean-olean/tests/fixtures/lean/v4.30.0-rc2"
+SIBLING_COPIES = (
+    ("clean", f"{CLEAN_FIXTURES}/trust_sem/SpecrPrelude.lean", "SpecrPrelude.lean"),
+    ("clean", f"{CLEAN_FIXTURES}/trust_sem/MiniRustSlice.lean", "generated/MiniRustSlice.lean"),
+    ("clean", f"{CLEAN_FIXTURES}/semr/MiniRust.lean", "wrapper"),
+    ("trust-ir", "lean/semr/MiniRust.lean", "wrapper"),
+)
+SIBLINGS = ("clean", "trust-ir")
+WRAPPER_HEAD, WRAPPER_TAIL = b"noncomputable section\n", b"\nend\n"
 CLEAN_TIMEOUT = 1800
 # The conformance run's limits (K8's: reports/2026-09-17-phase0-k8-specr/run_probe.sh).
 STEPS, FUEL = 200000, 2000
@@ -177,16 +201,33 @@ def manifest_for(root: Path, ast: bytes, records: bytes, produced: dict[str, byt
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("mode", nargs="?", default="check", choices=("check", "write"))
+    ap.add_argument("mode", nargs="?", default="check", choices=("check", "write", "copies"))
     ap.add_argument("--root", type=Path, default=HERE)
     ap.add_argument("--from-source", action="store_true")
     ap.add_argument("--frontend", type=Path)
     ap.add_argument("--minirust", type=Path)
-    ap.add_argument("--clean", type=Path)
+    ap.add_argument("--clean", type=Path,
+                    help="check: the clean binary for --clean's kernel check; copies: a Clean checkout")
+    ap.add_argument("--trust-ir", type=Path, help="copies: a trust-ir checkout")
     ap.add_argument("--clean-timeout", type=float, default=CLEAN_TIMEOUT)
-    ap.add_argument("--fixture", type=Path, default=HERE.parents[2] / FIXTURE_REL)
+    ap.add_argument("--repo", type=Path,
+                    help="the Trust repository whose HEAD gitlinks pin the siblings (default: the one holding --root)")
+    ap.add_argument("--sibling-git", action="append", default=[], metavar="NAME=DIR",
+                    help="read sibling NAME's blobs from the object store of DIR (default: first-party/NAME)")
+    ap.add_argument("--require-siblings", action="store_true",
+                    help="a sibling comparison that is NOT RUN exits 2")
     a = ap.parse_args(argv)
     root = a.root.resolve()
+    stores: dict[str, Path] = {}
+    for spec in a.sibling_git:
+        name, sep, d = spec.partition("=")
+        if not sep or name not in SIBLINGS or not d:
+            raise SystemExit(f"regen: --sibling-git takes NAME=DIR with NAME one of {', '.join(SIBLINGS)}, not {spec!r}")
+        if name in stores:
+            raise SystemExit(f"regen: --sibling-git {name} given twice")
+        stores[name] = Path(d).resolve()
+    if a.mode == "copies":
+        return write_copies(root, {"clean": a.clean, "trust-ir": a.trust_ir})
 
     records = gzip.decompress((root / "pinned/records.jsonl.gz").read_bytes())
     pinned_ast_path = root / "pinned/ast.json.gz"
@@ -242,29 +283,128 @@ def main(argv: list[str] | None = None) -> int:
         if p.is_file() and rel not in expected:
             drift = True
             lines.append(f"DRIFT      {rel}  (not an output of this translator)")
-    copies = fixture_lines(root, a.fixture.resolve())
+    copies = sibling_lines(root, a.repo.resolve() if a.repo else trust_repo_of(root), stores)
     drift |= any(line.startswith("DRIFT") for line in copies)
+    not_run = any(line.startswith("NOT RUN") for line in copies)
     lines.extend(copies)
     print("\n".join(lines))
     print("regen: byte-identical" if not drift else "regen: DRIFT (run `regen.py write` and review the diff)")
     bad_check = False
     if a.clean is not None:
         bad_check = not clean_check(root, a.clean, a.clean_timeout)
-    return 1 if drift or bad_check else 0
+    if drift or bad_check:
+        return 1
+    if not_run and a.require_siblings:
+        print("regen: a sibling comparison was NOT RUN under --require-siblings")
+        return 2
+    return 0
 
 
-def fixture_lines(root: Path, fixture: Path) -> list[str]:
-    """One line per file Clean's TrustSem fixture copies: identical, DRIFT, or (no copy at
-    all yet) PENDING."""
-    present = [name for name, _ in FIXTURE_COPIES if (fixture / name).is_file()]
-    if not present:
-        return [f"PENDING    clean fixture {name}  (no copy in {fixture})" for name, _ in FIXTURE_COPIES]
+def git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return subprocess.run(["git", "-C", str(cwd), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          check=False, env=env)
+
+
+def trust_repo_of(root: Path) -> Path | None:
+    """The work tree of the git repository holding `root`, or None."""
+    proc = git(root, "rev-parse", "--show-toplevel")
+    return Path(proc.stdout.decode().strip()).resolve() if proc.returncode == 0 else None
+
+
+def is_own_work_tree(d: Path) -> bool:
+    """`d` is the top of its own git work tree (an initialised submodule), not an empty
+    directory inside the parent repository, whose objects are not the sibling's."""
+    if not d.is_dir():
+        return False
+    top = trust_repo_of(d)
+    return top is not None and top == d.resolve()
+
+
+def wrapper_bytes(root: Path) -> bytes:
+    return (WRAPPER_HEAD + (root / "SpecrPrelude.lean").read_bytes()
+            + (root / "generated/MiniRustSlice.lean").read_bytes() + WRAPPER_TAIL)
+
+
+def copy_source(root: Path, what: str) -> tuple[bytes, str]:
+    """The bytes a sibling copy must equal, and how the line names them."""
+    if what == "wrapper":
+        return wrapper_bytes(root), "noncomputable section + SpecrPrelude.lean + generated/MiniRustSlice.lean + end"
+    return (root / what).read_bytes(), what
+
+
+def sibling_lines(root: Path, repo: Path | None, stores: dict[str, Path]) -> list[str]:
+    """One line per sibling copy, compared at the sibling revision HEAD's gitlink pins:
+    identical, DRIFT (different bytes, or no such file at that revision), or NOT RUN (that
+    revision cannot be read here)."""
     out = []
-    for name, ours in FIXTURE_COPIES:
-        theirs = fixture / name
-        same = theirs.is_file() and theirs.read_bytes() == (root / ours).read_bytes()
-        out.append(f"{'identical' if same else 'DRIFT    '}  clean fixture {name}  (= {ours})")
+    for name in SIBLINGS:
+        rows = [(path, what) for sib, path, what in SIBLING_COPIES if sib == name]
+        rev, why = None, None
+        if repo is None:
+            why = f"{root} is not in a git repository, so no gitlink pins {name}"
+        else:
+            tree = git(repo, "ls-tree", "HEAD", f"first-party/{name}")
+            fields = tree.stdout.decode().split()
+            if tree.returncode != 0:
+                why = f"{repo} has no HEAD commit to read the gitlink first-party/{name} from"
+            elif len(fields) < 3 or fields[0] != "160000" or fields[1] != "commit":
+                for path, what in rows:
+                    out.append(f"DRIFT      {name}@(none) {path}  (HEAD of {repo} has no gitlink first-party/{name})")
+                continue
+            else:
+                rev = fields[2]
+        store = None
+        if rev is not None:
+            if name in stores:
+                store = stores[name]
+                if git(store, "rev-parse", "--git-dir").returncode != 0:
+                    raise SystemExit(f"regen: --sibling-git {name}={store}: not a git repository")
+            elif is_own_work_tree(repo / "first-party" / name):
+                store = repo / "first-party" / name
+            else:
+                why = f"first-party/{name} is not checked out; pass --sibling-git {name}=DIR"
+        if store is not None and git(store, "cat-file", "-e", f"{rev}^{{commit}}").returncode != 0:
+            why = f"{store} does not hold commit {rev}"
+            store = None
+        for path, what in rows:
+            ours, label = copy_source(root, what)
+            if store is None:
+                at = f"{name}@{rev[:10]}" if rev else f"{name}@?"
+                out.append(f"NOT RUN    {at} {path}  ({why})")
+                continue
+            blob = git(store, "cat-file", "blob", f"{rev}:{path}")
+            if blob.returncode != 0:
+                out.append(f"DRIFT      {name}@{rev[:10]} {path}  (no such file at {rev})")
+                continue
+            same = blob.stdout == ours
+            out.append(f"{'identical' if same else 'DRIFT    '}  {name}@{rev[:10]} {path}  (= {label})")
     return out
+
+
+def write_copies(root: Path, dests: dict[str, Path | None]) -> int:
+    """Write every SIBLING_COPIES file into the named sibling working trees."""
+    if not any(dests.values()):
+        raise SystemExit("regen: copies needs --clean DIR and/or --trust-ir DIR")
+    recorded = json.loads((root / "generated/MANIFEST.json").read_text())
+    for f, section in (("SpecrPrelude.lean", "translator"), ("generated/MiniRustSlice.lean", "outputs")):
+        want = recorded.get(section, {}).get(f)
+        if want != sha256((root / f).read_bytes()):
+            raise SystemExit(f"regen: {f} differs from generated/MANIFEST.json [{section}]; run `regen.py write` "
+                             "and review the diff before copying")
+    for name, path, what in SIBLING_COPIES:
+        d = dests.get(name)
+        if d is None:
+            continue
+        dst = d.resolve() / path
+        if not dst.parent.is_dir():
+            raise SystemExit(f"regen: {dst.parent} does not exist: is {d} a {name} checkout?")
+        data, label = copy_source(root, what)
+        same = dst.is_file() and dst.read_bytes() == data
+        if not same:
+            dst.write_bytes(data)
+        print(f"{'unchanged' if same else 'wrote    '}  {name} {path}  (= {label})")
+    return 0
 
 
 def clean_check(root: Path, clean: Path, timeout: float = CLEAN_TIMEOUT) -> bool:
@@ -297,13 +437,20 @@ def clean_check(root: Path, clean: Path, timeout: float = CLEAN_TIMEOUT) -> bool
         print(f"clean check: {clean} reports no trust_summary.{', '.join(missing)}; it is older than "
               "this check needs (Clean 01189665c, 2026-09-28, or later) -> FAILED")
         return False
+    # A theorem is accepted only when the report names it and records no error for it: a theorem
+    # the report never mentions (elaboration dropped it, the probe lost it) is not accepted.
+    present = {d.get("name") for d in ((rep.get("timing") or {}).get("per_declaration") or [])
+               if isinstance(d, dict)}
+    accepted = [t for t in theorems if t in present and t not in failed]
+    missing = [t for t in theorems if t not in present]
     ok = (rep.get("failed_count") == 0 and not failed and ts.get("sorry_axioms") == 0
           and ts.get("sorry_terms_minted") == 0 and ts.get("kernel_check_failures") == 0
-          and not rep.get("assumptions") and not rep.get("diverged"))
+          and not rep.get("assumptions") and not rep.get("diverged") and len(accepted) == len(theorems))
     tests = {t["test"] for t in index["theorems"]}
     print(f"clean check: {rep.get('success_count')}/{rep.get('decl_count')} declarations accepted, "
-          f"{len([t for t in theorems if t not in failed])}/{len(theorems)} conformance theorems "
-          f"({len(tests)} minitests), sorry {ts.get('sorry_axioms')}/{ts.get('sorry_terms_minted')}, "
+          f"{len(accepted)}/{len(theorems)} conformance theorems "
+          f"({len(tests)} minitests{f'; {len(missing)} absent from the report' if missing else ''}), "
+          f"sorry {ts.get('sorry_axioms')}/{ts.get('sorry_terms_minted')}, "
           f"kernel failures {ts.get('kernel_check_failures')}, assumptions {len(rep.get('assumptions') or [])}"
           f" -> {'ok' if ok else 'FAILED'}")
     return ok

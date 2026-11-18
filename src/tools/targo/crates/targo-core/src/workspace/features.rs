@@ -1673,6 +1673,9 @@ impl CliUnstable {
         }
     }
 
+    /// Trust: `build.shared-dependency-cache` turns fine-grain locking on in
+    /// the same way, but per build (`BuildContext::fine_grain_locking`, DC-17a),
+    /// since whether it applies depends on the compiler that build runs.
     fn implicitly_enable_features_if_needed(&mut self) {
         if self.fine_grain_locking && !self.build_dir_new_layout {
             debug!("-Zbuild-dir-new-layout implicitly enabled by -Zfine-grain-locking");

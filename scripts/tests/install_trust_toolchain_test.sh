@@ -482,4 +482,140 @@ grep -q 'step 5/8' "$TMP_ROOT/behind.out" \
 grep -q 'no sysroot at' "$TMP_ROOT/behind.err" \
     || fail "the BEHIND run stopped somewhere other than the sysroot check"
 
+# A LINKED build tree is populated by the classifier's --restore, never by the
+# blanket update. A build tree made by `git worktree add` (what this installer
+# makes when --build-dir does not exist) shares each submodule's repository with
+# the first checkout, and `git submodule update` there rewrites core.worktree in
+# that shared config even when it moves nothing. Measured with this fixture and
+# the old step (Apple Git 2.54.0): `worktree = ../../../../first-party/sub`
+# became `../../../../../../../second/first-party/sub`, which resolves from
+# neither tree's side of that config, and the first checkout's
+# `git -C first-party/sub rev-parse HEAD` failed.
+# The teeth are the byte comparison of that config and the absent update line.
+host="$(new_submodule_host guard-linked)"
+sub="$host/checkout/first-party/sub"
+pin="$($GITF -C "$sub" rev-parse HEAD)"
+$GITF -C "$host/checkout" worktree add -q --detach "$host/second" HEAD
+$GITF -C "$sub" worktree add -q --detach "$host/second/first-party/sub" "$pin~1"
+store_config="$host/checkout/.git/modules/first-party/sub/config"
+cp "$store_config" "$TMP_ROOT/linked-store-config.before"
+[ -f "$($GITF -C "$host/second/first-party/sub" rev-parse --absolute-git-dir)/commondir" ] \
+    || fail "fixture did not make the second tree's submodule a linked worktree"
+
+run_install "$host" --build-dir "$host/second" --dry-run \
+    >"$TMP_ROOT/linked-dry.out" 2>&1 || fail "dry run of a linked build tree failed"
+grep -Eq 'would run: bash .*submodule_sync.sh --root .*/second --restore' "$TMP_ROOT/linked-dry.out" \
+    || fail "the dry run of a linked build tree does not plan the classifier's --restore"
+grep -q 'submodule update --init --recursive' "$TMP_ROOT/linked-dry.out" \
+    && fail "the dry run of a linked build tree plans the blanket submodule update"
+
+run_install "$host" --build-dir "$host/second" \
+    >"$TMP_ROOT/linked.out" 2>"$TMP_ROOT/linked.err" || true
+[ "$($GITF -C "$host/second/first-party/sub" rev-parse HEAD)" = "$pin" ] \
+    || fail "the linked build tree's submodule was not moved to its pin"
+cmp -s "$store_config" "$TMP_ROOT/linked-store-config.before" \
+    || fail "populating a linked build tree rewrote the first checkout's submodule config"
+[ "$($GITF -C "$sub" rev-parse HEAD)" = "$pin" ] \
+    || fail "populating a linked build tree broke or moved the first checkout's submodule"
+grep -Eq '^  \+ bash .*submodule_sync.sh --root .*/second --restore$' "$TMP_ROOT/linked.out" \
+    || fail "a linked build tree was not populated through the classifier's --restore"
+grep -Eq '^  \+ git -C .* submodule update --init --recursive' "$TMP_ROOT/linked.out" \
+    && fail "the blanket submodule update ran in a linked build tree"
+grep -q 'no sysroot at' "$TMP_ROOT/linked.err" \
+    || fail "the linked run stopped somewhere other than the sysroot check"
+
+# The installer's own case: a build tree `git worktree add` has just made, with
+# its submodule never checked out. --restore makes that checkout a linked
+# worktree of the first checkout's store (its git directory has a `commondir`),
+# and the build tree gets no store of its own.
+host="$(new_submodule_host guard-linked-absent)"
+sub="$host/checkout/first-party/sub"
+pin="$($GITF -C "$sub" rev-parse HEAD)"
+$GITF -C "$host/checkout" worktree add -q --detach "$host/second" HEAD
+store_config="$host/checkout/.git/modules/first-party/sub/config"
+cp "$store_config" "$TMP_ROOT/absent-store-config.before"
+[ ! -e "$host/second/first-party/sub/.git" ] \
+    || fail "fixture: the new build tree's submodule is already checked out"
+
+run_install "$host" --build-dir "$host/second" \
+    >"$TMP_ROOT/absent.out" 2>"$TMP_ROOT/absent.err" || true
+[ "$($GITF -C "$host/second/first-party/sub" rev-parse HEAD)" = "$pin" ] \
+    || fail "the new build tree's submodule was not checked out at its pin"
+[ -f "$($GITF -C "$host/second/first-party/sub" rev-parse --absolute-git-dir)/commondir" ] \
+    || fail "the new build tree's submodule is not a linked worktree of the first checkout's store"
+[ ! -e "$host/checkout/.git/worktrees/second/modules" ] \
+    || fail "the new build tree was given a submodule store of its own"
+cmp -s "$store_config" "$TMP_ROOT/absent-store-config.before" \
+    || fail "populating a new build tree rewrote the first checkout's submodule config"
+[ "$($GITF -C "$sub" rev-parse HEAD)" = "$pin" ] \
+    || fail "populating a new build tree broke or moved the first checkout's submodule"
+grep -Eq '^  \+ bash .*submodule_sync.sh --root .*/second --restore$' "$TMP_ROOT/absent.out" \
+    || fail "a new build tree was not populated through the classifier's --restore"
+grep -Eq '^  \+ git -C .* submodule update --init --recursive' "$TMP_ROOT/absent.out" \
+    && fail "the blanket submodule update ran in a new linked build tree"
+grep -q 'no sysroot at' "$TMP_ROOT/absent.err" \
+    || fail "the new-build-tree run stopped somewhere other than the sysroot check"
+
+# The same tree on a host where the classifier cannot run (here a `bash` that
+# exits 3, its environment-error code). Only --restore makes the shared shape,
+# so nothing is linked there, and the blanket update is what it always was: a
+# clone for this tree alone. The tree is populated, not left without sources.
+host="$(new_submodule_host guard-linked-noclassifier)"
+sub="$host/checkout/first-party/sub"
+pin="$($GITF -C "$sub" rev-parse HEAD)"
+printf '#!/bin/sh\nexit 3\n' >"$host/fake-bin/bash"
+chmod +x "$host/fake-bin/bash"
+$GITF -C "$host/checkout" worktree add -q --detach "$host/second" HEAD
+store_config="$host/checkout/.git/modules/first-party/sub/config"
+cp "$store_config" "$TMP_ROOT/noclassifier-store-config.before"
+
+# git does not hand the superproject's protocol.file.allow to the clone a
+# submodule update starts, so this one run allows the fixture's local donor in
+# the environment, which that clone does read.
+env -i \
+    HOME="$host/home" \
+    PATH="$host/fake-bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    TMPDIR="$TMP_ROOT" \
+    TRUST_STAGE0_RUSTC="$host/stage0/bin/rustc" \
+    TRUST_LLVM_CONFIG="$host/fake-bin/llvm-config" \
+    RUSTUP_CALL_LOG="$host/rustup-call.log" \
+    GIT_ALLOW_PROTOCOL=file \
+    sh "$SOURCE_SCRIPT" --build-dir "$host/second" \
+    >"$TMP_ROOT/noclassifier.out" 2>"$TMP_ROOT/noclassifier.err" || true
+grep -q 'the submodule classifier could not run (exit 3)' "$TMP_ROOT/noclassifier.err" \
+    || fail "fixture: the classifier ran, so the no-classifier branch was not taken"
+[ "$($GITF -C "$host/second/first-party/sub" rev-parse HEAD)" = "$pin" ] \
+    || fail "a linked build tree was left without its submodule when the classifier could not run"
+[ -d "$host/checkout/.git/worktrees/second/modules/first-party/sub/objects" ] \
+    || fail "the no-classifier fallback did not clone a store for the build tree alone"
+cmp -s "$store_config" "$TMP_ROOT/noclassifier-store-config.before" \
+    || fail "the no-classifier fallback rewrote the first checkout's submodule config"
+[ "$($GITF -C "$sub" rev-parse HEAD)" = "$pin" ] \
+    || fail "the no-classifier fallback broke or moved the first checkout's submodule"
+grep -Eq '^  \+ git -C .*/second submodule update --init --recursive' "$TMP_ROOT/noclassifier.out" \
+    || fail "the no-classifier fallback did not run the update in a tree with nothing linked"
+
+# ...and never where a checkout IS linked: the update would rewrite the first
+# checkout's config. With nothing absent the tree is left as it is.
+host="$(new_submodule_host guard-linked-noclassifier-linked)"
+sub="$host/checkout/first-party/sub"
+pin="$($GITF -C "$sub" rev-parse HEAD)"
+printf '#!/bin/sh\nexit 3\n' >"$host/fake-bin/bash"
+chmod +x "$host/fake-bin/bash"
+$GITF -C "$host/checkout" worktree add -q --detach "$host/second" HEAD
+$GITF -C "$sub" worktree add -q --detach "$host/second/first-party/sub" "$pin"
+store_config="$host/checkout/.git/modules/first-party/sub/config"
+cp "$store_config" "$TMP_ROOT/noclassifier-linked-store-config.before"
+
+run_install "$host" --build-dir "$host/second" \
+    >"$TMP_ROOT/noclassifier-linked.out" 2>"$TMP_ROOT/noclassifier-linked.err" || true
+grep -q 'the submodule classifier could not run (exit 3)' "$TMP_ROOT/noclassifier-linked.err" \
+    || fail "fixture: the classifier ran, so the no-classifier branch was not taken"
+grep -Eq '^  \+ git -C .* submodule update --init --recursive' "$TMP_ROOT/noclassifier-linked.out" \
+    && fail "the blanket submodule update ran over a linked submodule checkout"
+cmp -s "$store_config" "$TMP_ROOT/noclassifier-linked-store-config.before" \
+    || fail "a linked submodule checkout's shared config was rewritten when the classifier could not run"
+[ "$($GITF -C "$sub" rev-parse HEAD)" = "$pin" ] \
+    || fail "the first checkout's submodule broke when the classifier could not run"
+
 echo "install-trust-toolchain tests: ok"

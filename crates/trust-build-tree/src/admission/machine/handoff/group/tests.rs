@@ -4,8 +4,8 @@ use std::process::Stdio;
 
 use super::*;
 
-const ACTOR: &str = "admission::resources::machine::handoff::group::tests::group_actor";
-const MODE: &str = "TRUST_FIXED_GROUP_TEST_MODE";
+pub(crate) const ACTOR: &str = "admission::resources::machine::handoff::group::tests::group_actor";
+pub(crate) const MODE: &str = "TRUST_FIXED_GROUP_TEST_MODE";
 
 fn close_inherited_claim() {
     let value = std::env::var_os(FIXED_HANDOFF_ENV).unwrap();
@@ -27,6 +27,35 @@ fn close_inherited_claim() {
 #[test]
 fn group_actor() {
     let Some(mode) = std::env::var_os(MODE) else { return };
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    if mode == "native-output-root"
+        || mode == "native-output-cwd-refusal"
+        || mode == "native-output-observed-root"
+        || mode == "native-output-observed-closed"
+        || mode == "native-output-observed-alias"
+    {
+        super::super::output_member::tests::actor_root();
+        return;
+    }
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    if mode == "native-output-leaf" {
+        super::super::output_member::tests::actor_leaf();
+        return;
+    }
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    if mode == "native-loaded-body" {
+        super::loaded_tests::body();
+        return;
+    }
+    #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+    if mode == "native-observer-closed-reader" {
+        super::loaded_tests::closed_reader_actor();
+        println!("GROUP-ACTOR-READY {}", std::process::id());
+        // The parent consumes that real completion marker then closes its
+        // fixture stdout reader. Do not let a later libtest postamble hit
+        // default SIGPIPE and misclassify the successful EPIPE body itself.
+        std::process::exit(0);
+    }
     if mode == "denied-absence-owner" {
         println!("ACTUAL-DENIED-ABSENCE-OWNER-ENTERED");
         persistent_post_reap_denial_keeps_actual_status_and_resources_until_unknown_drop();
@@ -152,7 +181,9 @@ fn group_actor() {
     std::process::exit(0);
 }
 
-fn actor(mode: &str) -> (tempfile::TempDir, RunningFixedGroup, std::process::ChildStdin, u32) {
+pub(super) fn actor(
+    mode: &str,
+) -> (tempfile::TempDir, RunningFixedGroup, std::process::ChildStdin, u32) {
     actor_with_forwarder(mode, false)
 }
 
@@ -174,7 +205,11 @@ fn actor_with_forwarder(
     } else {
         prepared.spawn_group_checked().unwrap()
     };
-    let input = group.child.stdin.take().unwrap();
+    let input = match group.child_mut() {
+        GroupChild::Standard(child) => child.stdin.take().unwrap(),
+        #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+        GroupChild::Native(_) => unreachable!("this fixture selected standard piped stdio"),
+    };
     let mut output = group.take_stdout().unwrap();
     let member = read_ready(&mut output, "GROUP-ACTOR-READY ");
     // Keep no output reader: the actual actors emit nothing more before exit.
@@ -214,7 +249,7 @@ fn signal_handler(signal: libc::c_int) -> libc::sighandler_t {
     unsafe { action.assume_init() }.sa_sigaction
 }
 
-fn finish(group: &mut RunningFixedGroup) -> ExitStatus {
+pub(crate) fn finish(group: &mut RunningFixedGroup) -> ExitStatus {
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = group.try_wait().unwrap() {
@@ -233,7 +268,7 @@ fn leader_exited(group: &RunningFixedGroup) {
     }
 }
 
-fn locked(root: &Path) {
+pub(super) fn locked(root: &Path) {
     for path in [root.join("worktree.lock"), root.join("legacy/slot-0")] {
         let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
         assert!(!try_exclusive(&file).unwrap());

@@ -732,7 +732,7 @@ fn ext_bearing_slot_refuses() {
     };
     let out = single(&mut Fixture::new(), abi(vec![direct(64)], zext_ret));
     refused_with(&out, RefusalClass::UnsupportedAbi, "_RF", "the result");
-    // An un-audited slot (`&mut T`, a raw pointer, a float) refuses too.
+    // An un-audited slot still refuses: pointer kind alone is not a transport witness.
     let unaudited = ArgShape::Direct {
         bits: 64,
         kind: ScalarKind::Pointer,
@@ -746,6 +746,82 @@ fn ext_bearing_slot_refuses() {
     // A width disagreement between rustc and the producer refuses.
     let out = single(&mut Fixture::new(), abi(vec![direct(32)], direct(64)));
     refused_with(&out, RefusalClass::UnsupportedAbi, "_RF", "rustc's slot 32");
+}
+
+/// Trust: an observed pointer carrier remains Ptr at both ends, with its actual
+/// register width. These plain shapes are not rustc FnAbi or proof authority;
+/// the original native thin-pointer fixture exercises that production adapter.
+#[test]
+fn direct_pointer_transport_preserves_type_and_refuses_unvalidated_shapes() {
+    let mut fx = Fixture::new();
+    let sig =
+        fx.m.add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::Ptr],
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("test pointer signature");
+    let id = FuncId::new(fx.m.functions.len() as u32);
+    let mut f = Function::new(id, "crate::ordinary_pointer_identity", sig, BlockId::new(0));
+    let mut block = Block::new(BlockId::new(0)).with_param(ValueId::new(0), Ty::Ptr);
+    block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
+    f.blocks.push(block);
+    f.producer = Some(Producer::TRust);
+    f.body_gate = Some(BodyGate::Gated { authority: DIRECT.to_string(), evidence: None });
+    fx.m.try_add_function(f).expect("test pointer body");
+    fx.item("_ROrdinaryPointer", id);
+    let pointer = ArgShape::Direct {
+        bits: 64,
+        kind: ScalarKind::Pointer,
+        ext: AbiExtension::None,
+        inreg: false,
+        audited: true,
+        newtype: false,
+    };
+    fx.items[0].state = WorkState::Admitted { abi: abi(vec![pointer.clone()], pointer.clone()) };
+    let out = fx.run();
+    clean(&out);
+    let emitted = find(&out, "_ROrdinaryPointer");
+    let signature = &out.m_cg.func_types[emitted.ty.as_usize()];
+    assert_eq!(signature.params, [Ty::Ptr]);
+    assert_eq!(signature.returns, [Ty::Ptr]);
+    assert_eq!(emitted.blocks[0].params, [(ValueId::new(0), Ty::Ptr)]);
+    assert_eq!(
+        out.placements["_ROrdinaryPointer"].params,
+        [ParamPlace::Scalar(ScalarPlace::gpr(0, 64))]
+    );
+    assert_eq!(
+        out.placements["_ROrdinaryPointer"].ret,
+        ReturnPlace::Scalar(ScalarPlace::gpr(0, 64))
+    );
+
+    for (bits, kind, ext, inreg, audited) in [
+        (32, ScalarKind::Pointer, AbiExtension::None, false, true),
+        (64, ScalarKind::Int { signed: false }, AbiExtension::None, false, true),
+        (64, ScalarKind::Float, AbiExtension::None, false, true),
+        (64, ScalarKind::Pointer, AbiExtension::Zext, false, true),
+        (64, ScalarKind::Pointer, AbiExtension::Sext, false, true),
+        (64, ScalarKind::Pointer, AbiExtension::None, true, true),
+        (64, ScalarKind::Pointer, AbiExtension::None, false, false),
+    ] {
+        let bad = ArgShape::Direct { bits, kind, ext, inreg, audited, newtype: false };
+        for is_return in [false, true] {
+            let shape = if is_return {
+                abi(vec![pointer.clone()], bad.clone())
+            } else {
+                abi(vec![bad.clone()], pointer.clone())
+            };
+            fx.items[0].state = WorkState::Admitted { abi: shape };
+            let out = fx.run();
+            assert!(names(&out).is_empty(), "invalid pointer carrier emitted a body");
+            assert!(
+                out.refusals.iter().any(|r| r.class() == RefusalClass::UnsupportedAbi),
+                "invalid pointer carrier has no ABI refusal: {}",
+                rendered(&out)
+            );
+        }
+    }
 }
 
 /// Rule 9 and 10 for `bool` (INC5.4-BOOLRET): the result is admitted with P `Zext` at 32 bits;

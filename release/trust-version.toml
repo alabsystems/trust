@@ -20,7 +20,7 @@
 schema_version = "trust.version-source.v2"
 product = "Trust"
 toolchain_alias = "trust"
-trust_product_version = "0.15.0"
+trust_product_version = "0.16.0"
 release_report_schema = "trust.release-report.v1"
 
 # The upstream revision Trust last merged. This is a record for compatibility

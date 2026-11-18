@@ -196,7 +196,6 @@ impl LocalJoinedScope {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd as _;
     use std::time::{Duration, Instant};
 
     use super::*;

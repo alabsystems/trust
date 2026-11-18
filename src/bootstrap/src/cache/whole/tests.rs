@@ -450,10 +450,56 @@ fn actual_native_controller_inode_inside_a_selected_tool_target_refuses_before_d
         let metadata = original.metadata().unwrap();
         let request = f.request(false, false);
         let prepared = Prepared::new(&request, &f.output).unwrap();
-        assert!(prepared.protect_original_inputs([(metadata.dev(), metadata.ino())]).is_err());
+        assert!(
+            prepared
+                .protect_original_inputs([(metadata.dev(), metadata.ino())], std::iter::empty(),)
+                .is_err()
+        );
         assert!(selected_image.is_file());
         assert!(prepared.detached.is_empty());
         assert_eq!(original.metadata().unwrap().ino(), metadata.ino());
+    });
+}
+
+#[test]
+fn installed_health_backing_hardlinks_in_cache_refuse_before_any_detach() {
+    isolated(|| {
+        for role in ["compiler", "runtime", "libstd"] {
+            let f = Fixture::new();
+            let installed = f.host.join("stage1").join(role);
+            fs::create_dir_all(installed.parent().unwrap()).unwrap();
+            // Real native image bytes and a real opened inode are refusal
+            // inputs only. No fixture is executed or called a healthy SDK.
+            fs::copy(std::env::current_exe().unwrap(), &installed).unwrap();
+            let alias = f.host.join("stage1-rustc/release").join(role);
+            fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            fs::hard_link(&installed, &alias).unwrap();
+            f.put(&format!("{HOST}/stage1-rustc/release/.cargo-lock"), b"");
+            let original = File::open(&installed).unwrap();
+            let meta = original.metadata().unwrap();
+            assert_eq!(meta.nlink(), 2);
+            let request = f.request(true, false);
+            let prepared = Prepared::new(&request, &f.output).unwrap();
+            assert!(selected(&prepared, &f.host.join("stage1-rustc")));
+            // Normal lock preparation is allowed; the refusal must leave this
+            // fully prepared namespace and every original backing untouched.
+            let before = snapshot(&f.build);
+            let error = prepared
+                .protect_original_inputs(std::iter::empty(), [(meta.dev(), meta.ino())])
+                .unwrap_err();
+            assert!(error.to_string().contains("retained native"));
+            assert!(prepared.detached.is_empty());
+            assert_eq!(snapshot(&f.build), before);
+            let after = original.metadata().unwrap();
+            assert_eq!(
+                (after.dev(), after.ino(), after.nlink()),
+                (meta.dev(), meta.ino(), meta.nlink())
+            );
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec(), after.mtime(), after.mtime_nsec()),
+                (meta.ctime(), meta.ctime_nsec(), meta.mtime(), meta.mtime_nsec())
+            );
+        }
     });
 }
 

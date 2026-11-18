@@ -2578,6 +2578,19 @@ pub struct RustcTargetData<'gctx> {
     target_info: HashMap<CompileTarget, TargetInfo>,
 }
 
+/// One configuration owner for real target metadata and preflight selection.
+pub(crate) fn target_configuration(
+    gctx: &GlobalContext,
+    kind: CompileKind,
+    host: &str,
+) -> CargoResult<TargetConfig> {
+    match kind {
+        CompileKind::Host if !gctx.target_applies_to_host()? => gctx.host_cfg_tuple(host),
+        CompileKind::Host => gctx.target_cfg_tuple(host),
+        CompileKind::Target(target) => gctx.target_cfg_tuple(target.short_name()),
+    }
+}
+
 impl<'gctx> RustcTargetData<'gctx> {
     #[tracing::instrument(skip_all)]
     pub fn new(
@@ -2593,11 +2606,7 @@ impl<'gctx> RustcTargetData<'gctx> {
         let host_info = TargetInfo::new(gctx, requested_kinds, &rustc, CompileKind::Host)?;
 
         // This config is used for link overrides and choosing a linker.
-        let host_config = if target_applies_to_host {
-            gctx.target_cfg_tuple(&rustc.host)?
-        } else {
-            gctx.host_cfg_tuple(&rustc.host)?
-        };
+        let host_config = target_configuration(gctx, CompileKind::Host, &rustc.host)?;
 
         // This is a hack. The unit_dependency graph builder "pretends" that
         // `CompileKind::Host` is `CompileKind::Target(host)` if the
@@ -2605,7 +2614,10 @@ impl<'gctx> RustcTargetData<'gctx> {
         // needs access to the target config data, create a copy so that it
         // can be found. See `rebuild_unit_graph_shared` for why this is done.
         if requested_kinds.iter().any(CompileKind::is_host) {
-            target_config.insert(host_target, gctx.target_cfg_tuple(&rustc.host)?);
+            target_config.insert(
+                host_target,
+                target_configuration(gctx, CompileKind::Target(host_target), &rustc.host)?,
+            );
 
             // If target_applies_to_host is true, the host_info is the target info,
             // otherwise we need to build target info for the target.
@@ -2667,8 +2679,10 @@ impl<'gctx> RustcTargetData<'gctx> {
     pub fn merge_compile_kind(&mut self, kind: CompileKind) -> CargoResult<()> {
         if let CompileKind::Target(target) = kind {
             if !self.target_config.contains_key(&target) {
-                self.target_config
-                    .insert(target, self.gctx.target_cfg_tuple(target.short_name())?);
+                self.target_config.insert(
+                    target,
+                    target_configuration(self.gctx, kind, &self.rustc.host)?,
+                );
             }
             if !self.target_info.contains_key(&target) {
                 self.target_info.insert(

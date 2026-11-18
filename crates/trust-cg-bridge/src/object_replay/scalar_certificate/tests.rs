@@ -392,3 +392,32 @@ fn actual_recovered_and_proof_rejects_changed_source_and_object() {
         "fresh object hashes must not rebind the old AND proof to XOR"
     );
 }
+
+/// Pins the readers' exact reads and errors. Their former `try_into().unwrap()`
+/// could not fail after a bounds-checked `get`, so this also passes on the code
+/// before that rewrite: it guards the rewrite, not a reachable panic.
+#[test]
+fn byte_readers_read_exact_fields_and_refuse_truncation_and_offset_overflow() {
+    let bytes = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+    assert_eq!(u16_at(&bytes, 6), Ok(0x0807));
+    assert_eq!(u32_at(&bytes, 4), Ok(0x0807_0605));
+    assert_eq!(u64_at(&bytes, 0), Ok(0x0807_0605_0403_0201));
+    assert_eq!(u16_at(&bytes, 7), Err("scalar certificate: truncated u16".into()));
+    assert_eq!(u32_at(&bytes, 5), Err("scalar certificate: truncated u32".into()));
+    assert_eq!(u64_at(&bytes, 1), Err("scalar certificate: truncated u64".into()));
+    assert_eq!(u64_at(&bytes, usize::MAX - 7), Err("scalar certificate: offset overflow".into()));
+}
+
+#[test]
+fn ret_x30_word_is_exactly_its_four_encoded_bytes() {
+    let ret = 0xd65f_03c0_u32.to_le_bytes();
+    assert!(is_ret_x30_word(&ret));
+    // A slice of another length is not the word. The former
+    // `u32::from_le_bytes(bytes.try_into().unwrap())` panicked on each of these.
+    assert!(!is_ret_x30_word(&ret[..3]));
+    assert!(!is_ret_x30_word(&[ret[0], ret[1], ret[2], ret[3], 0]));
+    assert!(!is_ret_x30_word(&[]));
+    // `RET X0` and the big-endian spelling of `RET X30` are other words.
+    assert!(!is_ret_x30_word(&0xd65f_0000_u32.to_le_bytes()));
+    assert!(!is_ret_x30_word(&0xd65f_03c0_u32.to_be_bytes()));
+}

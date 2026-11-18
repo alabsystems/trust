@@ -5,7 +5,8 @@
 
 /// Read memory available to this process without spawning a command.
 ///
-/// macOS counts free, speculative and purgeable pages only. Linux uses
+/// macOS counts free and purgeable pages, plus conservative file-cache
+/// headroom under an exact normal native pressure reading. Linux uses
 /// MemAvailable, capped by each readable applicable cgroup memory constraint.
 /// Missing or malformed required observations produce no estimate.
 pub fn available_memory() -> Option<u64> {
@@ -31,11 +32,47 @@ fn reserve_from_available(available: Option<u64>) -> u64 {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn available_pages(free: u64, speculative: u64, purgeable: u64, page_size: u64) -> Option<u64> {
-    if page_size == 0 {
+fn available_pages(
+    free: u64,
+    speculative: u64,
+    purgeable: u64,
+    external: u64,
+    pressure: Option<u32>,
+    page_size: u64,
+) -> Option<u64> {
+    if page_size == 0 || speculative > free {
         return None;
     }
-    free.checked_add(speculative)?.checked_add(purgeable)?.checked_mul(page_size)
+    // XNU host.c includes speculative pages in free_count, while
+    // vm_page_speculate also includes them in pageable external pages. Remove
+    // that shared subset before using file cache. Do not count anonymous
+    // inactive memory, compressed memory or wired pages as reclaimable.
+    // The maximum is a lower bound for the union of two reclaimable sets;
+    // it does not assume purgeable and file-cache counts are disjoint.
+    let cache = if pressure == Some(1) { external.checked_sub(speculative)? } else { 0 };
+    free.checked_add(purgeable.max(cache))?.checked_mul(page_size)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_memory_pressure() -> Option<u32> {
+    // The sysctl exports dispatch pressure flags, not the internal VM enum.
+    // XNU converts normal to NOTE_MEMORYSTATUS_PRESSURE_NORMAL (0x01).
+    // Only that exact value enables extra cache headroom; warning, critical,
+    // unknown, missing and malformed readings preserve the old base budget.
+    let mut pressure: u32 = 0;
+    let mut size = std::mem::size_of_val(&pressure);
+    // SAFETY: fixed read-only native key, correctly sized uint32 output,
+    // and no input pointer or bytes: this cannot change kernel pressure.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&raw mut pressure).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && size == std::mem::size_of_val(&pressure)).then_some(pressure)
 }
 
 #[cfg(target_os = "macos")]
@@ -85,6 +122,8 @@ fn macos() -> Option<u64> {
         u64::from(vm.free_count),
         u64::from(vm.speculative_count),
         u64::from(vm.purgeable_count),
+        u64::from(vm.external_page_count),
+        macos_memory_pressure(),
         page_size as u64,
     )
 }
@@ -254,10 +293,78 @@ mod tests {
     }
 
     #[test]
+    fn macos_free_count_already_includes_speculative_pages() {
+        // Preserve the original subset control on the unchanged baseline.
+        for speculative in [0, 1, 40, 100] {
+            assert_eq!(available_pages(100, speculative, 10, 0, None, 4096), Some(450_560));
+        }
+    }
+
+    #[test]
     fn macos_counts_only_known_reclaimable_pages_and_checks_overflow() {
-        assert_eq!(available_pages(2, 3, 5, 4096), Some(40960));
-        assert_eq!(available_pages(u64::MAX, 1, 0, 4096), None);
-        assert_eq!(available_pages(1, 0, 0, 0), None);
+        assert_eq!(available_pages(10, 3, 5, 0, None, 4096), Some(61440));
+        assert_eq!(available_pages(u64::MAX, 1, 0, 0, None, 4096), None);
+        assert_eq!(available_pages(1, 0, 0, 0, None, 0), None);
+    }
+
+    #[test]
+    fn macos_reclaimable_file_cache_can_satisfy_large_fixed_request() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const PAGE: u64 = 16 * 1024;
+        // A cache-heavy machine: the same physical speculative pages occur
+        // in both free and external. No anonymous memory is counted.
+        let available = available_pages(
+            4 * GIB / PAGE,
+            GIB / PAGE,
+            128 * 1024 * 1024 / PAGE,
+            40 * GIB / PAGE,
+            Some(1),
+            PAGE,
+        )
+        .unwrap();
+        assert!(available >= 36 * GIB, "reclaimable file cache withheld: {available}");
+        assert_eq!(available, 43 * GIB, "count the speculative subset once");
+    }
+
+    #[test]
+    fn macos_cached_headroom_requires_exact_native_normal_pressure() {
+        for pressure in [None, Some(0), Some(2), Some(4), Some(3), Some(u32::MAX)] {
+            assert_eq!(available_pages(100, 20, 10, 1000, pressure, 4096), Some(450_560));
+        }
+        assert_eq!(available_pages(100, 20, 10, 1000, Some(1), 4096), Some(4_423_680));
+    }
+
+    #[test]
+    fn macos_speculative_pages_in_both_counters_are_counted_once() {
+        for speculative in [0, 1, 40, 100] {
+            assert_eq!(
+                available_pages(
+                    100 + speculative,
+                    speculative,
+                    10,
+                    200 + speculative,
+                    Some(1),
+                    4096
+                ),
+                Some((300 + speculative) * 4096),
+            );
+        }
+    }
+
+    #[test]
+    fn macos_cache_and_purgeable_estimates_are_not_added() {
+        assert_eq!(available_pages(100, 0, 500, 200, Some(1), 1), Some(600));
+        assert_eq!(available_pages(100, 0, 200, 500, Some(1), 1), Some(600));
+        assert_eq!(available_pages(100, 0, 200, u64::MAX, None, 1), Some(300));
+    }
+
+    #[test]
+    fn macos_malformed_counters_and_overflow_refuse() {
+        assert_eq!(available_pages(10, 11, 0, 20, Some(1), 1), None);
+        assert_eq!(available_pages(20, 11, 0, 10, Some(1), 1), None);
+        assert_eq!(available_pages(u64::MAX, 0, 1, 0, None, 1), None);
+        assert_eq!(available_pages(u64::MAX, 0, 0, 1, Some(1), 1), None);
+        assert_eq!(available_pages(1, 0, 0, 0, None, 0), None);
     }
 
     #[test]

@@ -76,6 +76,7 @@ impl Collection {
             return false;
         };
         if records.len().saturating_add(*in_flight) >= MAX_RECORDS {
+            tracing::debug!("native tool observation attempt limit exceeded");
             self.unavailable();
             return false;
         }
@@ -92,18 +93,25 @@ impl Collection {
             return;
         };
         let Some(remaining) = in_flight.checked_sub(1) else {
+            tracing::debug!("native tool observation completed without a registered attempt");
             self.unavailable();
             return;
         };
-        let Ok(encoded) = record.encode() else {
-            self.unavailable();
-            return;
+        let encoded = match record.encode() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                tracing::debug!("native tool observation record encoding unavailable: {error:#}");
+                self.unavailable();
+                return;
+            }
         };
         let Some(bytes) = encoded_bytes.checked_add(encoded.len()) else {
+            tracing::debug!("native tool observation byte count overflowed");
             self.unavailable();
             return;
         };
         if bytes > MAX_RECORD_BYTES {
+            tracing::debug!("native tool observation byte limit exceeded");
             self.unavailable();
             return;
         }
@@ -117,16 +125,27 @@ impl Collection {
     fn terminal(&mut self) -> Option<Terminal> {
         match std::mem::replace(&mut self.state, State::Unavailable) {
             State::Disabled => {
+                tracing::debug!("native tool observation collection was not requested");
                 self.state = State::Disabled;
                 None
             }
             State::Collecting { records, in_flight: 0, .. } => Some(
                 ToolInputs::from_records(records)
                     .and_then(|inputs| inputs.encode())
+                    .inspect_err(|error| {
+                        tracing::debug!("native tool observation envelope unavailable: {error:#}");
+                    })
                     .map_or(Terminal::Unavailable, Terminal::Available),
             ),
             // A second finalization cannot recreate a successful empty fact.
-            State::Collecting { .. } | State::Unavailable => Some(Terminal::Unavailable),
+            State::Collecting { in_flight, .. } => {
+                tracing::debug!(in_flight, "native tool observation owning waits incomplete");
+                Some(Terminal::Unavailable)
+            }
+            State::Unavailable => {
+                tracing::debug!("native tool observation collection was already unavailable");
+                Some(Terminal::Unavailable)
+            }
         }
     }
 }
@@ -149,6 +168,7 @@ impl Session {
     }
 
     pub fn tool_inputs_unavailable(&self) {
+        tracing::debug!("native tool observation explicitly invalidated by compiler execution");
         self.tool_input_collection.borrow_mut().unavailable();
     }
 
@@ -164,6 +184,13 @@ impl Session {
             local_profile_for_options(&self.opts).and_then(|profile| {
                 Context::new(program, cwd, child_path, parent_path, profile)
                     .and_then(|context| context.begin())
+                    .inspect_err(|error| {
+                        tracing::debug!(
+                            ?program,
+                            ?cwd,
+                            "native tool observation admission unavailable: {error:#}"
+                        );
+                    })
                     .ok()
             })
         } else {
@@ -179,7 +206,16 @@ impl Session {
         if attempt.registered {
             // Observe outside the collection lock; another owned attempt may
             // finish while this one hashes its complete candidate readset.
-            let record = attempt.pending.and_then(|pending| pending.finish().ok());
+            let record = attempt.pending.and_then(|pending| {
+                pending
+                    .finish()
+                    .inspect_err(|error| {
+                        tracing::debug!(
+                            "native tool observation completion unavailable: {error:#}"
+                        );
+                    })
+                    .ok()
+            });
             self.tool_input_collection.borrow_mut().finished(record);
         }
     }

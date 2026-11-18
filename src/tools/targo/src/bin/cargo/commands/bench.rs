@@ -66,6 +66,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
         args.get_profile_name("bench", ProfileChecking::Custom)?;
 
     let ops = TestOptions {
+        child_supervision: None,
         no_run: args.flag("no-run"),
         no_fail_fast: args.flag("no-fail-fast"),
         required_test_bins: Vec::new(),

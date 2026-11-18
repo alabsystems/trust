@@ -299,11 +299,13 @@ pub struct Reservation {
 #[cfg(feature = "machine-admission")]
 #[path = "machine.rs"]
 mod machine;
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+pub use machine::ExecutionStartPipe;
 #[cfg(feature = "machine-admission")]
 pub use machine::{
     EarlyFixedClaim, FIXED_HANDOFF_ENV, FixedClaim, FixedCommandAdmission, FixedCommandSignal,
-    FixedCpuRequest, InheritedFixedClaim, PreparedFixedCommand, RunningFixedCommand,
-    RunningFixedGroup,
+    FixedCpuRequest, InheritedFixedClaim, MemberDirectory, PreparedFixedCommand,
+    RunningFixedCommand, RunningFixedGroup,
 };
 #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
 pub use machine::{PreparedNestedFixedCommand, RunningNestedFixedCommand};

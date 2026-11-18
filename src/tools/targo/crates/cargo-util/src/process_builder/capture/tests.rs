@@ -433,6 +433,7 @@ fn raw_capture_parent_held_writer_is_owner_drained_and_cleanup_error_keeps_statu
             ChildStdout::from(reader),
             stderr,
             Some(Instant::now() + Duration::from_secs(60)),
+            None,
             &mut |stdout, data, _| {
                 if stdout {
                     bytes.extend_from_slice(data);

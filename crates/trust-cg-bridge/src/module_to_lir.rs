@@ -98,6 +98,12 @@ pub enum ModuleLirError {
     #[error("function `{name}` has no func_type entry (id {ty})")]
     MissingFuncType { name: String, ty: u32 },
 
+    /// A transformation cannot reserve another fresh identifier without
+    /// overflowing its u32 space. Refuse before any wrapped id can alias one
+    /// already present in the source function or a previous splice.
+    #[error("function `{name}` exhausts fresh {space} identifiers")]
+    FreshIdExhausted { name: String, space: &'static str },
+
     /// The function body has no basic blocks at all (malformed).
     #[error("function `{name}` has no basic blocks")]
     NoBlocks { name: String },
@@ -534,6 +540,7 @@ impl ModuleLirError {
         match self {
             Self::MissingFunction(_) => "MissingFunction",
             Self::MissingFuncType { .. } => "MissingFuncType",
+            Self::FreshIdExhausted { .. } => "FreshIdExhausted",
             Self::NoBlocks { .. } => "NoBlocks",
             Self::MissingBlock { .. } => "MissingBlock",
             Self::EdgeArgArity { .. } => "EdgeArgArity",
@@ -1297,6 +1304,7 @@ fn inst_name(inst: &Inst) -> &'static str {
         Inst::PtrData { .. } => "PtrData",
         Inst::PtrMetadata { .. } => "PtrMetadata",
         Inst::PtrFromParts { .. } => "PtrFromParts",
+        Inst::BoxDeref { .. } => "BoxDeref",
         Inst::AtomicLoad { .. } => "AtomicLoad",
         Inst::AtomicStore { .. } => "AtomicStore",
         Inst::AtomicRMW { .. } => "AtomicRMW",
@@ -1348,15 +1356,13 @@ fn inst_name(inst: &Inst) -> &'static str {
         Inst::CallIndirectCannotUnwind { .. } => "CallIndirectCannotUnwind",
         Inst::DropInvoke { .. } => "DropInvoke",
         Inst::InvokeIndirect { .. } => "InvokeIndirect",
-        Inst::DialectOp(_) => "DialectOp",
-        // trust-ir v67-v69 tensor operations: outside this bridge's slice,
-        // refused by name like every other unmapped instruction.
         Inst::TensorContract { .. } => "TensorContract",
         Inst::TensorMap { .. } => "TensorMap",
         Inst::TensorReduce { .. } => "TensorReduce",
         Inst::TensorView { .. } => "TensorView",
         Inst::TensorGather { .. } => "TensorGather",
         Inst::TensorScatter { .. } => "TensorScatter",
+        Inst::DialectOp(_) => "DialectOp",
     }
 }
 
@@ -3496,7 +3502,8 @@ fn lower_trust_ir_function_to_lir_impl(
     let mut block_order: Vec<Block> = Vec::with_capacity(order.len());
     // Edge-split blocks accumulate here and are appended after the real blocks.
     let mut edge_blocks: Vec<(Block, LirBlock)> = Vec::new();
-    let mut next_edge_block: u32 = order.iter().copied().max().unwrap_or(0) + 1;
+    let mut next_edge_block =
+        FreshIdCursor::after(order.iter().copied().max().unwrap_or(0), "block", name)?;
     // Fresh-value allocator for cycle-breaking edge-copy temporaries; starts past
     // every SSA-bound value so a temp never aliases a real value.
     let mut next_value: u32 = vmap.next_value();
@@ -3569,9 +3576,10 @@ fn lower_trust_ir_function_to_lir_impl(
                 // The assert condition is `ok` (== !overflowed): branch to the
                 // continuation when true, to the shared trap block when false.
                 let cond_v = vmap.resolve(*cond, name)?;
-                let trap = *trap_block.get_or_insert_with(|| {
-                    let b = Block(next_edge_block);
-                    next_edge_block += 1;
+                let trap = if let Some(trap) = trap_block {
+                    trap
+                } else {
+                    let b = Block(next_edge_block.take(name)?);
                     split_blocks.push((
                         b,
                         LirBlock {
@@ -3584,10 +3592,10 @@ fn lower_trust_ir_function_to_lir_impl(
                             source_locs: vec![],
                         },
                     ));
+                    trap_block = Some(b);
                     b
-                });
-                let cont = Block(next_edge_block);
-                next_edge_block += 1;
+                };
+                let cont = Block(next_edge_block.take(name)?);
 
                 seg.push(Instruction {
                     opcode: Opcode::Brif { cond: cond_v, then_dest: cont, else_dest: trap },
@@ -3942,8 +3950,8 @@ fn inline_local_pure_leaf_calls_one_pass(
     // Fresh-ValueId / fresh-BlockId allocators: start past every id mentioned
     // anywhere in the caller so a spliced callee id can never alias a caller id
     // (or a previously-spliced callee id, since the counters only grow).
-    let mut next_value = max_value_id(function) + 1;
-    let mut next_block = max_block_id(function) + 1;
+    let mut next_value = FreshIdCursor::after(max_value_id(function), "value", &function.name)?;
+    let mut next_block = FreshIdCursor::after(max_block_id(function), "block", &function.name)?;
 
     let name = function.name.clone();
     let mut new_function = function.clone();
@@ -4046,7 +4054,9 @@ fn inline_local_pure_leaf_calls_one_pass(
             flatten_stack.pop();
             match out {
                 Ok(Cow::Owned(f)) => Some(f),
-                Ok(Cow::Borrowed(_)) | Err(_) => None,
+                Ok(Cow::Borrowed(_)) => None,
+                Err(error @ ModuleLirError::FreshIdExhausted { .. }) => return Err(error),
+                Err(_) => None,
             }
         } else {
             None
@@ -4071,6 +4081,9 @@ fn inline_local_pure_leaf_calls_one_pass(
                 continue;
             }
             Err(_single_detail) => {
+                if let Some(error) = next_value.failure(&name) {
+                    return Err(error);
+                }
                 // Not a single-block inline; try the MULTI-BLOCK splice.
             }
         }
@@ -4092,6 +4105,10 @@ fn inline_local_pure_leaf_calls_one_pass(
                 out_blocks.append(&mut spliced_blocks);
             }
             Err(_multi_detail) => {
+                if let Some(error) = next_value.failure(&name).or_else(|| next_block.failure(&name))
+                {
+                    return Err(error);
+                }
                 // Neither single- nor multi-block inline is admissible: leave the
                 // Call in place verbatim so the converter fail-closes on it. We
                 // never produce a wrong splice.
@@ -4109,6 +4126,44 @@ fn inline_local_pure_leaf_calls_one_pass(
     // boundary, NOT an inliner error.
     let _ = &name;
     Ok(new_function)
+}
+
+/// A checked cursor for sparse source IDs and synthetic block IDs. The
+/// following index must be representable before the current one is reserved;
+/// u32::MAX is therefore an exhaustion sentinel, never a wrapped alias.
+struct FreshIdCursor {
+    next: u32,
+    space: &'static str,
+    exhausted: bool,
+}
+
+impl FreshIdCursor {
+    fn after(maximum: u32, space: &'static str, name: &str) -> Result<Self, ModuleLirError> {
+        let next = maximum
+            .checked_add(1)
+            .ok_or_else(|| ModuleLirError::FreshIdExhausted { name: name.to_string(), space })?;
+        Ok(Self { next, space, exhausted: false })
+    }
+
+    fn take(&mut self, name: &str) -> Result<u32, ModuleLirError> {
+        let Some(following) = self.next.checked_add(1) else {
+            self.exhausted = true;
+            return Err(ModuleLirError::FreshIdExhausted {
+                name: name.to_string(),
+                space: self.space,
+            });
+        };
+        let fresh = self.next;
+        self.next = following;
+        Ok(fresh)
+    }
+
+    // The private splice helpers return ordinary shape-refusal strings. Keep
+    // exhaustion typed independently so their fallback cannot swallow it.
+    fn failure(&self, name: &str) -> Option<ModuleLirError> {
+        self.exhausted
+            .then(|| ModuleLirError::FreshIdExhausted { name: name.to_string(), space: self.space })
+    }
 }
 
 /// The largest `BlockId` index appearing anywhere in `function` (every block's
@@ -4189,7 +4244,7 @@ fn try_inline_call(
     callee: &IrFunction,
     args: &[ValueId],
     call_node: &InstrNode,
-    next_value: &mut u32,
+    next_value: &mut FreshIdCursor,
 ) -> Result<Vec<InstrNode>, String> {
     // ---- ACYCLIC (no self-recursion) ----
     if callee.id == caller.id {
@@ -4277,8 +4332,7 @@ fn try_inline_call(
     for n in body {
         // Single result (validated above).
         let old = n.results[0];
-        let fresh = ValueId::new(*next_value);
-        *next_value += 1;
+        let fresh = ValueId::new(next_value.take(&caller.name).map_err(|error| error.to_string())?);
         remap.insert(old, fresh);
     }
 
@@ -4548,8 +4602,8 @@ fn try_inline_call_multiblock(
     call_node: &InstrNode,
     caller_block: &trust_ir::Block,
     call_pos: usize,
-    next_value: &mut u32,
-    next_block: &mut u32,
+    next_value: &mut FreshIdCursor,
+    next_block: &mut FreshIdCursor,
 ) -> Result<Vec<trust_ir::Block>, String> {
     // ---- ACYCLIC (no self-recursion); leaf check below closes transitivity ----
     if callee.id == caller.id {
@@ -4623,14 +4677,12 @@ fn try_inline_call_multiblock(
     }
 
     // ---- Allocate the fresh continuation block id up front. ----
-    let cont_id = BlockId::new(*next_block);
-    *next_block += 1;
+    let cont_id = BlockId::new(next_block.take(&caller.name).map_err(|error| error.to_string())?);
 
     // ---- BlockId remap: every callee block -> a fresh BlockId. ----
     let mut block_remap: HashMap<BlockId, BlockId> = HashMap::new();
     for block in &callee.blocks {
-        let fresh = BlockId::new(*next_block);
-        *next_block += 1;
+        let fresh = BlockId::new(next_block.take(&caller.name).map_err(|error| error.to_string())?);
         block_remap.insert(block.id, fresh);
     }
     let entry_clone_id = block_remap[&callee.entry];
@@ -4644,15 +4696,15 @@ fn try_inline_call_multiblock(
     for block in &callee.blocks {
         if block.id != callee.entry {
             for (param_id, _) in &block.params {
-                let fresh = ValueId::new(*next_value);
-                *next_value += 1;
+                let fresh =
+                    ValueId::new(next_value.take(&caller.name).map_err(|error| error.to_string())?);
                 remap.insert(*param_id, fresh);
             }
         }
         for node in &block.body {
             for r in &node.results {
-                let fresh = ValueId::new(*next_value);
-                *next_value += 1;
+                let fresh =
+                    ValueId::new(next_value.take(&caller.name).map_err(|error| error.to_string())?);
                 remap.insert(*r, fresh);
             }
         }
@@ -4818,97 +4870,13 @@ fn remap_pure_leaf_inst(
     Ok(mapped)
 }
 
-/// The `ValueId` operands an instruction READS, for the max-value scan. Need
-/// not be exhaustive in meaning, only an upper bound on referenced ids, so a
-/// conservative match over every variant's value fields is used.
+/// The SSA operands read by an instruction, including constructs this bridge
+/// refuses to lower. Use the shared exhaustive walk so a new IR instruction
+/// cannot silently omit a read from the inliner's fresh-value scan.
 fn inst_value_operands(inst: &Inst) -> Vec<ValueId> {
-    match inst {
-        Inst::BinOp { lhs, rhs, .. }
-        | Inst::Overflow { lhs, rhs, .. }
-        | Inst::ICmp { lhs, rhs, .. }
-        | Inst::FCmp { lhs, rhs, .. } => vec![*lhs, *rhs],
-        Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } | Inst::Copy { operand, .. } => {
-            vec![*operand]
-        }
-        Inst::Load { ptr, .. } => vec![*ptr],
-        Inst::Store { ptr, value, .. } => vec![*ptr, *value],
-        Inst::Alloca { count, .. } | Inst::HeapAlloc { count, .. } => {
-            count.iter().copied().collect()
-        }
-        Inst::GEP { base, indices, .. } => {
-            let mut v = vec![*base];
-            v.extend(indices.iter().copied());
-            v
-        }
-        Inst::PtrData { ptr, .. } | Inst::PtrMetadata { ptr, .. } => vec![*ptr],
-        Inst::PtrFromParts { data, metadata, .. } => vec![*data, *metadata],
-        Inst::AtomicLoad { ptr, .. } => vec![*ptr],
-        Inst::AtomicStore { ptr, value, .. } | Inst::AtomicRMW { ptr, value, .. } => {
-            vec![*ptr, *value]
-        }
-        Inst::CmpXchg { ptr, expected, desired, .. } => vec![*ptr, *expected, *desired],
-        Inst::Br { args, .. } => args.clone(),
-        Inst::CondBr { cond, then_args, else_args, .. } => {
-            let mut v = vec![*cond];
-            v.extend(then_args.iter().copied());
-            v.extend(else_args.iter().copied());
-            v
-        }
-        Inst::Switch { value, default_args, cases, .. } => {
-            let mut v = vec![*value];
-            v.extend(default_args.iter().copied());
-            for c in cases {
-                v.extend(c.args.iter().copied());
-            }
-            v
-        }
-        Inst::Call { args, .. } => args.clone(),
-        Inst::CallIndirect { callee, args, .. } => {
-            let mut v = vec![*callee];
-            v.extend(args.iter().copied());
-            v
-        }
-        Inst::Return { values } => values.clone(),
-        Inst::ExtractField { aggregate, .. } => vec![*aggregate],
-        Inst::InsertField { aggregate, value, .. } => vec![*aggregate, *value],
-        Inst::ExtractElement { array, index, .. } => vec![*array, *index],
-        Inst::InsertElement { array, index, value, .. } => vec![*array, *index, *value],
-        Inst::Assume { cond } => vec![*cond],
-        // An assert reads its kind's operands and a sited one its run-time
-        // location (trust-ir v52/v54); the invoke-family and no-unwind call
-        // twins (v53/v55/v56) read their callee, arguments and edge
-        // arguments. trust-ir's canonical exhaustive walk names each.
-        Inst::Assert { .. }
-        | Inst::AssertInvoke { .. }
-        | Inst::CallCannotUnwind { .. }
-        | Inst::CallIndirectCannotUnwind { .. }
-        | Inst::DropInvoke { .. }
-        | Inst::InvokeIndirect { .. } => {
-            let mut v = Vec::new();
-            inst.visit_value_operands(|operand| v.push(operand));
-            v
-        }
-        Inst::Select { cond, then_val, else_val, .. } => vec![*cond, *then_val, *else_val],
-        Inst::Borrow { ptr } | Inst::BorrowMut { ptr } => vec![*ptr],
-        Inst::EndBorrow { borrow_ptr } => vec![*borrow_ptr],
-        Inst::Retain { ptr } | Inst::Release { ptr } | Inst::IsUnique { ptr } => vec![*ptr],
-        Inst::Dealloc { ptr, .. } => vec![*ptr],
-        // Named explicitly, never left to the fall-through below: each reads
-        // registers, and an operand missing from this scan is a use the
-        // inliner's fresh-id numbering could collide with.
-        Inst::Drop { ptr, .. } => vec![*ptr],
-        Inst::MemCopy { dst, src, bytes, .. } => vec![*dst, *src, *bytes],
-        Inst::MemSet { dst, byte, bytes } => vec![*dst, *byte, *bytes],
-        Inst::MakeAggregate { fields, .. } => fields.clone(),
-        // Runtime captures are ordered SSA reads even though this converter
-        // refuses closure construction. Include them in fresh-id scans.
-        Inst::MakeClosure { captures, .. } => captures.clone(),
-        // One operand whatever the array length: the splat names its element once.
-        Inst::ArraySplat { value, .. } => vec![*value],
-        // Variants with no `ValueId` operands (or whose operands are not in the
-        // remappable scalar core) contribute nothing to the max scan.
-        _ => vec![],
-    }
+    let mut operands = Vec::new();
+    inst.visit_value_operands(|operand| operands.push(operand));
+    operands
 }
 
 /// Split a block's body into its straight-line value instructions and its single
@@ -5148,6 +5116,15 @@ fn lower_aggregate_inst(
     name: &str,
 ) -> Result<bool, ModuleLirError> {
     let result0 = node.results.first().copied();
+    // The tracked-aggregate arms below are guarded by `result0.is_some_and(..)`,
+    // so their result, and the map entry a guard looked up, are present; should
+    // a guard and its arm ever disagree, the lowering refuses instead of panicking.
+    let guarded_result = |arm: &str| {
+        result0.ok_or_else(|| ModuleLirError::UnsupportedAggregate {
+            name: name.to_string(),
+            detail: format!("guarded aggregate {arm} has no result"),
+        })
+    };
 
     match &node.inst {
         // ---- Aggregate Alloca (Tuple or Struct) -> one sized stack slot. ----
@@ -5219,7 +5196,7 @@ fn lower_aggregate_inst(
         Inst::Undef { ty: ty @ (Ty::Tuple(_) | Ty::Struct(_)) }
             if result0.is_some_and(|r| agg_mem.agg_undef_seeds.contains(&r)) =>
         {
-            let result = result0.expect("guarded");
+            let result = guarded_result("Undef seed")?;
             // The field map starts "unset" (sentinel `Value(u32::MAX)`); every
             // entry MUST be overwritten by an `InsertField` before any
             // Store/Load/Extract reads it (PASS 1.7 proved this — it rejects a
@@ -5251,7 +5228,7 @@ fn lower_aggregate_inst(
         Inst::InsertField { aggregate, field, value, .. }
             if result0.is_some_and(|r| agg_mem.agg_insert_results.contains(&r)) =>
         {
-            let result = result0.expect("guarded");
+            let result = guarded_result("InsertField")?;
             let src = agg_field_values.get(aggregate).cloned().ok_or_else(|| {
                 ModuleLirError::UnsupportedAggregate {
                     name: name.to_string(),
@@ -5336,8 +5313,14 @@ fn lower_aggregate_inst(
         Inst::Load { ty: Ty::Tuple(_) | Ty::Struct(_), ptr, .. }
             if result0.is_some_and(|r| agg_mem.agg_incoming_load_layout.contains_key(&r)) =>
         {
-            let result = result0.expect("guarded");
-            let layout = agg_mem.agg_incoming_load_layout[&result].clone();
+            let result = guarded_result("incoming Load")?;
+            let layout =
+                agg_mem.agg_incoming_load_layout.get(&result).cloned().ok_or_else(|| {
+                    ModuleLirError::UnsupportedAggregate {
+                        name: name.to_string(),
+                        detail: "guarded aggregate incoming Load has no layout".to_string(),
+                    }
+                })?;
             let base = vmap.resolve(*ptr, name)?;
             let mut loaded = Vec::with_capacity(layout.field_offsets.len());
             for (offset, lir_ty) in &layout.field_offsets {
@@ -5380,7 +5363,7 @@ fn lower_aggregate_inst(
         Inst::Load { ty: Ty::Tuple(_) | Ty::Struct(_), ptr, .. }
             if result0.is_some_and(|r| agg_mem.agg_load_results.contains(&r)) =>
         {
-            let result = result0.expect("guarded");
+            let result = guarded_result("Load")?;
             let layout = agg_mem.agg_alloca_layout.get(ptr).ok_or_else(|| {
                 ModuleLirError::UnsupportedMemory {
                     name: name.to_string(),
@@ -5414,7 +5397,7 @@ fn lower_aggregate_inst(
         Inst::ExtractField { aggregate, field, .. }
             if result0.is_some_and(|r| agg_mem.agg_extract_field.contains_key(&r)) =>
         {
-            let result = result0.expect("guarded");
+            let result = guarded_result("ExtractField")?;
             let src_fields = agg_field_values.get(aggregate).ok_or_else(|| {
                 ModuleLirError::UnsupportedAggregate {
                     name: name.to_string(),
@@ -5461,8 +5444,13 @@ fn lower_aggregate_inst(
         Inst::GEP { base, .. }
             if result0.is_some_and(|r| agg_mem.agg_field_ptrs.contains_key(&r)) =>
         {
-            let result = result0.expect("guarded");
-            let field = &agg_mem.agg_field_ptrs[&result];
+            let result = guarded_result("field-pointer GEP")?;
+            let field = agg_mem.agg_field_ptrs.get(&result).ok_or_else(|| {
+                ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: "guarded aggregate field-pointer GEP has no field".to_string(),
+                }
+            })?;
             let base_v = vmap.resolve(*base, name)?;
             let slot =
                 *mem.slot_of.get(&base_v).ok_or_else(|| ModuleLirError::UnsupportedMemory {
@@ -6902,7 +6890,7 @@ fn lower_terminator(
     blocks_by_id: &HashMap<u32, &trust_ir::Block>,
     instructions: &mut Vec<Instruction>,
     edge_blocks: &mut Vec<(Block, LirBlock)>,
-    next_edge_block: &mut u32,
+    next_edge_block: &mut FreshIdCursor,
     next_value: &mut u32,
     name: &str,
 ) -> Result<(), ModuleLirError> {
@@ -7077,7 +7065,7 @@ fn conditional_edge_dest(
     pair_enum_values: &HashMap<ValueId, (Value, Value)>,
     blocks_by_id: &HashMap<u32, &trust_ir::Block>,
     edge_blocks: &mut Vec<(Block, LirBlock)>,
-    next_edge_block: &mut u32,
+    next_edge_block: &mut FreshIdCursor,
     next_value: &mut u32,
     name: &str,
 ) -> Result<Block, ModuleLirError> {
@@ -7115,8 +7103,7 @@ fn conditional_edge_dest(
         args: vec![],
         results: vec![],
     });
-    let id = Block(*next_edge_block);
-    *next_edge_block += 1;
+    let id = Block(next_edge_block.take(name)?);
     edge_blocks.push((id, LirBlock { params: vec![], instructions: tramp, source_locs: vec![] }));
     Ok(id)
 }
@@ -9159,6 +9146,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fail_closed_on_box_deref_without_erasing_its_operand() {
+        use trust_ir::box_validity::{
+            BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+        };
+
+        let operand = ValueId::new(0);
+        let inst = Inst::BoxDeref {
+            ptr_ty: Ty::Ptr,
+            pointee: BoxPointee::Sized { ty: Ty::I32 },
+            operand,
+            fact: Box::new(BoxValidityFact::premise(
+                BoxDerefSite { item: [7; 16], ordinal: 0 },
+                BoxFactSession::PROOF_SNAPSHOT,
+                PremiseRoot::ParamByValue,
+            )),
+        };
+        assert_eq!(inst_value_operands(&inst), vec![operand]);
+        let mut module = module_with_body("box_deref", vec![Ty::Ptr], Vec::new());
+        module.func_types[0].params = vec![Ty::Ptr];
+        module.functions[0].blocks[0].params = vec![(operand, Ty::Ptr)];
+        module.functions[0].blocks[0].body = vec![
+            InstrNode::new(inst).with_result(ValueId::new(2)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }),
+        ];
+        let lowered = lower_module_to_lir(&module, FuncId::new(0));
+        assert!(
+            matches!(&lowered, Err(ModuleLirError::UnsupportedInst { inst, .. })
+                if *inst == "BoxDeref"),
+            "Box validity evidence must not be discarded by lowering: {lowered:?}"
+        );
+    }
+
+    #[cfg(feature = "ay-proofs")]
+    #[test]
+    fn fail_closed_on_box_deref_even_when_unused() {
+        use trust_ir::box_validity::{
+            BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+        };
+
+        for returned in [ValueId::new(0), ValueId::new(2)] {
+            let fact = BoxValidityFact::premise(
+                BoxDerefSite { item: [0x5a; 16], ordinal: 7 },
+                BoxFactSession::PROOF_SNAPSHOT,
+                PremiseRoot::ParamByValue,
+            );
+            let mut module = module_with_body(
+                "box_deref",
+                vec![Ty::Ptr],
+                vec![
+                    InstrNode::new(Inst::BoxDeref {
+                        ptr_ty: Ty::Ptr,
+                        pointee: BoxPointee::Sized { ty: Ty::U8 },
+                        operand: ValueId::new(0),
+                        fact: Box::new(fact),
+                    })
+                    .with_result(ValueId::new(2)),
+                    InstrNode::new(Inst::Return { values: vec![returned] }),
+                ],
+            );
+            module.func_types[0].params = vec![Ty::Ptr, Ty::Ptr];
+            module.functions[0].blocks[0].params =
+                vec![(ValueId::new(0), Ty::Ptr), (ValueId::new(1), Ty::Ptr)];
+            assert!(trust_ir_build::validate_module(&module).is_empty());
+            assert!(matches!(
+                lower_module_to_lir(&module, FuncId::new(0)),
+                Err(ModuleLirError::UnsupportedInst { inst: "BoxDeref", .. })
+            ));
+        }
+    }
+
     /// trust-ir v67-v69's tensor operations compute over a run-time-shaped
     /// tensor value this bridge has no layout for: each is refused by name.
     #[test]
@@ -10797,6 +10855,176 @@ mod tests {
         };
         assert!(!is_multiblock_inlinable_value(&sited));
         assert!(inst_value_operands(&sited).contains(&ValueId::new(4)));
+    }
+
+    #[test]
+    fn unbound_box_operand_at_max_id_refuses_before_call_preprocessing_can_wrap() {
+        use trust_ir::box_validity::{
+            BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+        };
+        let mut module = caller_calls_add_module();
+        module.functions[0].blocks[0].body.insert(
+            0,
+            InstrNode::new(Inst::BoxDeref {
+                ptr_ty: Ty::Ptr,
+                pointee: BoxPointee::Sized { ty: Ty::I32 },
+                operand: ValueId::new(u32::MAX),
+                fact: Box::new(BoxValidityFact::premise(
+                    BoxDerefSite { item: [8; 16], ordinal: 0 },
+                    BoxFactSession::PROOF_SNAPSHOT,
+                    PremiseRoot::ParamByValue,
+                )),
+            })
+            .with_result(ValueId::new(5)),
+        );
+        // Intentionally malformed unbound input: it must produce a structured
+        // refusal, never panic or wrap before the ordinary BoxDeref barrier.
+        let error = lower_module_to_lir(&module, FuncId::new(0))
+            .expect_err("the unbound maximum operand must refuse before allocation");
+        assert!(matches!(&error, ModuleLirError::FreshIdExhausted { space: "value", .. }));
+        assert_eq!(error.class_name(), "FreshIdExhausted");
+    }
+
+    #[test]
+    fn inliner_value_reservations_refuse_exhaustion_and_preserve_sparse_id_control() {
+        for (highest, exhausted) in [(u32::MAX - 2, true), (u32::MAX - 3, false)] {
+            let mut module = caller_calls_add_module();
+            let result = ValueId::new(highest);
+            module.functions[0].blocks[0].body = vec![
+                InstrNode::new(Inst::Call {
+                    callee: FuncId::new(1),
+                    args: vec![ValueId::new(0), ValueId::new(1)],
+                })
+                .with_result(result),
+                InstrNode::new(Inst::Return { values: vec![result] }),
+            ];
+            // Two genuine pure-leaf results require two fresh IDs. At MAX-2
+            // the first reservation succeeds and the second must refuse.
+            module.functions[1].blocks[0].body.insert(
+                0,
+                InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) })
+                    .with_result(ValueId::new(13)),
+            );
+            let lowered = lower_module_to_lir(&module, FuncId::new(0));
+            if exhausted {
+                assert!(matches!(
+                    lowered,
+                    Err(ModuleLirError::FreshIdExhausted { space: "value", .. })
+                ));
+            } else {
+                assert!(lowered.is_ok(), "two available fresh IDs must still lower: {lowered:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_flattening_preserves_typed_id_exhaustion() {
+        let mut module = caller_calls_add_module();
+        let mut leaf = module.functions[1].clone();
+        leaf.id = FuncId::new(2);
+        leaf.name = "deep_add".into();
+        leaf.blocks[0].body.insert(
+            0,
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) })
+                .with_result(ValueId::new(13)),
+        );
+        let result = ValueId::new(u32::MAX - 2);
+        module.functions[1].blocks[0].body = vec![
+            InstrNode::new(Inst::Call {
+                callee: FuncId::new(2),
+                args: vec![ValueId::new(10), ValueId::new(11)],
+            })
+            .with_result(result),
+            InstrNode::new(Inst::Return { values: vec![result] }),
+        ];
+        module.functions.push(leaf);
+        assert!(matches!(
+            lower_module_to_lir(&module, FuncId::new(0)),
+            Err(ModuleLirError::FreshIdExhausted { space: "value", .. })
+        ));
+    }
+
+    #[test]
+    fn maximum_source_block_id_refuses_in_call_preprocessing() {
+        let mut module = caller_calls_add_module();
+        module.functions[0].entry = BlockId::new(u32::MAX);
+        module.functions[0].blocks[0].id = BlockId::new(u32::MAX);
+        assert!(matches!(
+            lower_module_to_lir(&module, FuncId::new(0)),
+            Err(ModuleLirError::FreshIdExhausted { space: "block", .. })
+        ));
+    }
+
+    #[test]
+    fn multiblock_inline_reservations_refuse_exhaustion_and_keep_the_control() {
+        for (highest, exhausted) in [(u32::MAX - 2, true), (u32::MAX - 4, false)] {
+            let mut module = caller_calls_add_module();
+            module.functions[0].entry = BlockId::new(highest);
+            module.functions[0].blocks[0].id = BlockId::new(highest);
+            // A real two-block pure callee needs the continuation and both
+            // cloned block IDs; entry args flow into the exit's actual param.
+            module.functions[1].blocks[0].body = vec![InstrNode::new(Inst::Br {
+                target: BlockId::new(1),
+                args: vec![ValueId::new(10)],
+            })];
+            let mut exit = Block::new(BlockId::new(1));
+            exit.params.push((ValueId::new(12), Ty::I32));
+            exit.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(12)] }));
+            module.functions[1].blocks.push(exit);
+            let lowered = lower_module_to_lir(&module, FuncId::new(0));
+            if exhausted {
+                assert!(matches!(
+                    lowered,
+                    Err(ModuleLirError::FreshIdExhausted { space: "block", .. })
+                ));
+            } else {
+                assert!(
+                    lowered.is_ok(),
+                    "three available fresh blocks must still lower: {lowered:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edge_split_block_reservations_refuse_without_an_inlining_call() {
+        for (highest, exhausted) in [(u32::MAX - 1, true), (u32::MAX - 4, false)] {
+            let mut module = module_with_body("edge_ids", vec![Ty::I32], Vec::new());
+            module.functions[0].entry = BlockId::new(highest);
+            let entry = &mut module.functions[0].blocks[0];
+            entry.id = BlockId::new(highest);
+            entry.body = vec![
+                InstrNode::new(Inst::ICmp {
+                    op: ICmpOp::Eq,
+                    ty: Ty::I32,
+                    lhs: ValueId::new(0),
+                    rhs: ValueId::new(1),
+                })
+                .with_result(ValueId::new(2)),
+                InstrNode::new(Inst::CondBr {
+                    cond: ValueId::new(2),
+                    then_target: BlockId::new(0),
+                    then_args: vec![ValueId::new(0)],
+                    else_target: BlockId::new(1),
+                    else_args: vec![ValueId::new(1)],
+                }),
+            ];
+            for (id, value) in [(0, 3), (1, 4)] {
+                let mut exit = Block::new(BlockId::new(id));
+                exit.params.push((ValueId::new(value), Ty::I32));
+                exit.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(value)] }));
+                module.functions[0].blocks.push(exit);
+            }
+            let lowered = lower_module_to_lir(&module, FuncId::new(0));
+            if exhausted {
+                assert!(matches!(
+                    lowered,
+                    Err(ModuleLirError::FreshIdExhausted { space: "block", .. })
+                ));
+            } else {
+                assert!(lowered.is_ok(), "two available edge blocks must still lower: {lowered:?}");
+            }
+        }
     }
 
     #[test]

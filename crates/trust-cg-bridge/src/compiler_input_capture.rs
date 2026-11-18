@@ -24,11 +24,21 @@ use crate::object_replay::{artifact_digest, encode};
 use crate::verify_output::EmitPolicy;
 
 const SCHEMA: &str = "trust.compiler-cer-input-data.v1";
+/// Complete Module serde JSON plus its canonical byte check. This transport
+/// profile is distinct from the TrustIR binary version and grants no authority.
+/// A different complete-writer contract needs a different profile.
+pub const MODULE_TRANSPORT_PROFILE: &str = "trust.ir.module.complete-serde-json.v1";
 const SCOPE: &str = "actual-compiler-IR-model-P-object-data; universal-Rust-source-refinement-unfinished; no-admission-authority";
 pub const MAX_FUNCTIONS: usize = 32;
 pub const MAX_WIRE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PART_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LABEL_BYTES: usize = 64 * 1024;
+
+mod migration;
+pub use migration::{
+    CompilerCaptureDataMigration, CompilerCaptureMigrationReceipt, CompilerModuleMigrationReceipt,
+    HistoricalModuleTransportProfile, migrate_historical_capture_data,
+};
 
 #[cfg(feature = "canonical-semr-scalar")]
 mod semr_scalar;
@@ -129,6 +139,10 @@ impl CompilerCaptureConfig {
 struct ModuleBytes {
     bytes: Vec<u8>,
     sha256: String,
+    // Appended and omitted only when absent: a legacy outer JSON document
+    // still re-encodes byte-for-byte. Absence never relaxes Module decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_profile: Option<String>,
 }
 impl ModuleBytes {
     fn capture(module: &Module) -> Result<Self, String> {
@@ -140,9 +154,20 @@ impl ModuleBytes {
         if &decoded != module || encode(&decoded, MAX_PART_BYTES)? != bytes {
             return Err("complete Module codec roundtrip differs".into());
         }
-        Ok(Self { sha256: artifact_digest(&bytes), bytes })
+        Ok(Self {
+            sha256: artifact_digest(&bytes),
+            bytes,
+            transport_profile: Some(MODULE_TRANSPORT_PROFILE.into()),
+        })
     }
     fn decode(&self) -> Result<Module, String> {
+        if self
+            .transport_profile
+            .as_deref()
+            .is_some_and(|profile| profile != MODULE_TRANSPORT_PROFILE)
+        {
+            return Err("compiler capture unknown Module transport profile".into());
+        }
         if self.bytes.is_empty()
             || self.bytes.len() > MAX_PART_BYTES
             || artifact_digest(&self.bytes) != self.sha256
@@ -484,6 +509,74 @@ impl DecodedCompilerInputs {
             relocation_model: self.relocation,
         }
     }
+}
+
+/// Explicit migration of the ONE immutable historical B8 test fixture. This
+/// returns untrusted DATA only; each consumer retains its own actual AOT,
+/// conditional proof, source/refinement refusal and independent replay checks.
+#[cfg(test)]
+pub(crate) fn historical_b8_data_for_tests() -> DecodedCompilerInputs {
+    const ORIGINAL: &[u8] = include_bytes!("compiler_frame_inputs/actual-b8-caller-input.json");
+    assert_eq!(
+        artifact_digest(ORIGINAL),
+        "fccc4c260617ebf86cc83a8bf32e56a17957aeb48949ea17050a997f116a2dae"
+    );
+    assert!(CompilerInputCapture::from_bytes(ORIGINAL).is_err());
+    let migrated = migrate_historical_capture_data(
+        ORIGINAL,
+        HistoricalModuleTransportProfile::OmittedEmptyTrailingClosureLayouts,
+    )
+    .unwrap();
+    let receipt = &migrated.receipt;
+    assert_eq!(receipt.schema, "trust.compiler-cer-input-data-migration.v1");
+    assert_eq!(receipt.input_capture_schema, SCHEMA);
+    assert_eq!(receipt.output_capture_schema, SCHEMA);
+    assert_eq!(receipt.input_capture_sha256, artifact_digest(ORIGINAL));
+    assert_eq!(receipt.input_capture_bytes, ORIGINAL.len());
+    assert_eq!(
+        receipt.input_module_profile,
+        "trust.ir.module.serde-json.omitted-empty-trailing-closure-layouts.v1"
+    );
+    assert_eq!(receipt.output_module_profile, MODULE_TRANSPORT_PROFILE);
+    assert_eq!(receipt.added_default_field.as_deref(), Some("closure_layouts"));
+    assert_eq!(receipt.object_bytes, 639);
+    assert_eq!(
+        receipt.object_sha256,
+        "c4b9e1fcbc611f998c791cacd906ae735a5371528725829739995fe92c24e941"
+    );
+    assert_eq!(receipt.modules.len(), 2);
+    assert_eq!(receipt.modules[0].site, "m_cg");
+    assert_eq!(receipt.modules[1].site, "producers[0].module");
+    for (row, (before, after, old_len, new_len)) in receipt.modules.iter().zip([
+        (
+            "5f421556cd357f2d25ec69b3da974153ab65f9a24123398fdfe412d5541283e6",
+            "2de3a3c729662897dfa1c0b5003a2bdbfccdb7be279780bb99abc87e492d4f62",
+            2845,
+            2866,
+        ),
+        (
+            "d771d07a45ce6ea54536887687146e6405ebb2eeff8c665f4b6c8ad871e849c4",
+            "0537fa28f2c4808f84c97e02761f9b204cd764a174fb85cebea6ffefcbbb1c2f",
+            2850,
+            2871,
+        ),
+    ]) {
+        assert_eq!(row.input_sha256, before);
+        assert_eq!(row.output_sha256, after);
+        assert_eq!(row.input_bytes, old_len);
+        assert_eq!(row.output_bytes, new_len);
+    }
+    let current = migrated.capture.to_bytes().unwrap();
+    assert_eq!(receipt.output_capture_sha256, artifact_digest(&current));
+    assert_eq!(receipt.output_capture_bytes, current.len());
+    assert_eq!(
+        receipt.output_capture_sha256,
+        "5da1ac01c637fac56a1a48cafc0554e56e5ea327fb5d0ddd928e936bbda713e6"
+    );
+    let data = CompilerInputCapture::from_bytes(&current).unwrap().decode_inputs().unwrap();
+    assert_eq!(artifact_digest(&data.object), receipt.object_sha256);
+    assert_eq!(data.object.len(), receipt.object_bytes);
+    data
 }
 
 #[cfg(test)]

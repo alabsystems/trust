@@ -113,6 +113,9 @@ NOT_LOADED = {
     ),
     "scripts/audit_first_party_pins.py": "submodule_sync.sh names the separate pin audit in comments; it does not execute it",
     "scripts/tests/submodule_sync_test.sh": "submodule_sync.sh names its separate regression suite in comments; daily unit tests use fixture synchronization owners",
+    "scripts/check_dependency_cycle_anchor.py": (
+        "submodule_sync.sh names it in a comment on why a shared store is never made shallow; it does not execute it"
+    ),
     "scripts/prove_rust_free_build.sh": (
         "mint_and_prove_seed.sh names it in help; the imported Clean input "
         "test executes only the extracted run_clean function"

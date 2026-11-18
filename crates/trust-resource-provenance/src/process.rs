@@ -24,6 +24,22 @@ pub struct Identity {
     pub exec_version: u32,
 }
 
+// Read-only lifecycle DATA. Original execution/ancestry callers continue to
+// require read_identity's live-only contract; only activity sampling consumes
+// positive terminal observations, without waiting, signalling, or reaping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservedIdentity {
+    Live(Identity),
+    Exited(Identity),
+}
+impl ObservedIdentity {
+    fn identity(self) -> Identity {
+        match self {
+            Self::Live(value) | Self::Exited(value) => value,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Presence {
     Absent,
@@ -230,24 +246,49 @@ const _: () = assert!(
 
 #[cfg(target_os = "macos")]
 pub fn read_identity(pid: u32) -> io::Result<Identity> {
+    let observed = observe_identity(pid).map_err(|error| {
+        // Keep the existing execution/ancestry reader's refusal contract.
+        // Raw disappearance errno is private activity-observation DATA only.
+        if error.raw_os_error().is_some() {
+            refused("complete native process identity unavailable")
+        } else {
+            error
+        }
+    })?;
+    match observed {
+        ObservedIdentity::Live(identity) => Ok(identity),
+        ObservedIdentity::Exited(_) => Err(refused("live same-user process unavailable")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn observe_identity(pid: u32) -> io::Result<ObservedIdentity> {
     let pid = i32::try_from(pid).map_err(|_| refused("invalid process PID"))?;
     if pid <= 1 {
         return Err(refused("invalid process PID"));
     }
     let mut info = std::mem::MaybeUninit::<BsdInfoWithUniqId>::zeroed();
     let size = std::mem::size_of::<BsdInfoWithUniqId>() as i32;
-    // SAFETY: this is aterm's maintained flavor-18 ABI; info is size writable bytes.
-    let n = unsafe { libc::proc_pidinfo(pid, 18, 0, info.as_mut_ptr().cast(), size) };
+    // SAFETY: this is the maintained flavor-18 ABI; info is size writable
+    // bytes, and __error returns this thread's writable errno slot.
+    let (n, errno) = unsafe {
+        *libc::__error() = 0;
+        // XNU proc_info.c's findzomb branch requires a nonzero arg for
+        // flavor18. Retain the complete native birth/unique-ID record for
+        // terminal observation; read_identity still refuses Exited below.
+        let n = libc::proc_pidinfo(pid, 18, 1, info.as_mut_ptr().cast(), size);
+        (n, *libc::__error())
+    };
     if n != size {
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         return Err(refused("complete native process identity unavailable"));
     }
     // SAFETY: the kernel filled the complete plain-data record.
     let info = unsafe { info.assume_init() };
     // SAFETY: geteuid reads only the current process's effective identity.
-    if info.bsd.pbi_pid != pid as u32
-        || info.bsd.pbi_uid != unsafe { libc::geteuid() }
-        || info.bsd.pbi_status == 5
-    {
+    if info.bsd.pbi_pid != pid as u32 || info.bsd.pbi_uid != unsafe { libc::geteuid() } {
         return Err(refused("live same-user process unavailable"));
     }
     let birth = info
@@ -257,13 +298,18 @@ pub fn read_identity(pid: u32) -> io::Result<Identity> {
         .and_then(|s| s.checked_add(info.bsd.pbi_start_tvusec))
         .filter(|b| *b != 0)
         .ok_or_else(|| refused("invalid BSD process birth"))?;
-    Ok(Identity {
+    let identity = Identity {
         pid: pid as u32,
         parent: info.bsd.pbi_ppid,
         birth,
         unique_id: info.unique,
         parent_unique_id: info.parent_unique,
         exec_version: info.version as u32,
+    };
+    Ok(if info.bsd.pbi_status == 5 {
+        ObservedIdentity::Exited(identity)
+    } else {
+        ObservedIdentity::Live(identity)
     })
 }
 
@@ -382,6 +428,14 @@ impl ProcDir {
 
 #[cfg(target_os = "linux")]
 fn stat(bytes: &[u8], pid: u32) -> io::Result<Identity> {
+    match stat_observation(bytes, pid)? {
+        ObservedIdentity::Live(identity) => Ok(identity),
+        ObservedIdentity::Exited(_) => Err(refused("proc process unavailable")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stat_observation(bytes: &[u8], pid: u32) -> io::Result<ObservedIdentity> {
     let text = std::str::from_utf8(bytes).map_err(|_| refused("invalid proc stat"))?;
     let (number, _) = text.split_once('(').ok_or_else(|| refused("missing proc comm"))?;
     let fields = text
@@ -390,9 +444,7 @@ fn stat(bytes: &[u8], pid: u32) -> io::Result<Identity> {
         .1
         .split_whitespace()
         .collect::<Vec<_>>();
-    if number.trim().parse::<u32>().ok() != Some(pid)
-        || fields.first().is_none_or(|s| matches!(*s, "Z" | "X" | "x"))
-    {
+    if number.trim().parse::<u32>().ok() != Some(pid) || fields.first().is_none() {
         return Err(refused("proc process unavailable"));
     }
     let parent =
@@ -402,11 +454,19 @@ fn stat(bytes: &[u8], pid: u32) -> io::Result<Identity> {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n != 0)
         .ok_or_else(|| refused("invalid proc birth"))?;
-    Ok(Identity { pid, parent, birth, unique_id: birth, parent_unique_id: 0, exec_version: 0 })
+    let identity =
+        Identity { pid, parent, birth, unique_id: birth, parent_unique_id: 0, exec_version: 0 };
+    Ok(if fields.first().is_some_and(|state| matches!(*state, "Z" | "X" | "x")) {
+        ObservedIdentity::Exited(identity)
+    } else {
+        ObservedIdentity::Live(identity)
+    })
 }
 
 #[cfg(target_os = "linux")]
 pub fn read_identity(pid: u32) -> io::Result<Identity> {
+    // Preserve the execution/ancestry owner's strict original read, including
+    // refusal before any later observation of a terminal process.
     if pid <= 1 || pid > i32::MAX as u32 {
         return Err(refused("invalid process PID"));
     }
@@ -418,12 +478,44 @@ pub fn read_identity(pid: u32) -> io::Result<Identity> {
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
         .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u32>().ok());
-    // SAFETY: geteuid reads only the current process identity.
+        .and_then(|value| value.parse::<u32>().ok());
+    // SAFETY: geteuid reads only this process's effective identity.
     if uid != Some(unsafe { libc::geteuid() }) || stat(&dir.read(c"stat")?, pid)? != before {
         return Err(refused("proc identity changed or foreign"));
     }
     Ok(before)
+}
+
+#[cfg(target_os = "linux")]
+fn observe_identity(pid: u32) -> io::Result<ObservedIdentity> {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return Err(refused("invalid process PID"));
+    }
+    let dir = ProcDir::open(pid)?;
+    let before = stat_observation(&dir.read(c"stat")?, pid)?;
+    let status = dir.read(c"status")?;
+    let text = std::str::from_utf8(&status).map_err(|_| refused("invalid proc status"))?;
+    let uid = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u32>().ok());
+    // SAFETY: geteuid reads only the current process identity.
+    if uid != Some(unsafe { libc::geteuid() }) {
+        return Err(refused("proc identity changed or foreign"));
+    }
+    let after = stat_observation(&dir.read(c"stat")?, pid)?;
+    if before != after
+        && !matches!((before, after), (ObservedIdentity::Live(left), ObservedIdentity::Exited(right)) if left == right)
+    {
+        return Err(refused("proc identity changed or foreign"));
+    }
+    Ok(after)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn observe_identity(pid: u32) -> io::Result<ObservedIdentity> {
+    read_identity(pid).map(ObservedIdentity::Live)
 }
 
 #[cfg(target_os = "linux")]
@@ -586,3 +678,7 @@ mod signal_lease;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use signal_lease::OWNED_GROUP_SIGNALS;
 pub use signal_lease::{ChildSignalLease, pending_child_signal};
+
+#[path = "process/activity.rs"]
+mod activity;
+pub use activity::{TreeActivity, TreeActivityObservation};

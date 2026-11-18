@@ -14,18 +14,23 @@ use sha2::{Digest, Sha256};
 use trust_types::{Formula, Sort};
 
 mod call_instance;
+#[cfg(feature = "fmrel")]
+mod fmrel;
 #[cfg(feature = "kernel-recheck")]
 mod frame_environment;
+mod retained_terms;
 mod subject;
 mod terms;
 pub(crate) use call_instance::{
     specialize_original_for_call, specialize_original_for_expected_transition,
 };
+use retained_terms::RetainedTerms;
 pub(crate) use subject::SubjectBinding;
 pub(crate) use terms::TermPacket;
 
 const MODEL: u32 = 2;
 const FRAME_MODEL: u32 = 3;
+const FORMULA_MODEL: u32 = 4;
 const MAX_WIRE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_REPLAY_FUNCTIONS: usize = 32;
@@ -34,6 +39,21 @@ const MAX_CONJUNCTS: usize = 256;
 const RECIPE: &str = "clean.with_prelude+init_bv_coercion+original-m8-data-parameters/v2";
 const FRAME_RECIPE: &str = "clean.with_prelude+init_bv_coercion+retained-byte-shift-v1+retained-frame-offsets-v1+retained-frame-reads-v1+retained-frame-word-transport-v1+retained-frame-word-assembly-v1+original-m8-data-parameters/v3";
 const LEGACY_RECIPE: &str = "clean.with_prelude+init_bv_coercion+original-m8-data-parameters/v1";
+const FORMULA_RECIPE: &str =
+    "trust-ir.formula-v2-original-bytes+checked-source-goal+final-source-proof/v4";
+
+/// Portable advice only. The shared TrustIR codecs impose their own decoding
+/// bounds; neither these bytes nor the cohort digest constitute admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FormulaEvidence {
+    cohort_sha256: String,
+    foundations: Vec<String>,
+    declarations: Vec<u8>,
+    relation: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preconditions: Option<Vec<u8>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,13 +73,15 @@ pub struct OriginalConjunctionPacket {
     original_sha256: String,
     context: SymbolicContext,
     context_sha256: String,
-    terms: TermPacket,
+    terms: RetainedTerms,
     goal_sha256: String,
     proof_sha256: String,
     environment_sha256: String,
     environment_mode: String,
     environment_recipe: String,
     kernel_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    formula_evidence: Option<FormulaEvidence>,
 }
 
 /// This private construction boundary is intentionally not Deserialize.
@@ -99,6 +121,24 @@ pub struct OriginalConjunctionCertificate {
     packet: OriginalConjunctionPacket,
 }
 impl OriginalConjunctionCertificate {
+    pub(crate) fn uses_formula_semantics(&self) -> bool {
+        self.packet.model == FORMULA_MODEL
+    }
+
+    #[cfg(feature = "fmrel")]
+    pub(crate) fn replay_formula(
+        &self,
+        original: &[(Formula, Formula)],
+        preconditions: &[(Formula, Formula)],
+    ) -> Result<CheckedOriginalConjunction, String> {
+        self.packet.validate()?;
+        if !self.uses_formula_semantics() {
+            return Err("retained Formula replay requires its distinct model".into());
+        }
+        crate::verify_output_instantiate::on_route_stack(|| {
+            fmrel::replay_with_preconditions(&self.packet, original, preconditions)
+        })
+    }
     pub(crate) fn bind(
         checked: &CheckedOriginalConjunction,
         input: &crate::call_event::CerInput<'_>,
@@ -141,6 +181,7 @@ impl OriginalConjunctionCertificate {
     pub fn encoded_bytes(&self) -> Result<usize, String> {
         bounded_len(self, MAX_WIRE_BYTES)
     }
+    /// Carrier records (Expr records in v1; Name/Level/Expr records in CEXDAG02).
     pub fn term_nodes(&self) -> usize {
         self.packet.terms.node_count()
     }
@@ -219,7 +260,7 @@ fn digest_is_valid(value: &str) -> bool {
 }
 impl OriginalConjunctionPacket {
     fn validate(&self) -> Result<(), String> {
-        if !matches!(self.model, 1 | MODEL | FRAME_MODEL)
+        if !matches!(self.model, 1 | MODEL | FRAME_MODEL | FORMULA_MODEL)
             || self.original.is_empty()
             || self.original.len() > MAX_CONJUNCTS
             || !self.context.exact_byte_arrays
@@ -230,6 +271,7 @@ impl OriginalConjunctionPacket {
                 != match self.model {
                     1 => LEGACY_RECIPE,
                     FRAME_MODEL => FRAME_RECIPE,
+                    FORMULA_MODEL => FORMULA_RECIPE,
                     _ => RECIPE,
                 }
             || self.kernel_version.is_empty()
@@ -246,6 +288,19 @@ impl OriginalConjunctionPacket {
             return Err(
                 "retained original proof: model/population/context/environment identity".into()
             );
+        }
+        match (&self.formula_evidence, self.model) {
+            (Some(evidence), FORMULA_MODEL)
+                if digest_is_valid(&evidence.cohort_sha256)
+                    && !evidence.declarations.is_empty()
+                    && !evidence.relation.is_empty()
+                    && evidence.declarations.len() <= MAX_WIRE_BYTES
+                    && evidence.relation.len() <= MAX_WIRE_BYTES => {}
+            (None, 1 | MODEL | FRAME_MODEL) => {}
+            _ => return Err("retained original proof: Formula evidence/model mismatch".into()),
+        }
+        if self.terms.is_formula() != (self.model == FORMULA_MODEL) {
+            return Err("retained original proof: term carrier/model mismatch".into());
         }
         self.terms.validate()?;
         if encoded_hash(&self.original, MAX_ORIGINAL_BYTES)?.0 != self.original_sha256
@@ -275,6 +330,12 @@ impl OriginalConjunctionPacket {
                 "retained original proof: independently expected original equations mismatch"
                     .into(),
             );
+        }
+        if self.model == FORMULA_MODEL {
+            #[cfg(feature = "fmrel")]
+            return fmrel::replay(self, original);
+            #[cfg(not(feature = "fmrel"))]
+            return Err("retained original proof: canonical Formula replay unavailable".into());
         }
         let (expected, context) =
             crate::verify_output_instantiate::original_conjunction_goal_version(
@@ -309,14 +370,19 @@ impl OriginalConjunctionPacket {
         Ok(CheckedOriginalConjunction { packet: Arc::new(self.clone()), label: self.label() })
     }
     fn label(&self) -> String {
-        format!(
+        let mut label = format!(
             "Clean.CIC.original-conjunction/v{} n={} inputs-sha256={} goal-sha256={} proof-sha256={}",
             self.model,
             self.original.len(),
             self.original_sha256,
             self.goal_sha256,
             self.proof_sha256
-        )
+        );
+        if let Some(evidence) = &self.formula_evidence {
+            label.push_str(" conditional-foundations=");
+            label.push_str(&evidence.foundations.join(","));
+        }
+        label
     }
 }
 
@@ -427,6 +493,25 @@ pub(crate) fn check_produced(
     check_supplied(original, goal, proof)
 }
 
+/// Canonical Formula route has a distinct retained recipe and admission
+/// boundary. Unavailable source operations and artifact cohorts refuse.
+#[cfg(feature = "fmrel")]
+pub(crate) fn check_formula_produced(
+    original: &[(Formula, Formula)],
+) -> Result<CheckedOriginalConjunction, String> {
+    crate::verify_output_instantiate::on_route_stack(|| fmrel::produce(original))
+}
+
+#[cfg(feature = "fmrel")]
+pub(crate) fn check_formula_with_preconditions(
+    original: &[(Formula, Formula)],
+    preconditions: &[(Formula, Formula)],
+) -> Result<CheckedOriginalConjunction, String> {
+    crate::verify_output_instantiate::on_route_stack(|| {
+        fmrel::produce_with_preconditions(original, preconditions)
+    })
+}
+
 /// Shared private supplied-proof boundary: independently render the full exact
 /// goal, enforce the retained codec/environment limits, and perform ONE actual
 /// check_type. Unlike the producer entry it may run under without_production.
@@ -449,13 +534,14 @@ fn check_supplied(
         original_sha256: encoded_hash(&original, MAX_ORIGINAL_BYTES)?.0,
         context_sha256: encoded_hash(&context, MAX_ORIGINAL_BYTES)?.0,
         context,
-        terms: TermPacket::capture(goal, proof)?,
+        terms: TermPacket::capture(goal, proof)?.into(),
         goal_sha256: encoded_hash(goal, 64 * 1024 * 1024)?.0,
         proof_sha256: encoded_hash(proof, 64 * 1024 * 1024)?.0,
         environment_sha256: environment_digest(&environment, model)?,
         environment_mode: format!("{:?}", environment.mode()),
         environment_recipe: if model == FRAME_MODEL { FRAME_RECIPE } else { RECIPE }.into(),
         kernel_version: clean_kernel::VERSION.into(),
+        formula_evidence: None,
     };
     packet.validate()?;
     let result = clean_kernel::TypeChecker::with_mode(&environment, environment.mode())

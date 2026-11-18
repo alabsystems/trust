@@ -58,6 +58,33 @@ impl Observation {
     pub fn stage(&self) -> u32 {
         self.stage
     }
+
+    /// Original opened backings that maintenance must not detach or unlink.
+    /// These identities only constrain a deletion plan; they grant no health,
+    /// execution, SDK or proof authority. Incomplete probes retain their inputs too.
+    pub fn retained_input_identities(&self) -> io::Result<Vec<(u64, u64)>> {
+        let Some(kept) = &self.kept else {
+            if self.original.is_some() || !self.std.is_empty() {
+                return Err(invalid("cache-health input keeper is unavailable"));
+            }
+            return Ok(Vec::new());
+        };
+        let until = deadline()?;
+        kept.0.validate(until)?;
+        inputs::recheck_std(&self.std, until)?;
+        let original = kept.0.observation();
+        if self.original.as_ref() != Some(original) {
+            return Err(invalid("cache-health input observation differs from its original keeper"));
+        }
+        let mut identities: Vec<_> = std::iter::once(&original.executable)
+            .chain(&original.runtime)
+            .map(|file| (file.device, file.inode))
+            .chain(inputs::original_identities(&self.std))
+            .collect();
+        identities.sort_unstable();
+        identities.dedup();
+        Ok(identities)
+    }
 }
 
 struct KeptProgram(Arc<HeldProgram>);

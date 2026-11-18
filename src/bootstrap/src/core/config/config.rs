@@ -51,8 +51,8 @@ use crate::core::config::toml::target::{
 };
 use crate::core::config::{
     Allocator, CompilerBuiltins, CompressDebuginfo, DebuggerPath, DebuginfoLevel, DryRun,
-    LlvmCiMode, LlvmLibunwind, Merge, ReplaceOpt, RustcLto, SplitDebuginfo, StringOrBool,
-    TargetSelection, threads_from_config,
+    LlvmCiMode, LlvmLibunwind, ReplaceOpt, RustcLto, SplitDebuginfo, StringOrBool, TargetSelection,
+    threads_from_config,
 };
 use crate::core::download::{DownloadContext, is_download_ci_available};
 use crate::utils::channel::{self, GitInfo};
@@ -488,7 +488,60 @@ impl InputLayout {
     }
 }
 
+/// Exact observations of the configured seed selectors. These paths and
+/// digests are DATA, not authenticated tools, source custody or seed admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeedConfiguration {
+    rustc: Option<PathBuf>,
+    cargo: Option<PathBuf>,
+    inputs: Vec<(PathBuf, String)>,
+}
+
+impl SeedConfiguration {
+    pub fn rustc_override(&self) -> Option<&Path> {
+        self.rustc.as_deref()
+    }
+    pub fn cargo_override(&self) -> Option<&Path> {
+        self.cargo.as_deref()
+    }
+    pub fn inputs(&self) -> &[(PathBuf, String)] {
+        &self.inputs
+    }
+}
+
 impl Config {
+    /// Trust: the freshness gate selects no --set overrides, matching its
+    /// existing contract. Reuse the ordinary strict typed parser and actual
+    /// include/profile merger without constructing Config, Session or a child.
+    /// The caller supplies its original source classification and retains any
+    /// required read custody through this observation.
+    pub(crate) fn seed_configuration(
+        source: &Path,
+        config_path: Option<PathBuf>,
+        source_is_tarball: bool,
+    ) -> std::io::Result<SeedConfiguration> {
+        let inputs = std::cell::RefCell::new(Vec::new());
+        let reader = |path: &Path| {
+            let absolute =
+                if path.is_absolute() { path.to_owned() } else { env::current_dir()?.join(path) };
+            let parsed = Self::try_get_toml_source(path, |contents| {
+                inputs.borrow_mut().push((
+                    absolute.clone(),
+                    crate::utils::trust_repo_cache::bytes_digest(contents.as_bytes()),
+                ));
+            })?;
+            parsed.map_err(|error| configuration_parse_error(path, error))
+        };
+        let (mut toml, path) = try_load_toml_config(source, config_path, &reader)?;
+        try_postprocess_includes_and_profile(&mut toml, source, path, &reader, source_is_tarball)?;
+        let build = toml.build.unwrap_or_default();
+        Ok(SeedConfiguration {
+            rustc: build.rustc,
+            cargo: build.cargo,
+            inputs: inputs.into_inner(),
+        })
+    }
+
     /// Raw Config inputs share the SAME actual source producer as TOML. The
     /// ordinary readers/parsers still choose paths and interpret returned text.
     pub(crate) fn read_source_text(path: &Path) -> std::io::Result<String> {
@@ -2505,6 +2558,53 @@ fn load_toml_config(
     config_path: Option<PathBuf>,
     get_toml: &impl Fn(&Path) -> Result<TomlConfig, toml::de::Error>,
 ) -> (TomlConfig, Option<PathBuf>) {
+    try_load_toml_config(src, config_path, &|path| {
+        get_toml(path).map_err(|error| configuration_parse_error(path, error))
+    })
+    .unwrap_or_else(|error| configuration_error(error))
+}
+
+// Trust: ordinary Bootstrap retains its exit diagnostic at the wrapper. A
+// native observer receives the original I/O kind or an invalid-config error.
+pub(super) fn configuration_error(error: std::io::Error) -> ! {
+    if let Some(parsed) = error.get_ref().and_then(|error| error.downcast_ref::<TomlConfigError>())
+    {
+        bad_config(&parsed.path, &parsed.error);
+    }
+    if cfg!(test) {
+        panic!("{error}");
+    }
+    eprintln!("ERROR: {error}");
+    helpers::exit_process(2);
+}
+
+#[derive(Debug)]
+struct TomlConfigError {
+    path: PathBuf,
+    error: toml::de::Error,
+}
+impl std::fmt::Display for TomlConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Failed to parse '{}': {}", self.path.display(), self.error)
+    }
+}
+impl std::error::Error for TomlConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+pub(super) fn configuration_parse_error(path: &Path, error: toml::de::Error) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        TomlConfigError { path: path.to_owned(), error },
+    )
+}
+
+fn try_load_toml_config(
+    src: &Path,
+    config_path: Option<PathBuf>,
+    get_toml: &impl Fn(&Path) -> std::io::Result<TomlConfig>,
+) -> std::io::Result<(TomlConfig, Option<PathBuf>)> {
     // Locate the configuration file using the following priority (first match wins):
     // 1. `--config <path>` (explicit flag)
     // 2. `RUST_BOOTSTRAP_CONFIG` environment variable
@@ -2516,11 +2616,11 @@ fn load_toml_config(
     let using_default_path = toml_path.is_none();
     let mut toml_path = toml_path.unwrap_or_else(|| PathBuf::from("bootstrap.toml"));
 
-    if using_default_path && !toml_path.exists() {
+    if using_default_path && !toml_path.try_exists()? {
         toml_path = src.join(PathBuf::from("bootstrap.toml"));
-        if !toml_path.exists() {
+        if !toml_path.try_exists()? {
             toml_path = PathBuf::from("config.toml");
-            if !toml_path.exists() {
+            if !toml_path.try_exists()? {
                 toml_path = src.join(PathBuf::from("config.toml"));
             }
         }
@@ -2528,16 +2628,16 @@ fn load_toml_config(
 
     // Give a hard error if `--config` or `RUST_BOOTSTRAP_CONFIG` are set to a missing path,
     // but not if `bootstrap.toml` hasn't been created.
-    if !using_default_path || toml_path.exists() {
+    if !using_default_path || toml_path.try_exists()? {
         let path = Some(if cfg!(not(test)) {
-            toml_path = Config::canonicalize_toml_path(&toml_path).unwrap();
+            toml_path = Config::canonicalize_toml_path(&toml_path)?;
             toml_path.clone()
         } else {
             toml_path.clone()
         });
-        (get_toml(&toml_path).unwrap_or_else(|e| bad_config(&toml_path, e)), path)
+        Ok((get_toml(&toml_path)?, path))
     } else {
-        (TomlConfig::default(), None)
+        Ok((TomlConfig::default(), None))
     }
 }
 
@@ -2553,6 +2653,7 @@ fn postprocess_toml(
     postprocess_toml_with_git_info(toml, src_dir, toml_path, override_set, get_toml, &git_info);
 }
 
+// Trust: every include/profile/override shares this exact caller reader.
 fn postprocess_toml_with_git_info(
     toml: &mut TomlConfig,
     src_dir: &Path,
@@ -2561,7 +2662,28 @@ fn postprocess_toml_with_git_info(
     get_toml: &impl Fn(&Path) -> Result<TomlConfig, toml::de::Error>,
     git_info: &GitInfo,
 ) {
-    if git_info.is_from_tarball() && toml.profile.is_none() {
+    try_postprocess_includes_and_profile(
+        toml,
+        src_dir,
+        toml_path,
+        &|path| get_toml(path).map_err(|error| configuration_parse_error(path, error)),
+        git_info.is_from_tarball(),
+    )
+    .unwrap_or_else(|error| configuration_error(error));
+
+    apply_toml_overrides(toml, override_set, get_toml);
+}
+
+// Trust: this is the ONE include/profile algorithm, shared by ordinary Config
+// and the fallible seed-selector projection. It performs no --set merging.
+fn try_postprocess_includes_and_profile(
+    toml: &mut TomlConfig,
+    src_dir: &Path,
+    toml_path: Option<PathBuf>,
+    get_toml: &impl Fn(&Path) -> std::io::Result<TomlConfig>,
+    source_is_tarball: bool,
+) -> std::io::Result<()> {
+    if source_is_tarball && toml.profile.is_none() {
         toml.profile = Some("dist".into());
     }
 
@@ -2573,19 +2695,29 @@ fn postprocess_toml_with_git_info(
     for include_path in toml.include.clone().unwrap_or_default().iter().rev() {
         let include_path = toml_path
             .as_ref()
-            .expect("include found in default TOML config")
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "include found in default TOML config",
+                )
+            })?
             .parent()
-            .unwrap()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "configuration has no parent directory",
+                )
+            })?
             .join(include_path);
 
-        let included_toml =
-            get_toml(&include_path).unwrap_or_else(|e| bad_config(&include_path, e));
-        toml.merge(
+        let included_toml = get_toml(&include_path)?;
+        toml.try_merge_with_reader(
             Some(include_path),
             &mut Default::default(),
             included_toml,
             ReplaceOpt::IgnoreDuplicate,
-        );
+            get_toml,
+        )?;
     }
 
     if let Some(include) = &toml.profile {
@@ -2602,21 +2734,23 @@ fn postprocess_toml_with_git_info(
         include_path.push("bootstrap");
         include_path.push("defaults");
         include_path.push(format!("bootstrap.{include}.toml"));
-        let included_toml = get_toml(&include_path).unwrap_or_else(|e| {
-            eprintln!(
-                "ERROR: Failed to parse default config profile at '{}': {e}",
-                include_path.display()
-            );
-            helpers::exit_process(2);
-        });
-        toml.merge(
+        let included_toml = get_toml(&include_path)?;
+        toml.try_merge_with_reader(
             Some(include_path),
             &mut Default::default(),
             included_toml,
             ReplaceOpt::IgnoreDuplicate,
-        );
+            get_toml,
+        )?;
     }
+    Ok(())
+}
 
+fn apply_toml_overrides(
+    toml: &mut TomlConfig,
+    override_set: &[String],
+    get_toml: &impl Fn(&Path) -> Result<TomlConfig, toml::de::Error>,
+) {
     let mut override_toml = TomlConfig::default();
     for option in override_set.iter() {
         fn get_table(option: &str) -> Result<TomlConfig, toml::de::Error> {
@@ -2625,7 +2759,13 @@ fn postprocess_toml_with_git_info(
 
         let mut err = match get_table(option) {
             Ok(v) => {
-                override_toml.merge(None, &mut Default::default(), v, ReplaceOpt::ErrorOnDuplicate);
+                override_toml.merge_with_reader(
+                    None,
+                    &mut Default::default(),
+                    v,
+                    ReplaceOpt::ErrorOnDuplicate,
+                    get_toml,
+                );
                 continue;
             }
             Err(e) => e,
@@ -2637,11 +2777,12 @@ fn postprocess_toml_with_git_info(
         {
             match get_table(&format!(r#"{key}="{value}""#)) {
                 Ok(v) => {
-                    override_toml.merge(
+                    override_toml.merge_with_reader(
                         None,
                         &mut Default::default(),
                         v,
                         ReplaceOpt::ErrorOnDuplicate,
+                        get_toml,
                     );
                     continue;
                 }
@@ -2651,7 +2792,13 @@ fn postprocess_toml_with_git_info(
         eprintln!("failed to parse override `{option}`: `{err}");
         helpers::exit_process(2);
     }
-    toml.merge(None, &mut Default::default(), override_toml, ReplaceOpt::Override);
+    toml.merge_with_reader(
+        None,
+        &mut Default::default(),
+        override_toml,
+        ReplaceOpt::Override,
+        get_toml,
+    );
 }
 
 #[cfg(test)]
@@ -2929,6 +3076,27 @@ pub(crate) fn update_submodule<'a>(
         return;
     }
 
+    // Trust: a second worktree's submodule checkout made by
+    // `scripts/submodule_sync.sh --restore` is a linked worktree of the first
+    // checkout's store. `submodule update` there rewrites the core.worktree
+    // every checkout of that store reads, and the `stash`, `reset --hard` and
+    // `clean -dfx` below act on a store and a stash the first checkout
+    // shares. Move such a checkout only through the script.
+    if let Some(store) = linked_submodule_store(&absolute_path) {
+        if !dwn_ctx.exec_ctx.dry_run() {
+            eprintln!(
+                "ERROR: submodule {relative_path} is not at its pin ({actual_hash}), and its \
+                 checkout is a linked worktree of {}, a store other checkouts read.\n\
+                 bootstrap does not update it: `git submodule update` there would rewrite that \
+                 store's core.worktree, and its reset and clean could act on another checkout.\n\
+                 Move it with:  scripts/submodule_sync.sh --restore",
+                store.display()
+            );
+            helpers::exit_process(1);
+        }
+        return;
+    }
+
     if !dwn_ctx.exec_ctx.dry_run() {
         println!("Updating submodule {relative_path}");
     };
@@ -2986,6 +3154,23 @@ pub(crate) fn update_submodule<'a>(
     }
 }
 
+/// The store a submodule checkout shares when it is a linked worktree: its
+/// `.git` file names a git directory with a `commondir`, as
+/// `scripts/submodule_sync.sh --restore` makes a second worktree's. A
+/// checkout's own store (a `.git` directory, or a `.git` file naming
+/// `modules/<name>`) and an empty directory give `None`.
+pub(crate) fn linked_submodule_store(checkout: &Path) -> Option<PathBuf> {
+    let dot_git = checkout.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let line = fs::read_to_string(&dot_git).ok()?;
+    let target = line.lines().next()?.strip_prefix("gitdir: ")?.trim_end();
+    let git_dir = checkout.join(target);
+    let common = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    Some(git_dir.join(common.trim_end()))
+}
+
 pub fn git_info(exec_ctx: &ExecutionContext, omit_git_hash: bool, dir: &Path) -> GitInfo {
     GitInfo::new(omit_git_hash, dir, exec_ctx)
 }
@@ -3014,7 +3199,7 @@ pub(crate) fn read_file_by_commit<'a>(
     git.run_capture_stdout(dwn_ctx.exec_ctx).stdout()
 }
 
-fn bad_config(toml_path: &Path, e: toml::de::Error) -> ! {
+fn bad_config(toml_path: &Path, e: &toml::de::Error) -> ! {
     eprintln!("ERROR: Failed to parse '{}': {e}", toml_path.display());
     let e_s = e.to_string();
     if e_s.contains("unknown field")

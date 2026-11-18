@@ -1,4 +1,12 @@
 fn main() {
+    assert_eq!(zero_capture_direct_fn(), 43);
+    assert_eq!(zero_capture_direct_fn_mut_request(), 47);
+    assert_eq!(zero_capture_once(), 41);
+    assert_eq!(zero_capture_once_receiver_effects(), 141);
+    assert_eq!(distinct_nested_once_targets(), 417);
+    assert!(mutable_once_home_guard());
+    assert!(once_home_address_binding_guard());
+    assert!(once_home_other_comparison_guard());
     assert_eq!(by_value_repeated(), 2);
     assert_eq!(by_reference_repeated(), 2);
     assert_eq!(copied_value_environments(), 32);
@@ -20,4 +28,6 @@ fn main() {
     }
     assert_eq!(by_value_array_guard(), 1);
     assert_eq!(ordinary_tuple_guard(), 2);
+    assert_eq!(nested_once_effects(), 10);
+    assert_eq!(nested_once_failure(), 51);
 }

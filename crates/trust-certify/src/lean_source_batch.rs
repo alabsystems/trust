@@ -20,7 +20,8 @@
 //! Exactly the supplied module keys and explicitly indexed aliases are marked
 //! satisfied-from-source. An alias names one checked snapshot, never an
 //! additional unchecked input or an external module. External
-//! `.olean` loading remains disabled; lazy/prelude enumeration is not certified
+//! source-driven `.olean` loading remains disabled. The opt-in initializer
+//! separately materializes configured pinned Init; lazy enumeration is not certified
 //! exhaustive; added eager declarations include proofs and generated kernel
 //! helpers, not a complete erased/specialized runtime-body universe. A consumer
 //! must separately establish carrier refinement, reachability, and codegen
@@ -39,6 +40,7 @@
 //! `targo trust meter`; no verdict, binding or digest reads it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clean_kernel::{Environment, Name};
@@ -47,6 +49,127 @@ use trust_types::digest::canonical_json_sha256;
 use crate::clean_census::owned_names;
 use crate::clean_island::CleanIslandSession;
 use crate::clean_island_batch::CleanIslandBatch;
+
+pub(crate) mod pinned_reference;
+
+#[cfg(test)]
+mod pinned_tests;
+
+/// An owned, explicitly selected compiler-world source initializer. Its Init
+/// snapshot is producer DATA, never a cached verdict. Each check starts from
+/// a fresh clone and replays the complete owned/judgment cone from empty.
+///
+/// This is opt-in: existing constructors and Rust islands retain their current
+/// environment. It requires the configured/bundled pinned library DATA and
+/// never executes Lean or interprets diagnostic paths as project provenance.
+pub struct PinnedLeanSourceWorld {
+    decision: clean_olean::SourceWorldDecision,
+    setup: clean_elab::module_driver::SourceModuleSetup,
+}
+
+/// Only the initializer above can produce this context. No public arbitrary
+/// environment, digest, deserializer or assertion can seed a source session.
+pub(crate) struct ProducedSourcePrelude {
+    environment: Environment,
+    file_context: clean_elab::FileContext,
+}
+
+impl ProducedSourcePrelude {
+    pub(crate) fn into_parts(self) -> (Environment, clean_elab::FileContext) {
+        (self.environment, self.file_context)
+    }
+}
+
+impl PinnedLeanSourceWorld {
+    /// Select existing pinned library DATA and materialize genuine Init with
+    /// Clean's maintained source-module producer. Missing/foreign inputs fail;
+    /// there is no fallback to the legacy built-in context.
+    pub fn new() -> Result<Self, String> {
+        let decision =
+            clean_olean::source_world_for_snapshot().map_err(|error| error.to_string())?;
+        Self::from_decision(decision)
+    }
+
+    fn from_decision(decision: clean_olean::SourceWorldDecision) -> Result<Self, String> {
+        // Clean's general source setup deliberately supports an Oracle
+        // bootstrap when project artifact imports are denied. This opt-in
+        // genuine-Init path must refuse that decision before any setup.
+        decision.imports().map_err(|error| {
+            format!("compiler-world source initializer refuses artifact inputs: {error}")
+        })?;
+        let mut setup = clean_elab::module_driver::SourceModuleSetup::new(
+            clean_elab::module_driver::EnvironmentSetup::default(),
+            &decision,
+        )
+        .map_err(|error| error.to_string())?;
+        setup
+            .initial_environment(&clean_parser::FileHeader::default())
+            .map_err(|error| error.to_string())?;
+        Ok(Self { decision, setup })
+    }
+
+    /// Read-only selection DATA. It authenticates neither all library bytes
+    /// nor external search paths and supplies no source/proof/codegen grade.
+    #[must_use]
+    pub fn decision(&self) -> &clean_olean::SourceWorldDecision {
+        &self.decision
+    }
+
+    #[must_use]
+    pub fn check(
+        &mut self,
+        sources: Vec<LeanSourceInput>,
+        collect_census: bool,
+    ) -> CheckedLeanSourceBatch {
+        self.check_with_aliases(sources, Vec::new(), collect_census)
+    }
+
+    #[must_use]
+    pub fn check_with_aliases(
+        &mut self,
+        sources: Vec<LeanSourceInput>,
+        aliases: Vec<LeanSourceAlias>,
+        collect_census: bool,
+    ) -> CheckedLeanSourceBatch {
+        CheckedLeanSourceBatch::check_impl(sources, aliases, collect_census, false, Some(self))
+    }
+
+    #[must_use]
+    pub fn check_with_aliases_and_runtime_baseline(
+        &mut self,
+        sources: Vec<LeanSourceInput>,
+        aliases: Vec<LeanSourceAlias>,
+        collect_census: bool,
+    ) -> CheckedLeanSourceBatch {
+        CheckedLeanSourceBatch::check_impl(sources, aliases, collect_census, true, Some(self))
+    }
+
+    #[must_use]
+    pub fn check_with_runtime_baseline(
+        &mut self,
+        sources: Vec<LeanSourceInput>,
+        collect_census: bool,
+    ) -> CheckedLeanSourceBatch {
+        self.check_with_aliases_and_runtime_baseline(sources, Vec::new(), collect_census)
+    }
+
+    fn fresh_prelude(&self, sources: &[LeanSourceInput]) -> Result<ProducedSourcePrelude, String> {
+        for source in sources {
+            let header = clean_parser::Parser::parse_header(&source.source)
+                .map_err(|error| format!("source `{}` header: {error}", source.module))?;
+            if header.is_prelude {
+                return Err(
+                    "the opt-in pinned Init source API does not yet support prelude modules".into(),
+                );
+            }
+        }
+        let mut fresh = self.setup.isolated();
+        let (environment, file_context) = fresh
+            .initial_environment_and_file_context(&clean_parser::FileHeader::default())
+            .map_err(|error| error.to_string())?;
+        Ok(ProducedSourcePrelude { environment, file_context })
+    }
+}
 
 /// Untrusted inputs, not evidence. The constructor checks these actual bytes;
 /// labels are retained verbatim and do not assert filesystem provenance.
@@ -76,7 +199,9 @@ pub struct LeanSourceAlias {
 pub struct LeanBatchTiming {
     /// Starting the fresh strict session: the kernel prelude and the builtin
     /// PProd prologue, measured before any source is elaborated. `None` when
-    /// the batch was refused before a session started.
+    /// the batch was refused before a session started. The opt-in world
+    /// owner's initial Init import occurs in `PinnedLeanSourceWorld::new`;
+    /// its subsequent checks measure the fresh snapshot clone here.
     pub session_start: Option<Duration>,
     /// Clean's per-declaration records, in elaboration order (see the module
     /// doc: the batch records lexical commands through it, not declarations).
@@ -85,7 +210,34 @@ pub struct LeanBatchTiming {
     pub total: Duration,
 }
 
+/// Private construction binds this opaque custody value to one successfully
+/// accepted source batch. Cloning preserves that same owner; independent
+/// checks always receive a distinct owner even when all disclosed data match.
+///
+/// This is in-memory identity only, never a semantic checker, source hash,
+/// serialized certificate or permission to compile a function.
+#[derive(Clone)]
+pub struct AcceptedSourceContextCustody {
+    identity: Arc<()>,
+}
+
+impl std::fmt::Debug for AcceptedSourceContextCustody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("AcceptedSourceContextCustody").finish_non_exhaustive()
+    }
+}
+
+impl AcceptedSourceContextCustody {
+    /// Compare retained ownership, not source/library equality or proof truth.
+    /// The Arc allocation remains live while any token holds this custody.
+    #[must_use]
+    pub fn same_context(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
 struct AcceptedBinding {
+    custody: AcceptedSourceContextCustody,
     source_closure_sha256: String,
     owned_declarations: BTreeSet<Name>,
     owned_declarations_sha256: String,
@@ -103,6 +255,7 @@ pub struct CheckedLeanSourceBatch {
     binding: Option<AcceptedBinding>,
     runtime_baseline: Option<Environment>,
     timing: LeanBatchTiming,
+    source_world: Option<clean_olean::SourceWorldDecision>,
 }
 
 impl CheckedLeanSourceBatch {
@@ -125,7 +278,7 @@ impl CheckedLeanSourceBatch {
         aliases: Vec<LeanSourceAlias>,
         collect_census: bool,
     ) -> Self {
-        Self::check_impl(sources, aliases, collect_census, false)
+        Self::check_impl(sources, aliases, collect_census, false, None)
     }
 
     /// The identical strict checker with an opt-in read-only pre-source
@@ -148,7 +301,7 @@ impl CheckedLeanSourceBatch {
         aliases: Vec<LeanSourceAlias>,
         collect_census: bool,
     ) -> Self {
-        Self::check_impl(sources, aliases, collect_census, true)
+        Self::check_impl(sources, aliases, collect_census, true, None)
     }
 
     fn check_impl(
@@ -156,10 +309,16 @@ impl CheckedLeanSourceBatch {
         aliases: Vec<LeanSourceAlias>,
         collect_census: bool,
         retain_runtime_baseline: bool,
+        pinned_world: Option<&mut PinnedLeanSourceWorld>,
     ) -> Self {
         let started = Instant::now();
-        let mut checked =
-            Self::check_untimed(sources, aliases, collect_census, retain_runtime_baseline);
+        let mut checked = Self::check_untimed(
+            sources,
+            aliases,
+            collect_census,
+            retain_runtime_baseline,
+            pinned_world,
+        );
         checked.timing.total = started.elapsed();
         checked
     }
@@ -169,6 +328,7 @@ impl CheckedLeanSourceBatch {
         aliases: Vec<LeanSourceAlias>,
         collect_census: bool,
         retain_runtime_baseline: bool,
+        pinned_world: Option<&mut PinnedLeanSourceWorld>,
     ) -> Self {
         let mut checked = Self {
             sources,
@@ -179,6 +339,7 @@ impl CheckedLeanSourceBatch {
             binding: None,
             runtime_baseline: None,
             timing: LeanBatchTiming::default(),
+            source_world: pinned_world.as_ref().map(|world| world.decision.clone()),
         };
         if checked.sources.is_empty() {
             checked
@@ -221,7 +382,13 @@ impl CheckedLeanSourceBatch {
         }
 
         let session_started = Instant::now();
-        let mut session = match CleanIslandSession::new_for_source_batch() {
+        let produced_session = match pinned_world.as_ref() {
+            Some(world) => world
+                .fresh_prelude(&checked.sources)
+                .map(CleanIslandSession::new_for_pinned_source_batch),
+            None => CleanIslandSession::new_for_source_batch(),
+        };
+        let mut session = match produced_session {
             Ok(session) => session,
             Err(error) => {
                 checked.timing.session_start = Some(session_started.elapsed());
@@ -248,7 +415,9 @@ impl CheckedLeanSourceBatch {
         // Clean's recorder is per thread and the batch elaborates on this
         // one; arming it only records.
         clean_elab::begin_decl_timing();
-        let mut attempt = if collect_census {
+        let mut attempt = if checked.source_world.is_some() {
+            session.check_all_pinned_source(&sources, collect_census, &before)
+        } else if collect_census {
             session.check_all_with_census(&sources)
         } else {
             session.check_all(&sources)
@@ -264,7 +433,13 @@ impl CheckedLeanSourceBatch {
         if !attempt.is_rejected() && checked.errors.is_empty() {
             match session.environment() {
                 Some(env) => {
-                    match bind_accepted_sources(env, &before, &checked.sources, &checked.aliases) {
+                    match bind_accepted_sources(
+                        env,
+                        &before,
+                        &checked.sources,
+                        &checked.aliases,
+                        checked.source_world.as_ref(),
+                    ) {
                         Ok(binding) => checked.binding = Some(binding),
                         Err(error) => checked.errors.push(error),
                     }
@@ -330,6 +505,7 @@ impl CheckedLeanSourceBatch {
             environment: self.session.as_ref()?.environment()?,
             binding: self.binding.as_ref()?,
             runtime_baseline: self.runtime_baseline.as_ref(),
+            source_world: self.source_world.as_ref(),
         })
     }
 }
@@ -343,9 +519,23 @@ pub struct AcceptedLeanSourceContext<'a> {
     environment: &'a Environment,
     binding: &'a AcceptedBinding,
     runtime_baseline: Option<&'a Environment>,
+    source_world: Option<&'a clean_olean::SourceWorldDecision>,
 }
 
 impl AcceptedLeanSourceContext<'_> {
+    /// Opaque custody of this actual accepted batch. Reborrows and legitimate
+    /// lazy materialization keep the same owner; no digest can reconstruct it.
+    #[must_use]
+    pub fn custody(&self) -> &AcceptedSourceContextCustody {
+        &self.binding.custody
+    }
+
+    /// The privately retained opt-in world selection, if used. DATA only;
+    /// the complete source check and closed judgments supply acceptance.
+    #[must_use]
+    pub fn source_world(&self) -> Option<&clean_olean::SourceWorldDecision> {
+        self.source_world
+    }
     #[must_use]
     pub fn environment(&self) -> &Environment {
         self.environment
@@ -375,6 +565,9 @@ impl AcceptedLeanSourceContext<'_> {
     /// With aliases, the version is `trust.lean.supplied-source-batch/v2` and
     /// the tuple additionally contains the ordered `(module, source_index)`
     /// alias rows. Alias-free v1 identities remain unchanged.
+    /// The opt-in compiler-world domain additionally binds the selected world
+    /// label. None of these digests authenticates every Init/import byte:
+    /// the retained actual environment and closed replay carry that context.
     /// It binds actual bytes, not caller-provided source digests. Path labels
     /// are identities within this snapshot bundle, NOT filesystem attestation.
     #[must_use]
@@ -409,6 +602,7 @@ fn bind_accepted_sources(
     before: &BTreeSet<Name>,
     sources: &[LeanSourceInput],
     aliases: &[LeanSourceAlias],
+    source_world: Option<&clean_olean::SourceWorldDecision>,
 ) -> Result<AcceptedBinding, String> {
     let after = owned_names(env);
     if !before.is_subset(&after) {
@@ -435,7 +629,16 @@ fn bind_accepted_sources(
             .map_err(|error| format!("cannot bind added Lean kernel payloads: {error}"))?;
     let inputs: Vec<_> =
         sources.iter().map(|source| (&source.module, &source.path, &source.source)).collect();
-    let source_closure_sha256 = if aliases.is_empty() {
+    let source_closure_sha256 = if let Some(world) = source_world {
+        let aliases: Vec<_> =
+            aliases.iter().map(|alias| (&alias.module, alias.source_index)).collect();
+        canonical_json_sha256(&(
+            "trust.lean.compiler-world-source-batch/v1",
+            world.world().to_string(),
+            inputs,
+            aliases,
+        ))
+    } else if aliases.is_empty() {
         canonical_json_sha256(&("trust.lean.supplied-source-batch/v1", inputs))
     } else {
         let aliases: Vec<_> =
@@ -443,7 +646,12 @@ fn bind_accepted_sources(
         canonical_json_sha256(&("trust.lean.supplied-source-batch/v2", inputs, aliases))
     }
     .map_err(|error| format!("cannot bind Lean source snapshots: {error}"))?;
-    Ok(AcceptedBinding { source_closure_sha256, owned_declarations, owned_declarations_sha256 })
+    Ok(AcceptedBinding {
+        custody: AcceptedSourceContextCustody { identity: Arc::new(()) },
+        source_closure_sha256,
+        owned_declarations,
+        owned_declarations_sha256,
+    })
 }
 
 #[cfg(test)]
@@ -456,6 +664,44 @@ mod tests {
             path: format!("{module}.lean"),
             source: text.into(),
         }
+    }
+
+    #[test]
+    fn accepted_context_custody_survives_reborrows_clones_and_owner_moves() {
+        let inputs = vec![source("Custody", "def identity (x : UInt64) : UInt64 := x")];
+        let first = CheckedLeanSourceBatch::check(inputs.clone(), false);
+        let custody = first.accepted_context().unwrap().custody().clone();
+        let cloned = custody.clone();
+        assert!(custody.same_context(&cloned));
+        assert!(custody.same_context(first.accepted_context().unwrap().custody()));
+        let moved = first;
+        assert!(custody.same_context(moved.accepted_context().unwrap().custody()));
+        drop(moved);
+        // The retained Arc keeps the old allocation alive after the batch is
+        // gone, so a subsequent owner cannot authenticate by address reuse.
+        for _ in 0..4 {
+            let next = CheckedLeanSourceBatch::check(inputs.clone(), false);
+            assert!(!custody.same_context(next.accepted_context().unwrap().custody()));
+        }
+    }
+
+    #[test]
+    fn pinned_source_initializer_refuses_actual_denied_import_decision_before_bootstrap() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("Main.lean");
+        std::fs::write(&file, "def value : Nat := 0\n").unwrap();
+        std::fs::write(root.path().join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        // Clean's maintained producer returns a decision whose source world
+        // is Oracle but whose measured project's artifact imports are denied.
+        // Its general source setup would intentionally build a bootstrap.
+        let decision = clean_olean::source_world_for_file(&file, None).unwrap();
+        assert!(decision.imports().is_err(), "real denied artifact decision required");
+        let refusal = match PinnedLeanSourceWorld::from_decision(decision) {
+            Ok(_) => panic!("denied imports created a genuine-Init source owner"),
+            Err(refusal) => refusal,
+        };
+        assert!(refusal.contains("refuses artifact inputs"), "{refusal}");
+        assert!(refusal.contains("measured"), "{refusal}");
     }
 
     #[test]

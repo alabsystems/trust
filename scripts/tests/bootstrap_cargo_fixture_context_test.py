@@ -63,7 +63,9 @@ def main():
                    RUSTC_LINK_STD_INTO_RUSTC_DRIVER='0', TRUST_BOOTSTRAP_SHIM_NO_VERIFY='1',
                    TRUST_CARGO_TEST_SHIM_VERSION='3', TRUST_VANILLA_ANNOUNCED='1')
     observer = out/'observe.py'
-    observer.write_text('#!'+sys.executable+'\nimport json,os,sys\nprint(json.dumps({"argv":sys.argv[1:],"announced":os.environ.get("TRUST_VANILLA_ANNOUNCED"),"authored":os.environ.get("TRUST_FIXTURE_AUTHORED")}))\n')
+    # sh/python polyglot: a shebang cannot carry an interpreter path with spaces.
+    observer.write_text('#!/bin/sh\n""":"\nexec "'+sys.executable+'" "$0" "$@"\n":"""\n'
+                        'import json,os,sys\nprint(json.dumps({"argv":sys.argv[1:],"announced":os.environ.get("TRUST_VANILLA_ANNOUNCED"),"authored":os.environ.get("TRUST_FIXTURE_AUTHORED")}))\n')
     observer.chmod(0o700)
     observer_stage = out/'stage1'
     observer_stage.mkdir(mode=0o700)

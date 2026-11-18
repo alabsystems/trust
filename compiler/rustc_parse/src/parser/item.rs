@@ -90,6 +90,8 @@ fn clean_decl_kind_and_name(
     let anon = |kind| Ok((kind, sym::empty));
 
     match decl {
+        // This is only the syntax summary. The original island text still
+        // reaches Clean elaboration, which enforces its bare-module rule.
         D::Prelude { .. } => anon(CleanDeclKind::Prelude),
         D::Def { name, .. } => named(CleanDeclKind::Def, name),
         D::Alias { names, .. } => match names.as_slice() {

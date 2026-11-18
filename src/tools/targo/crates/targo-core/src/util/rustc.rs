@@ -36,6 +36,8 @@ const TRUST_TARGO_INTERNAL_ENV: &[&str] = &[
     "TRUST_TARGO_TEST_MONITOR_SESSION",
     "TRUST_TARGO_VERIFY",
     "TRUST_TARGO_FRONTEND",
+    // Trust: DC-24a. Only Targo asks the unit source.
+    crate::compiler::unit_source::UNIT_SOURCE_ENV,
 ];
 
 pub(crate) fn scrub_trust_targo_internal_env(cmd: &mut ProcessBuilder) {
@@ -417,6 +419,17 @@ impl Rustc {
             }
         }
         Ok(true)
+    }
+
+    /// Trust (DC-18b): the compiler can refuse metadata that carries a host
+    /// path (`-Ztrust-path-free`, DC-18a). A workspace member is shared only
+    /// by a compiler that can show it path-free; no wrapper is in force where
+    /// one is, so the plain compiler answers.
+    pub(crate) fn supports_trust_path_free(&self, gctx: &GlobalContext) -> CargoResult<bool> {
+        let mut command = self.process();
+        apply_env_config(gctx, &mut command)?;
+        command.args(&["-Ztrust-path-free", "--print=cfg"]);
+        Ok(self.cached_output(&command, 0).is_ok())
     }
 
     /// Gets a process builder set up to use the found rustc version, with a wrapper if `Some`.

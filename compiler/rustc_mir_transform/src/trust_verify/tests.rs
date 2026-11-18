@@ -5600,6 +5600,42 @@ fn native_trust_ir_compiler_function() -> (
 }
 
 #[test]
+fn new_ir_carrier_native_metadata_preserves_input_role_and_exact_digest() {
+    let (function, compiler_contracts, vcs) = native_trust_ir_compiler_function();
+    let (_, native_bundle) =
+        build_full_verification_input_for_tests(&function, &compiler_contracts, &vcs);
+    let mut bundle = native_bundle.expect("native construction").expect("actual native fixture");
+    let request = bundle
+        .requests
+        .iter()
+        .find_map(|request| match request {
+            trust_ir::NativeVerificationRequest::TrustMc(request) => Some(request.clone()),
+            _ => None,
+        })
+        .expect("actual MC request");
+    let obligation = request.obligations[0];
+    let mir = trust_ir::ProofDigest::sha256([0x31; 32]);
+    let thir = trust_ir::ProofDigest::sha256([0x73; 32]);
+    for (input, name, digest) in [
+        (trust_ir::NativeAdapterInput::RustMir { body_digest: mir }, "rust-mir", Some(mir)),
+        (trust_ir::NativeAdapterInput::RustThir { source_digest: thir }, "rust-thir", Some(thir)),
+        (trust_ir::NativeAdapterInput::TrustIrModule, "trust_ir-module", None),
+    ] {
+        bundle.input = input;
+        let module_digest = bundle.trust_ir_module_digest;
+        let metadata = trust_mc_native_typed_chc_metadata_json(&bundle, &request, obligation);
+        assert_eq!(metadata["adapter_input"], name);
+        assert_eq!(
+            metadata["source_digest"],
+            digest.map(native_artifact_digest_json).unwrap_or(serde_json::Value::Null)
+        );
+        assert_eq!(bundle.input, input, "metadata does not change source role");
+        assert_eq!(bundle.trust_ir_module_digest, module_digest);
+        assert_ne!(mir, thir, "the input roles carry independent exact identities");
+    }
+}
+
+#[test]
 fn native_bundle_producer_labels_preserve_all_sources() {
     use trust_ir::NativeBundleProducer;
 
@@ -8821,6 +8857,59 @@ fn trust_mc_default_admission_refuses_each_tensor_instruction_by_name() {
     assert!(!trust_mc_default_instruction_requires_fail_closed_admission(&positive));
 }
 
+// Trust: a trust-ir v74 Box deref gets a fail-closed `error` edge in the default
+// structural CHC: its validity fact is an assumption the encoder does not model.
+#[test]
+fn trust_mc_default_admission_refuses_a_box_deref_by_name() {
+    use trust_ir::box_validity::{
+        BoxDerefSite, BoxFactSession, BoxPointeeG, BoxValidityFact, JudgedBody, PremiseRoot,
+        ProducingSession,
+    };
+    use trust_ir::{Inst, Ty, ValueId};
+    let fact = BoxValidityFact::premise(
+        BoxDerefSite { item: [0; 16], ordinal: 0 },
+        BoxFactSession {
+            judged: JudgedBody::VerificationSnapshot,
+            producing: ProducingSession::ProofSession,
+        },
+        PremiseRoot::ParamByValue,
+    );
+    let node = trust_ir::InstrNode::new(Inst::BoxDeref {
+        ptr_ty: Ty::Ptr,
+        pointee: BoxPointeeG::Sized { ty: Ty::I32 },
+        operand: ValueId::new(0),
+        fact: Box::new(fact),
+    })
+    .with_result(ValueId::new(1));
+    assert!(trust_mc_default_instruction_requires_fail_closed_admission(&node));
+    // The arithmetic-surface allowlist names it too, gated out rather than admitted by
+    // its `_` arm: the CHC models neither its fact nor its validity conjuncts.
+    assert!(!super::chc_inst_arithmetic_surface_modeled(&node.inst));
+}
+
+// Trust: the typed-CHC metadata names each native input as the pinned trust-mc runner
+// does, so the binding identity check can match them; trust-ir's `RustThir` carries its
+// source digest like `RustMir`'s body digest.
+#[test]
+fn native_adapter_input_metadata_matches_the_trust_mc_runner_spelling() {
+    let digest = trust_ir::ProofDigest::sha256([7; 32]);
+    let (name, source) = native_adapter_input_metadata_json(trust_ir::NativeAdapterInput::RustThir {
+        source_digest: digest,
+    });
+    assert_eq!(name, "rust-thir");
+    assert_eq!(source, Some(native_artifact_digest_json(digest)));
+    assert_eq!(
+        native_adapter_input_metadata_json(trust_ir::NativeAdapterInput::RustMir {
+            body_digest: digest
+        }),
+        ("rust-mir", Some(native_artifact_digest_json(digest)))
+    );
+    assert_eq!(
+        native_adapter_input_metadata_json(trust_ir::NativeAdapterInput::TrustIrModule),
+        ("trust_ir-module", None)
+    );
+}
+
 /// A uniform array keeps the answers the admitting `_` arms gave it before it was
 /// named: `ArraySplat` and a `Const` carrying `Constant::Splat` are pure, total and
 /// arithmetic-free, so every proof-authority gate below admits them, and naming
@@ -8898,6 +8987,81 @@ fn uniform_array_arms_keep_every_proof_authority_gate_answer() {
         !super::function_unbounded_int_arithmetic_is_faithful(&beside_a_wrapping_add),
         "the wrapping add is still refused; the splat arm must not mask it"
     );
+}
+
+#[test]
+fn source_equations_native_metadata_preserves_adapter_source_identity() {
+    let (mut function, _, _) = native_trust_ir_compiler_function();
+    function.contracts.clear();
+    let mut public = trust_verifier_api::TrustContractBundle::empty(
+        "adapter-source-metadata",
+        trust_verifier_api::BundleSubject::Function {
+            crate_name: "demo".to_string(),
+            path: function.def_path.clone(),
+        },
+    );
+    let mut native =
+        build_native_trust_ir_bundle_for_test_verifier_api(&function, &mut public, &[])
+            .expect("native bundle should build")
+            .expect("default function obligation requests trust-mc");
+    // This exercises export only. Mutating a label or digest cannot mint source
+    // generation, replay authority or a proof for this existing request.
+    let mut previous = None;
+    for (input, label, digest_byte) in [
+        (
+            trust_ir::NativeAdapterInput::RustMir {
+                body_digest: trust_ir::ProofDigest::sha256([0x11; 32]),
+            },
+            "rust-mir",
+            Some(0x11),
+        ),
+        (
+            trust_ir::NativeAdapterInput::RustThir {
+                source_digest: trust_ir::ProofDigest::sha256([0x22; 32]),
+            },
+            "rust-thir",
+            Some(0x22),
+        ),
+        (
+            trust_ir::NativeAdapterInput::RustThir {
+                source_digest: trust_ir::ProofDigest::sha256([0x23; 32]),
+            },
+            "rust-thir",
+            Some(0x23),
+        ),
+        (trust_ir::NativeAdapterInput::TrustIrModule, "trust_ir-module", None),
+    ] {
+        native.input = input;
+        let request = native
+            .requests
+            .iter()
+            .find_map(|request| match request {
+                trust_ir::NativeVerificationRequest::TrustMc(request) => Some(request),
+                _ => None,
+            })
+            .expect("default function request belongs to trust-mc");
+        let proof = *request.obligations.first().expect("request has a proof obligation");
+        let metadata = trust_mc_native_typed_chc_metadata_json(&native, request, proof);
+        assert_eq!(metadata["adapter_input"], label);
+        match digest_byte {
+            Some(byte) => {
+                assert_eq!(metadata["source_digest"]["algorithm"], "sha256");
+                assert_eq!(metadata["source_digest"]["value"], format!("{byte:02x}").repeat(32));
+            }
+            None => assert!(metadata["source_digest"].is_null()),
+        }
+        let mut identity_independent = metadata.clone();
+        let fields = identity_independent.as_object_mut().expect("metadata is an object");
+        fields.remove("adapter_input");
+        fields.remove("source_digest");
+        if let Some(previous) = &previous {
+            assert_eq!(
+                &identity_independent, previous,
+                "source identity changes no request/proof facts"
+            );
+        }
+        previous = Some(identity_independent);
+    }
 }
 
 #[test]

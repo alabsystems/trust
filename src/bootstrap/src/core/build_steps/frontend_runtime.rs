@@ -38,16 +38,16 @@ enum CommandState {
     Original(build_helper::trust_repo_lock::management::Lease),
     Withheld {
         lease: Arc<build_helper::trust_repo_lock::management::WithheldLease>,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
         retention: Option<RetentionBinding>,
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
         offered: bool,
     },
     Failed(build_helper::trust_repo_lock::management::WithholdFailure),
     Unresolved,
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 struct RetentionBinding {
     context: trust_resource_controller::Context,
     binding: trust_resource_controller::JobBinding,
@@ -103,9 +103,9 @@ impl CommandOwnership {
                 let lease = Arc::new(lease);
                 *original = CommandState::Withheld {
                     lease: Arc::clone(&lease),
-                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
                     retention: None,
-                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
                     offered: false,
                 };
                 Ok(lease)
@@ -516,5 +516,5 @@ impl CompletedRuntime {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod retention;

@@ -31,6 +31,9 @@ pub(crate) struct NativeWorkItem {
     pub(crate) placement: Option<FnPlacement>,
     /// A real source dependency omitted from rustc's optimized mono inventory.
     pub(crate) inventory_residue: bool,
+    /// A compiler-owned inventory row with an actual, independently checked
+    /// ClosureOnce FnAbi. It never enters the source definition map.
+    pub(crate) adapter_identity: Option<crate::source_abi::ClosureOnceAdapterIdentity>,
 }
 
 pub(crate) struct NativeModuleInput<'a> {
@@ -119,11 +122,31 @@ pub(crate) fn build(input: &NativeModuleInput<'_>) -> CodegenModuleOutput {
         if symbol_owners.insert(&item.symbol, item.func).is_some() {
             out.refusals.push(refusal(&item.symbol, "two source work items claim one link symbol"));
         }
-        if !input.source_ids.contains(&item.func) {
-            out.refusals.push(refusal(
-                &item.symbol,
-                "selected source instance has no exact handoff source identity",
-            ));
+        match &item.adapter_identity {
+            None if !input.source_ids.contains(&item.func) => {
+                out.refusals.push(refusal(
+                    &item.symbol,
+                    "selected source instance has no exact handoff source identity",
+                ));
+            }
+            Some(identity) => {
+                if input.source_ids.contains(&item.func)
+                    || !identity.matches(producer, item.func)
+                    || item.inventory_residue
+                {
+                    out.refusals.push(refusal(&item.symbol,
+                        "compiler-owned ClosureOnce row has another image, source identity or residue"));
+                }
+                // The actual rustc ABI token does not replace the independent
+                // canonical protocol, conservation, owner/body and placement check.
+                match adapter_placement::derive(input, item.func) {
+                    Ok(placement) if placement == item.placement => {}
+                    Ok(_) => out.refusals.push(refusal(&item.symbol,
+                        "actual ClosureOnce ABI differs from its canonical typed adapter placement")),
+                    Err(reason) => out.refusals.push(refusal(&item.symbol, reason)),
+                }
+            }
+            None => {}
         }
         if producer.function_by_id(item.func).is_none_or(|f| f.is_declaration()) {
             out.refusals.push(refusal(&item.symbol, "selected source body is missing"));

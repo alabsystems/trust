@@ -11,14 +11,19 @@ readme = "README.md"
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "trust-build-status"
+path = "src/bin/trust-build-status.rs"
+required-features = ["machine-admission"]
+
 [features]
 # Explicit real frontdoor qualification: TRUST_BUILD_TREE_TARGO and
 # TRUST_BUILD_TREE_BOOTSTRAP must identify the actual built executables.
 # Native namespace/withholding policy actors run in the default harness.
 native-cli-tests = []
-machine-admission = ["dep:trust-build-cpu", "dep:trust-sha2", "dep:jobserver_utils"]
+machine-admission = ["dep:trust-build-cpu", "dep:trust-sha2", "dep:jobserver_utils", "dep:trust-resource-provenance"]
 # Actual child execution is separate from the client-disabled original courier.
-native-exec = ["machine-admission", "jobserver_utils/client", "dep:trust-resource-provenance"]
+native-exec = ["machine-admission", "jobserver_utils/client"]
 # Same-attempt resident input closure; ordinary local joins still cannot release.
 resident-inputs = ["machine-admission", "dep:trust-resource-controller"]
 

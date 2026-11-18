@@ -2,7 +2,8 @@ use crate::sources::CRATES_IO_DOMAIN;
 
 pub use self::cargo_clean::{CleanContext, CleanOptions, clean};
 pub use self::cargo_compile::unit_generator::{
-    NativeTestArgumentScope, UnitGenerator, native_test_argument_scope,
+    NativeTestArgumentScope, NativeTestRunnerScope, UnitGenerator, native_test_argument_scope,
+    native_test_runner_scope,
 };
 pub use self::cargo_compile::{CompileFilter, FilterRule, LibRule, Packages};
 pub use self::cargo_compile::{

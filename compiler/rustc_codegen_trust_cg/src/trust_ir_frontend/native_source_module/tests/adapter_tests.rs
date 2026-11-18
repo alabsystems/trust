@@ -211,7 +211,7 @@ fn pointer_probe() -> (Module, Vec<NativeWorkItem>) {
         linkage: FunctionLinkage::External,
         never_inline: true,
         placement: Some(placement(vec![scalar(0, 64)])),
-        inventory_residue: false,
+        inventory_residue: false, adapter_identity: None,
     });
     (module, items)
 }
@@ -332,4 +332,20 @@ int main(void) {
         let run = Command::new(dir.join("identity")).output().unwrap();
         assert!(run.status.success(), "native adapter ABI failed: {:?}", run.status);
     }
+}
+
+#[test]
+fn ordinary_work_item_cannot_forge_a_compiler_owned_adapter_identity() {
+    let (module, mut items) = classified();
+    let original = module.clone();
+    items.push(NativeWorkItem {
+        func: FuncId::new(2), symbol: "adapter".into(), linkage: FunctionLinkage::Internal,
+        never_inline: false, placement: Some(placement(vec![scalar(0, 64)])),
+        inventory_residue: false, adapter_identity: None,
+    });
+    let out = build_all(&module, &items, &[0, 1, 2]);
+    assert!(out.refusals.iter().any(|row| row.to_string()
+        .contains("selected source instance has no exact handoff source identity")),
+        "{:?}", out.refusals);
+    assert_eq!(module, original);
 }

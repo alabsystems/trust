@@ -366,3 +366,109 @@ fn seed_tools_absence_is_positive_and_bound_to_the_actual_host() {
         assert!(absent.check(&output).is_err());
     });
 }
+
+fn captured_input_fixture(body: impl FnOnce(&mut Observation, &Path, &Path, &Path)) {
+    let temp = crate::owner_only::tempdir();
+    let output_path = temp.path().join("build");
+    let stage = output_path.join("host/stage1");
+    let compiler = stage.join("bin/trustc");
+    let std = stage.join("lib/rustlib/host/lib/libstd-input-control.rlib");
+    fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+    fs::create_dir_all(std.parent().unwrap()).unwrap();
+    // Genuine native test-image bytes are captured, but NEVER executed here.
+    // The ordinary retained file below is negative fixture DATA, not a valid
+    // libstd, SDK, compiler-health result or proof input.
+    fs::copy(std::env::current_exe().unwrap(), &compiler).unwrap();
+    fs::write(&std, b"input-retention control; no SDK authority").unwrap();
+    let alias = temp.path().join("cache-alias");
+    fs::hard_link(&compiler, &alias).unwrap();
+    let output = OutputLock::try_acquire(&output_path).unwrap().unwrap();
+    let (held, std_inputs) =
+        inputs::capture(&output, Path::new("host/stage1"), OsStr::new("host"), deadline().unwrap())
+            .unwrap()
+            .unwrap();
+    let mut observation = Observation {
+        stage: 1,
+        complete: false,
+        detail: "input capture only; no version command executed".into(),
+        compiler: compiler.clone(),
+        raw_status: None,
+        libstd_files: std_inputs.len(),
+        original: Some(held.observation().clone()),
+        std: std_inputs,
+        kept: Some(KeptProgram(held)),
+        seed_absence: None,
+    };
+    body(&mut observation, &compiler, &std, &alias);
+}
+
+#[test]
+fn incomplete_probe_keeps_actual_inputs_and_refuses_unbacked_observation_data() {
+    isolated(|| {
+        use std::os::unix::fs::MetadataExt as _;
+        captured_input_fixture(|observation, compiler, std, _| {
+            assert!(!observation.complete);
+            let identities = observation.retained_input_identities().unwrap();
+            for path in [compiler, std] {
+                let meta = fs::metadata(path).unwrap();
+                assert!(identities.contains(&(meta.dev(), meta.ino())));
+            }
+            let original = observation.original.as_ref().unwrap().clone();
+            observation.original.as_mut().unwrap().runtime.push(original.executable.clone());
+            assert!(
+                observation
+                    .retained_input_identities()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("input observation differs from its original keeper")
+            );
+            observation.original = Some(original);
+            let kept = observation.kept.take();
+            assert!(
+                observation
+                    .retained_input_identities()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("input keeper is unavailable")
+            );
+            observation.kept = kept;
+            assert_eq!(observation.retained_input_identities().unwrap(), identities);
+        });
+    });
+}
+
+#[test]
+fn health_input_alias_unlink_refuses_identity_export_without_changing_original_bytes() {
+    isolated(|| {
+        captured_input_fixture(|observation, compiler, _, alias| {
+            observation.retained_input_identities().unwrap();
+            let original_bytes = fs::read(compiler).unwrap();
+            fs::remove_file(alias).unwrap();
+            assert_eq!(fs::read(compiler).unwrap(), original_bytes);
+            assert!(
+                observation
+                    .retained_input_identities()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("original native executable/runtime backing changed")
+            );
+        });
+    });
+}
+
+#[test]
+fn absent_probe_has_no_backing_identity_to_supply() {
+    let observation = Observation {
+        stage: 2,
+        complete: false,
+        detail: "original stage/bin/trustc is absent".into(),
+        compiler: PathBuf::from("absent-stage/bin/trustc"),
+        raw_status: None,
+        libstd_files: 0,
+        original: None,
+        std: Vec::new(),
+        kept: None,
+        seed_absence: None,
+    };
+    assert!(observation.retained_input_identities().unwrap().is_empty());
+}

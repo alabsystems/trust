@@ -143,7 +143,7 @@ pub(super) fn records(
             if records >= MAX_RECORDS {
                 bail!("log record limit exceeded");
             }
-            let mut value = serde_json::from_slice::<UniqueJson>(&line)?.0;
+            let mut value = decode_unique_json(&line)?;
             let object = value
                 .as_object_mut()
                 .context("log record must be an object")?;
@@ -194,7 +194,7 @@ fn check_fields(object: &serde_json::Map<String, Value>) -> CargoResult<()> {
     let fields: &[&str] = match reason {
         "execution-enabled" => &["reason", "version"],
         "compiler-observations-enabled" => &["reason", "version", "rusage_requested"],
-        "shared-dependency-policy" => &["reason", "version", "enabled"],
+        "shared-dependency-policy" => &["reason", "version", "enabled", "members", "keyed"],
         "shared-dependency-decision" => &["reason", "index", "decision"],
         "test-action-registered" => &["reason", "index", "harness", "prerequisites"],
         "unit-scheduled" => &["reason", "index", "elapsed", "fresh"],
@@ -421,6 +421,38 @@ mod record_stream_tests {
         }
     }
 
+    /// Every float this logger writes reads back as a number, whether or not
+    /// serde_json's `arbitrary_precision` is on in the graph; an object that
+    /// spells serde_json's number token, plainly or escaped, stays an object.
+    #[test]
+    fn written_floats_read_back_and_a_spelled_number_token_stays_refused() {
+        for elapsed in [0.0, 1.5, 0.000123, 1e-7, 12345.678901] {
+            let frame = format!(
+                "{}\n",
+                serde_json::json!({
+                    "run_id":"selected", "timestamp":"2026-11-06T00:00:00Z",
+                    "reason":"resolution-started", "elapsed":elapsed,
+                })
+            );
+            let read = records(Cursor::new(&frame), "selected").collect::<CargoResult<Vec<_>>>();
+            assert!(read.is_ok(), "{frame}: {:?}", read.err());
+        }
+        for spelled in [
+            "{\"$serde_json::private::Number\":\"1.5\"}",
+            "{\"\\u0024serde_json::private::Number\":\"1.5\"}",
+        ] {
+            let frame = format!(
+                "{{\"run_id\":\"selected\",\"timestamp\":\"2026-11-06T00:00:00Z\",\"reason\":\"resolution-started\",\"elapsed\":{spelled}}}\n"
+            );
+            assert!(
+                records(Cursor::new(&frame), "selected")
+                    .collect::<CargoResult<Vec<_>>>()
+                    .is_err(),
+                "{frame}"
+            );
+        }
+    }
+
     #[test]
     fn empty_or_bad_first_frame_reports_one_error_then_fuses() {
         for input in [String::new(), "{bad}\n".into(), "{}".into()] {
@@ -476,61 +508,149 @@ mod record_stream_tests {
 
 // Trust: Value alone would silently replace duplicate JSON object keys. This
 // bounded-frame decoder rejects duplicates recursively before typed decoding.
-struct UniqueJson(Value);
-impl<'de> Deserialize<'de> for UniqueJson {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct UniqueVisitor;
-        impl<'de> Visitor<'de> for UniqueVisitor {
-            type Value = UniqueJson;
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("JSON without duplicate fields")
-            }
-            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Bool(value)))
-            }
-            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Number(value.into())))
-            }
-            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Number(value.into())))
-            }
-            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Number(
-                    serde_json::Number::from_f64(value)
-                        .ok_or_else(|| E::custom("nonfinite number"))?,
-                )))
-            }
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::String(value.into())))
-            }
-            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::String(value)))
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Null))
-            }
-            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Null))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(value) = seq.next_element::<UniqueJson>()? {
-                    values.push(value.0);
-                }
-                Ok(UniqueJson(Value::Array(values)))
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut values = serde_json::Map::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    if values.contains_key(&key) {
-                        return Err(serde::de::Error::custom("duplicate JSON field"));
-                    }
-                    values.insert(key, map.next_value::<UniqueJson>()?.0);
-                }
-                Ok(UniqueJson(Value::Object(values)))
-            }
+//
+// The decoder also keeps numbers numbers when serde_json's `arbitrary_precision`
+// is on in this graph (trust-ir's `native-transport-json`, through trust-types).
+// There `deserialize_any` hands every number that is not a plain `u64`/`i64`
+// (each float this logger writes) to `visit_map` as a one-entry map whose key
+// serde_json supplies itself, `NUMBER_TOKEN`; read as an object, every `f64`
+// field of a record failed ("invalid type: map, expected f64"). That key never
+// comes from the line: a key the line spells is borrowed from `input` or, when
+// escaped, decoded into a transient buffer. So only a borrowed key outside the
+// line is serde_json's number, and a line that spells the token itself stays an
+// object, refused by typed decoding as before.
+const NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
+fn decode_unique_json(input: &[u8]) -> serde_json::Result<Value> {
+    use serde::de::DeserializeSeed as _;
+    let mut deserializer = serde_json::Deserializer::from_slice(input);
+    let value = UniqueJson { input }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
+#[derive(Clone, Copy)]
+struct UniqueJson<'i> {
+    input: &'i [u8],
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for UniqueJson<'_> {
+    type Value = Value;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for UniqueJson<'_> {
+    type Value = Value;
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON without duplicate fields")
+    }
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+        Ok(Value::Number(
+            serde_json::Number::from_f64(value).ok_or_else(|| E::custom("nonfinite number"))?,
+        ))
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.into()))
+    }
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(self)? {
+            values.push(value);
         }
-        deserializer.deserialize_any(UniqueVisitor)
+        Ok(Value::Array(values))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key_seed(Key { input: self.input })? {
+            if key.number_token && values.is_empty() {
+                let Value::String(text) = map.next_value_seed(self)? else {
+                    return Err(serde::de::Error::custom("serde_json number is not text"));
+                };
+                if map.next_key_seed(Key { input: self.input })?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "serde_json number has another field",
+                    ));
+                }
+                return text
+                    .parse::<serde_json::Number>()
+                    .map(Value::Number)
+                    .map_err(serde::de::Error::custom);
+            }
+            if key.number_token {
+                return Err(serde::de::Error::custom(
+                    "serde_json number inside an object",
+                ));
+            }
+            if values.contains_key(&key.text) {
+                return Err(serde::de::Error::custom("duplicate JSON field"));
+            }
+            let value = map.next_value_seed(self)?;
+            values.insert(key.text, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
+/// An object key, and whether serde_json supplied it as its number token.
+struct ObjectKey {
+    text: String,
+    number_token: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Key<'i> {
+    input: &'i [u8],
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Key<'_> {
+    type Value = ObjectKey;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<ObjectKey, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Key<'_> {
+    type Value = ObjectKey;
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object key")
+    }
+    fn visit_borrowed_str<E: serde::de::Error>(self, value: &'de str) -> Result<ObjectKey, E> {
+        let start = self.input.as_ptr() as usize;
+        let at = value.as_ptr() as usize;
+        let in_line = at >= start && at < start + self.input.len();
+        Ok(ObjectKey {
+            text: value.to_owned(),
+            number_token: !in_line && value == NUMBER_TOKEN,
+        })
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ObjectKey, E> {
+        Ok(ObjectKey {
+            text: value.to_owned(),
+            number_token: false,
+        })
     }
 }
 

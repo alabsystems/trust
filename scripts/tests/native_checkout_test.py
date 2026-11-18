@@ -109,6 +109,35 @@ class ProtocolTests(unittest.TestCase):
                     self.assertRaisesRegex(native.Corrupt,"malformed ready.*retirement failed"):
                 native.Reader(program,"00"*32,1,{},lambda _:object(),None,lambda:None)
 
+    def test_the_reader_runs_outside_every_checkout(self):
+        # The build-tree lock counts a targo process whose cwd lies inside a
+        # tree as that tree's writer. A reader started from the gate's checkout
+        # held it against every x.py leg of the same run, so the reader must
+        # run from a directory no checkout contains, whatever the caller's cwd.
+        # Launch controls only: no substitute executable is ever started.
+        launched = []
+        def popen(argv, **options):
+            launched.append((argv, options))
+            raise OSError("launch recorded")
+        program = types.SimpleNamespace(bookend=lambda:None,close=lambda:None,root=Path("/source"),
+            executable=Path("/source/bin/targo"),expected="00"*32)
+        with tempfile.TemporaryDirectory() as checkout:
+            here = os.getcwd()
+            os.chdir(checkout)
+            try:
+                with patch.object(native.landing_targo,"exit_observation_available",return_value=True), \
+                        patch.object(native.landing_targo,"resource_fds",return_value=()), \
+                        patch.object(native.subprocess,"Popen",side_effect=popen), \
+                        self.assertRaisesRegex(OSError,"launch recorded"):
+                    native.Reader(program,"00"*32,1,{},lambda _:object(),None,lambda:None)
+            finally:
+                os.chdir(here)
+        self.assertEqual(len(launched), 1)
+        argv, options = launched[0]
+        self.assertEqual(argv, ["/source/bin/targo", "source-check", "--tracked-inputs"])
+        self.assertEqual(options.get("cwd"), "/")
+        self.assertEqual(native.READER_CWD, "/")
+
 
 class CleanupTests(unittest.TestCase):
     def test_native_cleanup_failure_still_retires_original_ready_workers(self):

@@ -27,3 +27,16 @@ pub fn shared_local_with_direct_reborrow(number: f64, count: i32) -> bool {
     bump(&mut *(&mut other));
     before && same_wide(&value, &value)
 }
+
+#[inline(never)]
+pub fn same_raw_pointer_location(left: &*const u32, right: &*const u32) -> bool {
+    std::ptr::eq(left, right)
+}
+
+// Borrow the pointer object, not the allocation it might address. A null raw
+// pointer remains an ordinary value, and no dereference is performed here.
+#[inline(never)]
+pub fn shared_raw_pointer_parameter(value: *const u32) -> bool {
+    same_raw_pointer_location(&value, &value)
+        && same_raw_pointer_location(&value, &value)
+}

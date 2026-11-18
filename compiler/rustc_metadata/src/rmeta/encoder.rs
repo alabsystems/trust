@@ -620,6 +620,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
         let local_crate_stable_id = self.tcx.stable_crate_id(LOCAL_CRATE);
 
+        // Trust (DC-18a): `-Ztrust-path-free` judges each name exactly as it is written.
+        let path_free = self.tcx.sess.opts.unstable_opts.trust_path_free;
+
         // Only serialize `SourceFile`s that were used during the encoding of a `Span`.
         //
         // The order in which we encode source files is important here: the on-disk format for
@@ -649,6 +652,15 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 }
             };
 
+            // Trust: DC-18a.
+            if path_free {
+                crate::trust_path_free::judge_file_name(
+                    self.tcx,
+                    source_file,
+                    &adapted_source_file.name,
+                );
+            }
+
             // We're serializing this `SourceFile` into our crate metadata,
             // so mark it as coming from this crate.
             // This also ensures that we don't try to deserialize the
@@ -670,6 +682,22 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             let on_disk_index: u32 =
                 on_disk_index.try_into().expect("cannot export more than U32_MAX files");
             adapted.set_some(on_disk_index, self.lazy(adapted_source_file));
+        }
+
+        // Trust (DC-18a): a local file no span in this metadata names is still written by
+        // name elsewhere (a Trust-IR entry's file table), so every local name is judged.
+        // `encode_and_write_metadata` reports the refusals and writes no output.
+        if path_free {
+            for (index, source_file) in all_source_files.iter().enumerate() {
+                if source_file.is_imported() || required_source_files.contains(&index) {
+                    continue;
+                }
+                let mut exported = source_file.name.clone();
+                if let FileName::Real(real) = &mut exported {
+                    real.update_for_crate_metadata();
+                }
+                crate::trust_path_free::judge_file_name(self.tcx, source_file, &exported);
+            }
         }
 
         adapted.encode(&mut self.opaque)
@@ -2494,6 +2522,12 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     fn encode_native_libraries(&mut self) -> LazyArray<NativeLib> {
         empty_proc_macro!(self);
         let used_libraries = self.tcx.native_libraries(LOCAL_CRATE);
+        // Trust (DC-18a): a native library's name is written as given.
+        if self.tcx.sess.opts.unstable_opts.trust_path_free {
+            for lib in used_libraries {
+                crate::trust_path_free::judge_native_library(self.tcx, lib);
+            }
+        }
         self.lazy_array(used_libraries.iter())
     }
 

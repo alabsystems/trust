@@ -10,13 +10,16 @@
 //! Selected developer requests retain their actual frozen Cargo producers.
 //! Classification DATA never supplies availability or source/child custody.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::core::builder::Kind;
-use crate::core::config::Config;
 use crate::core::config::flags::Flags;
+use crate::core::config::{Config, DryRun};
+use crate::core::session::Session;
+use crate::utils::exec::{BootstrapCommand, command};
 use crate::utils::helpers;
 
 /// Native request classification DATA, never readiness, custody or completion.
@@ -73,6 +76,84 @@ pub(crate) fn ensure(
     initial_cargo: &Path,
 ) -> Result<(), String> {
     ensure_bound(config, initial_rustc, initial_cargo, std::env::var_os("BOOTSTRAP_PYTHON"))
+}
+
+// Trust: SelfCheck has already walked the SAME selected native Step graph.
+// Fetching this separate workspace, unlike startup metadata --no-deps, checks
+// its transitive index and source/archive inputs without compiling anything.
+// Full requests already check the entire recipe envelope. Explicit dry runs
+// and tools whose graph never requests std keep their existing fast paths.
+pub(crate) fn check_selected_std_sources(sess: &Session, requested: bool) -> Result<(), String> {
+    if !requested {
+        return Ok(());
+    }
+    check_selected_manifest_sources(sess, Path::new("library/Cargo.toml"), "std")
+}
+
+pub(crate) fn check_selected_tool_sources(
+    sess: &Session,
+    manifests: &BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    for manifest in manifests {
+        check_selected_manifest_sources(sess, manifest, "tool")?;
+    }
+    Ok(())
+}
+
+fn check_selected_manifest_sources(
+    sess: &Session,
+    relative_manifest: &Path,
+    role: &str,
+) -> Result<(), String> {
+    if !matches!(sess.config.get_dry_run(), DryRun::SelfCheck)
+        || PreparationScope::for_config(&sess.config) != PreparationScope::RequestSources
+    {
+        return Ok(());
+    }
+    let manifest = sess.src.join(relative_manifest);
+    eprintln!("Trust source readiness: checking selected {role} inputs ({})", manifest.display());
+    let mut command = selected_manifest_check_command(
+        &sess.initial_cargo,
+        &sess.initial_rustc,
+        &sess.src,
+        relative_manifest,
+    );
+    if !command.run(sess) {
+        return Err(format!(
+            "selected {role} locked offline inputs unavailable: {}; prepare with the same Cargo home: {} fetch --locked --manifest-path {}",
+            manifest.display(),
+            sess.initial_cargo.display(),
+            manifest.display(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn selected_std_check_command(cargo: &Path, rustc: &Path, source: &Path) -> BootstrapCommand {
+    selected_manifest_check_command(cargo, rustc, source, Path::new("library/Cargo.toml"))
+}
+
+fn selected_manifest_check_command(
+    cargo: &Path,
+    rustc: &Path,
+    source: &Path,
+    relative_manifest: &Path,
+) -> BootstrapCommand {
+    let mut command = command(cargo).allow_failure();
+    // Reuse the original scheduler/child transport and Cargo's normal cache
+    // exclusion. No saved availability seal or new source/SDK owner is made.
+    command.metadata_scheduler();
+    command
+        .run_in_dry_run()
+        .env("RUSTC", rustc)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env_remove("CARGO_BUILD_TARGET")
+        .args(["fetch", "--frozen", "--manifest-path"])
+        .arg(source.join(relative_manifest))
+        // Match Builder::bare_cargo's config lookup and relative tool binding.
+        .current_dir(source);
+    command
 }
 
 /// `ensure` with x.py's bound interpreter passed in, not read from the

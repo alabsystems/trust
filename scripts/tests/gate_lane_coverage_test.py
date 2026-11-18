@@ -253,6 +253,7 @@ class ScriptTestDriverRowControls(unittest.TestCase):
 
     PROBE = "scripts/tests/targo_dependency_filename_process.py"
     GATE = "slow.targo-dependency-filename-process"
+    EVIDENCE = '--evidence "$(mktemp -d)/evidence"'
 
     def test_the_filename_process_probe_is_a_row_with_explicit_producers(self) -> None:
         probe = coverage.REPO_ROOT / self.PROBE
@@ -268,7 +269,7 @@ class ScriptTestDriverRowControls(unittest.TestCase):
         self.assertEqual(required, "true")
         for producer in ('--targo "$(pwd -P)/build/host/stage2/bin/targo"',
                          '--rustc "$(pwd -P)/build/host/stage2/bin/trustc"',
-                         '--evidence "$(mktemp -d)/evidence"'):
+                         self.EVIDENCE):
             self.assertIn(producer, command)
         _errors, uncovered = coverage.check()
         self.assertNotIn("script-test: " + self.PROBE, uncovered)
@@ -277,6 +278,39 @@ class ScriptTestDriverRowControls(unittest.TestCase):
         with mock.patch.object(coverage, "manifest_rows", return_value=without):
             _errors, uncovered = coverage.check()
         self.assertIn("script-test: " + self.PROBE, uncovered)
+
+
+class F1NativeQuestionRowControls(unittest.TestCase):
+    def test_identity_unit_controls_do_not_replace_the_live_regression(self):
+        probe = "scripts/check_f1_native_question_binding.py"
+        gate = "release.f1-native-question-binding"
+        self.assertNotIn(probe, coverage.INDIRECT)
+        self.assertNotIn(probe, coverage.MANUAL_ONLY)
+        rows = coverage.manifest_rows()
+        named = [r for r in rows if coverage._named_by(probe, r[5])]
+        self.assertEqual([r[0] for r in named], [gate])
+        row = named[0]
+        self.assertEqual(row[3], "true")
+        self.assertTrue({"slow", "release"} <= set(row[1].split(",")))
+        self.assertIn('--targo "$(pwd -P)/build/host/stage2/bin/targo"', row[5])
+        self.assertIn('--target-dir "$(pwd -P)/build/f1-native-question-binding-target.noindex"', row[5])
+        without = [r for r in rows if r[0] != gate]
+        with mock.patch.object(coverage, "manifest_rows", return_value=without):
+            _errors, uncovered = coverage.check()
+        self.assertIn("checker: " + probe, uncovered)
+
+
+class InternalLintDriverRowControls(ScriptTestDriverRowControls):
+    """The incremental compiler driver must run as a required live-tool row."""
+
+    PROBE = "scripts/tests/internal_lint_incremental_process.py"
+    GATE = "slow.internal-lint-incremental-process"
+    EVIDENCE = ('--evidence "$(pwd -P)/build/evidence/'
+                'internal-lint-incremental-$(date -u +%Y%m%dT%H%M%S)-$$"')
+
+    def test_internal_lint_driver_is_in_release(self) -> None:
+        row = next(row for row in coverage.manifest_rows() if row[0] == self.GATE)
+        self.assertIn("release", row[1].split(","))
 
 
 if __name__ == "__main__":

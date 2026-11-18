@@ -3481,39 +3481,44 @@ fn exact_non_empty_scalar_target_binding(
         ));
     }
 
-    if blockers.is_empty() {
-        let formula = formula.expect("blockers empty only when formula exists");
-        let target_bool = target_bool.expect("blockers empty only when target bool exists");
-        let checked_certificate =
-            checked_certificate.expect("blockers empty only when checked certificate exists");
-        let proof_replay = proof_replay.expect("blockers empty only when proof replay exists");
-        let provenance = provenance.expect("blockers empty only when provenance exists");
-        let proof_identity =
-            proof_identity.expect("blockers empty only when proof identity exists");
-        let unsupported_ledger_identifier = unsupported_ledger_eliminated
-            .iter()
-            .map(|entry| wasm_unsupported_ledger_identifier(entry))
-            .collect::<Vec<_>>()
-            .join("|");
-        Ok(NonEmptyScalarTargetBinding {
-            function: formula.function.clone(),
-            formula_value: target_bool,
-            target_operation: if target_bool { "i32.const 1" } else { "i32.const 0" },
-            formula_identifier: format!(
-                "{}::bb{}::stmt{}::{}",
-                formula.function, formula.block, formula.statement_index, formula.operand
-            ),
-            provenance_identifier: wasm_provenance_identifier(provenance),
-            checked_certificate_identifier: wasm_checked_certificate_identifier(
-                checked_certificate,
-            ),
-            proof_replay_identifier: wasm_proof_replay_identifier(proof_replay),
-            unsupported_ledger_identifier,
-            proof_identity,
-        })
-    } else {
-        Err(blockers)
+    if !blockers.is_empty() {
+        return Err(blockers);
     }
+    // Each component's absence above raised a blocker, so none is missing here;
+    // should one be, the binding is refused rather than the process aborted.
+    let (
+        Some(formula),
+        Some(target_bool),
+        Some(checked_certificate),
+        Some(proof_replay),
+        Some(provenance),
+        Some(proof_identity),
+    ) = (formula, target_bool, checked_certificate, proof_replay, provenance, proof_identity)
+    else {
+        return Err(vec![validation_blocker(
+            "non-empty-scalar-binding-component-missing",
+            "non-empty scalar Wasm proof consumption raised no blocker yet lacks a binding component",
+        )]);
+    };
+    let unsupported_ledger_identifier = unsupported_ledger_eliminated
+        .iter()
+        .map(|entry| wasm_unsupported_ledger_identifier(entry))
+        .collect::<Vec<_>>()
+        .join("|");
+    Ok(NonEmptyScalarTargetBinding {
+        function: formula.function.clone(),
+        formula_value: target_bool,
+        target_operation: if target_bool { "i32.const 1" } else { "i32.const 0" },
+        formula_identifier: format!(
+            "{}::bb{}::stmt{}::{}",
+            formula.function, formula.block, formula.statement_index, formula.operand
+        ),
+        provenance_identifier: wasm_provenance_identifier(provenance),
+        checked_certificate_identifier: wasm_checked_certificate_identifier(checked_certificate),
+        proof_replay_identifier: wasm_proof_replay_identifier(proof_replay),
+        unsupported_ledger_identifier,
+        proof_identity,
+    })
 }
 
 fn push_unique_blocker(blockers: &mut Vec<WasmValidationBlocker>, code: &str, detail: &str) {

@@ -52,6 +52,8 @@ pub(crate) fn expand_option_env<'cx>(
     let sp = cx.with_def_site_ctxt(sp);
     let value = lookup_env(cx, var);
     cx.sess.env_depinfo.borrow_mut().insert((var, value.as_ref().ok().copied()));
+    // Trust: DC-18a.
+    record_trust_path_free_read(cx, sym::option_env, var, &value, sp);
     let e = match value {
         Err(VarError::NotPresent) => {
             let lt = cx.lifetime(sp, Ident::new(kw::StaticLifetime, sp));
@@ -125,6 +127,8 @@ pub(crate) fn expand_env<'cx>(
     let span = cx.with_def_site_ctxt(sp);
     let value = lookup_env(cx, var);
     cx.sess.env_depinfo.borrow_mut().insert((var, value.as_ref().ok().copied()));
+    // Trust: DC-18a.
+    record_trust_path_free_read(cx, sym::env, var, &value, sp);
     let e = match value {
         Err(VarError::NotPresent) => {
             let var_str = var.as_str();
@@ -162,6 +166,31 @@ pub(crate) fn expand_env<'cx>(
         Ok(value) => cx.expr_str(span, value),
     };
     ExpandResult::Ready(MacEager::expr(e))
+}
+
+/// Trust (DC-18a): under `-Ztrust-path-free`, records a read whose value holds a host
+/// path, for `rustc_metadata` to refuse the unit's metadata on. The value is never changed:
+/// a unit that needs its real path is compiled without the option.
+fn record_trust_path_free_read(
+    cx: &ExtCtxt<'_>,
+    mac: Symbol,
+    var: Symbol,
+    value: &Result<Symbol, VarError>,
+    sp: Span,
+) {
+    use rustc_span::trust_path_free::{RecordPath, Refusal, host_path_in_value};
+    if cx.sess.opts.unstable_opts.trust_path_free
+        && let Ok(value) = value
+        && let Some(path) = host_path_in_value(value.as_str(), cx.sess.trust_path_free_prefixes())
+    {
+        cx.sess.trust_path_free_refusals.borrow_mut().push(Refusal {
+            origin: "env",
+            describe: format!("`{mac}!(\"{}\")`", var.as_str().escape_debug()),
+            path: RecordPath::from_bytes(path.as_bytes()),
+            fields: vec![("var", var.to_string()), ("read", format!("{mac}!"))],
+            span: Some(sp),
+        });
+    }
 }
 
 /// Returns `true` if an environment variable from `env!` could be one set by

@@ -391,6 +391,137 @@ fn entry_on_callee(
 }
 
 #[test]
+fn unconditional_scope_retains_original_non_root_entry_obligations() {
+    let (mut public, mut native) = fixture(ContractKind::Requires);
+    entry_on_callee(&mut public, &mut native, false);
+    let original = native.clone();
+    let admitted = trust_ir::ValidatedNativeBundle::new(&native).unwrap();
+    for scope in [NativePublicProofScope::Unconditional, NativePublicProofScope::DeclaredEntry] {
+        let question =
+            NativePublicQuestion::for_derivation(&public, &admitted, "obligation:post", scope)
+                .unwrap();
+        assert_eq!(question.entry_preconditions(FuncId::new(0)).count(), 0);
+        assert_eq!(question.entry_preconditions(FuncId::new(1)).count(), 1);
+        assert_eq!(
+            question.entry_preconditions(FuncId::new(1)).next().unwrap().proof().id,
+            ProofId::new(1)
+        );
+    }
+    assert_eq!(native, original);
+    let entry = &mut public.obligations[1].metadata[0];
+    let mut forged = ObligationContext::from_metadata_entry(entry).unwrap().unwrap();
+    forged.function.as_mut().unwrap().path = "identity".into();
+    *entry = forged.to_metadata_entry().unwrap();
+    refresh(&public, &mut native);
+    let admitted = trust_ir::ValidatedNativeBundle::new(&native).unwrap();
+    assert!(
+        NativePublicQuestion::for_derivation(
+            &public,
+            &admitted,
+            "obligation:post",
+            NativePublicProofScope::Unconditional
+        )
+        .is_err(),
+        "a forged root context must not hide the original callee carrier"
+    );
+}
+
+#[test]
+fn unconditional_scope_refuses_a_missing_original_callee_entry_carrier() {
+    let (mut public, mut native) = fixture(ContractKind::Requires);
+    entry_on_callee(&mut public, &mut native, false);
+    let admitted = trust_ir::ValidatedNativeBundle::new(&native).unwrap();
+    NativePublicQuestion::for_derivation(
+        &public,
+        &admitted,
+        "obligation:post",
+        NativePublicProofScope::Unconditional,
+    )
+    .unwrap();
+    native.module.proof_obligations.pop();
+    native.compiler_facts.obligation_sources.pop();
+    native.lineage.nodes[0].obligations.pop();
+    refresh(&public, &mut native);
+    let admitted = trust_ir::ValidatedNativeBundle::new(&native).unwrap();
+    assert!(
+        NativePublicQuestion::for_derivation(
+            &public,
+            &admitted,
+            "obligation:post",
+            NativePublicProofScope::Unconditional
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_caller_owned_callsite_precondition_is_not_an_omittable_root_entry() {
+    let (public, mut native) = fixture(ContractKind::Requires);
+    let mut callee = native.module.functions[0].clone();
+    callee.id = FuncId::new(1);
+    callee.name = "callee".into();
+    callee.display_path = Some("test::callee".into());
+    native.module.try_add_function(callee).unwrap();
+    native.module.functions[0].blocks[0].body.insert(
+        0,
+        InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![ValueId::new(0)] })
+            .with_result(ValueId::new(1)),
+    );
+    native.module.proof_obligations[1].site =
+        Some(trust_ir::proof::ObligationSite::new(FuncId::new(0), BlockId::new(0), 0));
+    refresh(&public, &mut native);
+    let admitted = trust_ir::ValidatedNativeBundle::new(&native)
+        .expect("original typed call-site carrier is structurally admitted");
+    assert!(
+        matches!(&native.module.functions[0].blocks[0].body[0].inst,Inst::Call { callee,.. } if *callee == FuncId::new(1))
+    );
+    for scope in [NativePublicProofScope::Unconditional, NativePublicProofScope::DeclaredEntry] {
+        assert!(
+            NativePublicQuestion::for_derivation(&public, &admitted, "obligation:post", scope)
+                .is_err(),
+            "a call-site condition is owed, never an omitted root declaration: {scope:?}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_root_declaration_does_not_erase_an_independently_matched_callee_entry() {
+    let (mut public, mut native) = fixture(ContractKind::Requires);
+    let mut root_contract = public.contracts[1].clone();
+    let mut root_obligation = public.obligations[1].clone();
+    entry_on_callee(&mut public, &mut native, false);
+    root_contract.contract_id = "unsupported-root".into();
+    root_contract.predicate = ContractPredicate::CanonicalJson {
+        schema: "unsupported.root.v1".into(),
+        value: "original unsupported root declaration".into(),
+    };
+    root_obligation.obligation_id = "obligation:unsupported-root".into();
+    root_obligation.contract_id = Some(root_contract.contract_id.clone());
+    let mut context =
+        ObligationContext::from_metadata_entry(&root_obligation.metadata[0]).unwrap().unwrap();
+    if let ObligationOrigin::Contract { contract_id, contract_index, .. } = &mut context.origin {
+        *contract_id = root_contract.contract_id.clone();
+        *contract_index = 2;
+    } else {
+        unreachable!()
+    }
+    root_obligation.metadata[0] = context.to_metadata_entry().unwrap();
+    public.contracts.push(root_contract);
+    public.obligations.push(root_obligation);
+    let admitted = trust_ir::ValidatedNativeBundle::new(&native).unwrap();
+    let bare = NativePublicQuestion::for_derivation(
+        &public,
+        &admitted,
+        "obligation:post",
+        NativePublicProofScope::Unconditional,
+    )
+    .unwrap();
+    assert_eq!(bare.entry_preconditions(FuncId::new(0)).count(), 0);
+    assert_eq!(bare.entry_preconditions(FuncId::new(1)).count(), 1);
+    assert!(NativePublicQuestion::new(&public, &admitted, "obligation:post").is_err());
+}
+
+#[test]
 fn callee_only_domain_does_not_allow_a_forged_selected_post_owner() {
     let (mut public, mut native) = fixture(ContractKind::Requires);
     entry_on_callee(&mut public, &mut native, false);
@@ -616,14 +747,14 @@ fn missing_precondition_on_a_bare_callee_is_not_silently_classified_outside() {
     let admitted = trust_ir::ValidatedNativeBundle::new(&native).unwrap();
     let error = NativePublicQuestion::new(&public, &admitted, "obligation:post").unwrap_err();
     assert!(error.contains("unidentified native function"), "{error}");
-    let bare = NativePublicQuestion::for_derivation(
+    let error = NativePublicQuestion::for_derivation(
         &public,
         &admitted,
         "obligation:post",
         NativePublicProofScope::Unconditional,
     )
-    .unwrap();
-    assert!(!bare.has_entry_preconditions());
+    .unwrap_err();
+    assert!(error.contains("unidentified native function"), "{error}");
 }
 
 #[test]

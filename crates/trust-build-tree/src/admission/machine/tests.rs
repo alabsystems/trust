@@ -58,7 +58,9 @@ fn fixed_publication_retains_slots_and_worktree_but_releases_only_shared_admissi
     let root = crate::owner_only::tempdir();
     let native = crate::owner_only::tempdir();
     let pool = Pool::open_in(native.path(), width(8)).unwrap();
-    let claim = reserve(root.path(), false).publish_fixed(width(8), width(2)).unwrap();
+    let claim = reserve(root.path(), false)
+        .publish_fixed(width(8), width(2), FixedPublication::ExistingLease)
+        .unwrap();
     claim.check_current().unwrap();
     assert_eq!(claim.budget(), width(2));
     let probe =
@@ -82,11 +84,17 @@ fn fixed_publication_retains_slots_and_worktree_but_releases_only_shared_admissi
 #[test]
 fn fixed_budget_never_exceeds_the_actual_retained_share_or_original_manifest_width() {
     let root = crate::owner_only::tempdir();
-    assert!(reserve(root.path(), false).publish_fixed(width(8), width(3)).is_err());
+    assert!(
+        reserve(root.path(), false)
+            .publish_fixed(width(8), width(3), FixedPublication::ExistingLease)
+            .is_err()
+    );
     let root = crate::owner_only::tempdir();
     let native = crate::owner_only::tempdir();
     let pool = Pool::open_in(native.path(), width(4)).unwrap();
-    let claim = reserve(root.path(), false).publish_fixed(width(8), width(2)).unwrap();
+    let claim = reserve(root.path(), false)
+        .publish_fixed(width(8), width(2), FixedPublication::ExistingLease)
+        .unwrap();
     assert!(claim.observe_in_pool(&pool).is_err());
 }
 
@@ -98,7 +106,9 @@ fn exclusive_fixed_records_cover_historic_indices_without_creating_gap_slots() {
     crate::launcher_file::write(&root.path().join("slot-9"), &[]);
     let mut reservation = reserve(root.path(), true);
     assert!(reservation.try_drain_exclusive().unwrap());
-    let claim = reservation.publish_fixed(width(8), width(8)).unwrap();
+    let claim = reservation
+        .publish_fixed(width(8), width(8), FixedPublication::ExistingLease)
+        .unwrap();
     assert_eq!(claim.record_pool_slots, 10);
     assert_eq!(
         claim.observe_in_pool(&pool).unwrap(),
@@ -127,7 +137,9 @@ fn changed_fixed_record_or_replaced_original_slot_refuses_readiness() {
         let root = crate::owner_only::tempdir();
         let native = crate::owner_only::tempdir();
         let pool = Pool::open_in(native.path(), width(8)).unwrap();
-        let claim = reserve(root.path(), false).publish_fixed(width(8), width(2)).unwrap();
+        let claim = reserve(root.path(), false)
+            .publish_fixed(width(8), width(2), FixedPublication::ExistingLease)
+            .unwrap();
         let slot = root.path().join("slot-0");
         if replace {
             fs::rename(&slot, root.path().join("original-slot")).unwrap();

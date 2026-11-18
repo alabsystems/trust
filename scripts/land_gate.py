@@ -2604,12 +2604,12 @@ TCB_RATCHET_SHELL = "/bin/bash"
 # Every program the script runs by its bare name; the rest of what it does is
 # bash builtins. Each is pinned (sealed_program). `mv` runs only under
 # --update-baseline and `rm` in its exit trap: both are pinned anyway.
-TCB_RATCHET_PROGRAMS = ("awk", "dirname", "find", "git", "grep", "mktemp", "mv", "rm", "sed", "sort")
+TCB_RATCHET_PROGRAMS = ("awk", "dirname", "find", "git", "grep", "mktemp", "mv", "rm", "sort")
 # sha256 of the script whose reads are declared here. The declaration is an
 # audit of those bytes (DECISION_QUEUE.md LEG-READS-1 lists what they read);
 # other bytes may read anything, so they run fresh until the audit is renewed
 # here (TcbRatchetReadTests.test_the_audited_script_is_the_trees fails until then).
-TCB_RATCHET_AUDITED_SHA256 = "ef2b160c48f84eef8306f0623b0e68a6f25054a1817e7edb06697062d282ebf2"
+TCB_RATCHET_AUDITED_SHA256 = "80c37dcc9b1a9c7fb74058b70dff07f37396b493dd4cc70b43c44560dcc88e1c"
 
 
 def _read_through(path: Path, shown: str) -> str:

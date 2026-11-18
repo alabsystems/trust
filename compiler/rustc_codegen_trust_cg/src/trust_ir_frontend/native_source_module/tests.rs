@@ -97,7 +97,7 @@ pub(super) fn fixture() -> (Module, Vec<NativeWorkItem>) {
             linkage: FunctionLinkage::External,
             never_inline: false,
             placement: None,
-            inventory_residue: false,
+            inventory_residue: false, adapter_identity: None,
         },
         NativeWorkItem {
             func: FuncId::new(1),
@@ -105,7 +105,7 @@ pub(super) fn fixture() -> (Module, Vec<NativeWorkItem>) {
             linkage: FunctionLinkage::Internal,
             never_inline: false,
             placement: None,
-            inventory_residue: false,
+            inventory_residue: false, adapter_identity: None,
         },
     ];
     (module, items)

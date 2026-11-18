@@ -23,6 +23,12 @@ from scripts import mint_seed_support as support
 HOST = "aarch64-unknown-linux-gnu"
 
 
+# A `#!{sys.executable}` shebang cannot carry an interpreter path with spaces (atpkg's python
+# lives under `Application Support/`): exec splits it and the fake never runs. This sh/python
+# polyglot execs the interpreter quoted and keeps argv[0] as the fake's own path.
+PYTHON_SHEBANG = f'#!/bin/sh\n""":"\nexec "{sys.executable}" "$0" "$@"\n":"""\n'
+
+
 class HistoricalSurfaceControls(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -47,7 +53,7 @@ class HistoricalSurfaceControls(unittest.TestCase):
     def executable(self, relative, code):
         path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("#!" + sys.executable + "\n" + code)
+        path.write_text(PYTHON_SHEBANG + code)
         path.chmod(0o755)
         return path
 
@@ -129,10 +135,14 @@ class HistoricalSurfaceControls(unittest.TestCase):
 
     def test_actual_timed_out_probe_reaps_its_owned_child(self):
         marker = self.root / "timed-child.pid"
-        path = self.executable("bin/timed", "import os,time\nopen(" + repr(str(marker)) + ",'w').write(str(os.getpid()))\ntime.sleep(5)\n")
+        # The deadline outlasts the child's start on a loaded host, so the child has written
+        # its pid before the probe times out; it then sleeps far past the deadline.
+        path = self.executable("bin/timed", "import os,time\nopen(" + repr(str(marker)) + ",'w').write(str(os.getpid()))\ntime.sleep(60)\n")
         with self.assertRaises(subprocess.TimeoutExpired):
-            historical.probe(path, [], self.env, time.monotonic() + .2)
-        self.assertFalse(Path("/proc/" + marker.read_text()).exists())
+            historical.probe(path, [], self.env, time.monotonic() + 3)
+        # Reaped, not merely killed: signal 0 still reaches a zombie, on Linux and on macOS.
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(marker.read_text()), 0)
 
     def test_candidate_symlink_is_refused_before_execution(self):
         (self.root / "bin/targo").unlink()

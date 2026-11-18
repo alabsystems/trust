@@ -43,19 +43,19 @@ TREES: dict = {}
 PUBLISHED = {
     "universe.fls.chapters": 21, "universe.fls.sections": 304, "universe.fls.paragraphs": 3755, "universe.reference.files": 119,
     "universe.reference.rules": 3016, "universe.std.members": 221, "universe.std-docs.sections": 164, "universe.std-docs.files": 31,
-    "universe.design.parts": 12, "universe.formality.judgments": 78, "unmapped.fls.paragraphs": 0, "unmapped.fls.sections": 0,
+    "universe.design.parts": 12, "universe.formality.judgments": 82, "unmapped.fls.paragraphs": 0, "unmapped.fls.sections": 0,
     "unmapped.reference.rules": 0, "unmapped.std.members": 0, "unmapped.std-docs.sections": 0, "unmapped.design.parts": 0,
-    "unmapped.formality.judgments": 0, "rows": 193, "rows.compat-candidate": 4, "rows.de-facto": 0, "rows.with-conflicts": 21,
-    "conflicts.fls-reference": 9, "conflicts.fls-std": 1, "conflicts.document-rustc": 4, "conflicts.formality-rustc": 7,
+    "unmapped.formality.judgments": 0, "rows": 193, "rows.compat-candidate": 4, "rows.de-facto": 0, "rows.with-conflicts": 22,
+    "conflicts.fls-reference": 9, "conflicts.fls-std": 1, "conflicts.document-rustc": 4, "conflicts.formality-rustc": 8,
     "conflicts.document-gap": 2, "members.st": 5395, "members.outside-st": 1761, "outside-st.dispositioned": 1356,
     "outside-st.dispositioned.std": 192, "outside-st.twin-required": 264, "twins.groups": 99, "outside-st.kind.library-api": 155,
     "outside-st.kind.no-rejection": 35, "outside-st.kind.lint-level": 44, "rustc-error-tests.citing-outside-st-reference-rules": 28,
     "grammar.side-conditions": 41, "grammar.candidates": 306, "grammar.candidates.cited": 131, "grammar.candidates.dismissed": 175,
-    "formality.notes": 58, "rfcs.registered": 8, "rfcs.not-stabilized": 1, "ui-tests.bound-to-rows": 3,
+    "formality.notes": 67, "rfcs.registered": 8, "rfcs.not-stabilized": 1, "ui-tests.bound-to-rows": 3,
     "post-alignment.fls.added": 0, "post-alignment.fls.removed": 0, "post-alignment.fls.changed": 0,
     "design.parts.rank-1": 10, "design.parts.rank-1-gap": 2, "doc_citations": 25,
 }
-PUBLISHED_JUDGMENTS = 712
+PUBLISHED_JUDGMENTS = 721
 STD = "library/core/src/default.rs"
 
 
@@ -193,6 +193,40 @@ class Mutations(unittest.TestCase):
     def test_control_copies_pass(self):
         self.assertEqual(self.run_inputs(), [])
 
+    def test_formality_note_moves_keep_the_id_and_require_a_new_review(self):
+        path = "tests/outlives.rs"
+        source = TREES["a-mir-formality"]
+        lines = source.text(path).split("\n")
+        lines[86], lines[87] = lines[87], lines[86]
+        trees = {"a-mir-formality": Overlay(source, {path: "\n".join(lines)})}
+        ledger = replace_once(self.ledger, f'a-mir-formality:{path}:87"', f'a-mir-formality:{path}:88"')
+        jid = "formality_test_note:FN-OUTLIVES-1"
+        violations = self.run_inputs(ledger=ledger, trees=trees)
+        self.assertEqual(self.mechanical(violations), [])
+        self.assertEqual(len(violations), 1)
+        self.assert_violation(violations, f"REVIEW: judgment {jid}: its content changed")
+        self.assertEqual(self.run_inputs(ledger=ledger, registry=self.review([jid], ledger=ledger), trees=trees), [])
+
+    def test_formality_note_refuses_positional_and_duplicate_ids(self):
+        ledger = replace_once(self.ledger, 'id = "FN-OUTLIVES-1"', 'id = "a-mir-formality:tests/outlives.rs:87"')
+        self.assert_violation(self.run_inputs(ledger=ledger), "expected a stable FN-<FILE-STEM>-<N> id")
+
+        ledger = replace_once(self.ledger, 'id = "FN-OUTLIVES-1"', 'id = "FN-CODEGEN-9"')
+        self.assert_violation(self.run_inputs(ledger=ledger), "duplicate row 'FN-CODEGEN-9'")
+
+    def test_formality_note_refuses_a_second_id_for_the_same_line(self):
+        header = 'id = "FN-OUTLIVES-1"\n'
+        row = self.ledger.split(header)[1].split("\n\n")[0]
+        clone = '[[formality_test_note]]\nid = "FN-OUTLIVES-2"\n' + row
+        ledger = replace_once(self.ledger, header + row, header + row + "\n\n" + clone)
+        registry = self.review(["formality_test_note:FN-OUTLIVES-2"], ledger=ledger)
+        self.assert_violation(self.run_inputs(ledger=ledger, registry=registry),
+                              "FN-OUTLIVES-2: tests/outlives.rs:87 is already cited by FN-OUTLIVES-1")
+
+    def test_formality_note_citation_must_name_a_single_line(self):
+        ledger = replace_once(self.ledger, 'a-mir-formality:tests/outlives.rs:87"', 'a-mir-formality:tests/outlives.rs:87-88"')
+        self.assert_violation(self.run_inputs(ledger=ledger), "FN-OUTLIVES-1: cite one source line")
+
     # ---- the blocker: standard-library text beyond rule (e)
     def test_std_documentation_beyond_items_is_a_universe(self):
         std = TREES["std"]
@@ -258,7 +292,7 @@ class Mutations(unittest.TestCase):
             ("status evidence expect not a value", replace_once(self.ledger, 'quote = "v.push(v.len());", expect = "pass"', 'quote = "v.push(v.len());", expect = "maybe"'),
              "CITE: rfc 2025: worktree:tests/ui/borrowck/two-phase-baseline.rs:7 expect 'maybe': expect 'maybe' is not one of"),
             ("expect on a citation that is no rustc test", replace_once(self.ledger, 'quote = "- Unconstrained ints are replaced with `i32`." }', 'quote = "- Unconstrained ints are replaced with `i32`.", expect = "pass" }'),
-             "CITE: rfc 0212: worktree:compiler/rustc_hir_typeck/src/fallback.rs:49: expect and revision belong to a citation of a rustc test"),
+             "CITE: rfc 0212: worktree:compiler/rustc_hir_typeck/src/fallback.rs:51: expect and revision belong to a citation of a rustc test"),
             # The verification of 46cc325055: the rule went by prefix, so a `rustc:` citation of the same test file passed
             # with no expect, and one with an expect was refused.
             ("rustc: status evidence expect removed", replace_once(self.ledger, 'ref = "worktree:tests/ui/borrowck/two-phase-baseline.rs:7", quote = "v.push(v.len());", expect = "pass"',
@@ -267,9 +301,9 @@ class Mutations(unittest.TestCase):
             ("rustc: status evidence wrong expect", replace_once(self.ledger, 'ref = "worktree:tests/ui/borrowck/two-phase-baseline.rs:7", quote = "v.push(v.len());", expect = "pass"',
                                                                  'ref = "rustc:tests/ui/borrowck/two-phase-baseline.rs:7", quote = "v.push(v.len());", expect = "error"'),
              "CITE: rfc 2025: rustc:tests/ui/borrowck/two-phase-baseline.rs:7 expect 'error': no ERROR annotation targets the quoted lines"),
-            ("rustc: status evidence of a rustc file that is no test", replace_once(self.ledger, 'ref = "worktree:compiler/rustc_hir_typeck/src/fallback.rs:49", quote = "- Unconstrained ints are replaced with `i32`." }',
-                                                                              'ref = "rustc:compiler/rustc_hir_typeck/src/fallback.rs:49", quote = "- Unconstrained ints are replaced with `i32`.", expect = "pass" }'),
-             "CITE: rfc 0212: rustc:compiler/rustc_hir_typeck/src/fallback.rs:49: expect and revision belong to a citation of a rustc test"),
+            ("rustc: status evidence of a rustc file that is no test", replace_once(self.ledger, 'ref = "worktree:compiler/rustc_hir_typeck/src/fallback.rs:51", quote = "- Unconstrained ints are replaced with `i32`." }',
+                                                                              'ref = "rustc:compiler/rustc_hir_typeck/src/fallback.rs:51", quote = "- Unconstrained ints are replaced with `i32`.", expect = "pass" }'),
+             "CITE: rfc 0212: rustc:compiler/rustc_hir_typeck/src/fallback.rs:51: expect and revision belong to a citation of a rustc test"),
         ):
             with self.subTest(label):
                 self.assert_violation(self.run_inputs(ledger), fragment)

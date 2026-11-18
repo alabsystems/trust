@@ -9,8 +9,8 @@ the live ``git ls-remote`` of trust-wp's canonical main becomes an ``ls-remote``
 of the fixture's LOCAL remote repository (or the sha a test names), and the
 ruling's W0/B constants are bound to the fixture's own base and floor commits
 so the fixture's byte-exact v3 marker can spell them.  Every other read is the
-real one.  The real-history test stubs the same sample with the submodule's
-remote-tracking ``origin/main`` and says so.
+real one.  The real-history test, which stubs the same sample with the
+submodule's remote-tracking ``origin/main``, is dependency_cycle_anchor_history_test.
 """
 
 from __future__ import annotations
@@ -2537,6 +2537,55 @@ class CommittedConstellationTests(unittest.TestCase):
             commits["trust-wp"] = fixture.wp_floor
             self.assertEqual(self.policy(fixture, merge, commits)["moves"], 2)
 
+    def test_p2_admitted_merge_mint_is_the_exact_pair_judged_for_retention(self) -> None:
+        """TRUSTWP-MERGE-MINT-ADMITTED admits one exact (merge, binding) pair.
+
+        A merge binding w2, which neither marked parent carried, mints and is
+        refused.  Admitted with w2, it is judged as an adoption of w2 instead:
+        w2 contains both parents' bindings (W0 and w1), so it is retained and
+        accepted.  The admission reaches nothing else: the same merge admitted
+        with another binding still mints, another merge minting the admitted
+        binding still mints, and an admitted merge whose binding does not
+        contain a parent's off-main binding x1 is refused for retention.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(temporary)
+            assert fixture.policy_activation is not None
+            root = fixture.root
+            wp = fixture.checkout("trust-wp")
+            activation = fixture.policy_activation
+            w0 = fixture.commits["trust-wp"]
+            w1 = wp_child(wp, w0, "main's off-main advance")
+            w2 = wp_child(wp, w1, "a further off-main advance")
+            x1 = wp_child(wp, w0, "a branch's own off-main advance")
+            main_move = pin_wp(root, activation, w1, "main moves W0 -> w1")
+            stale = root_child(root, activation, "marked branch still binding W0")
+            diverged = pin_wp(root, activation, x1, "marked branch moves W0 -> x1")
+            minted = root_child(root, main_move, "merge that mints w2",
+                                {anchor.WP_ROOT_DELTA_PATH: ("160000", w2)},
+                                [main_move, stale])
+            dropping = root_child(root, main_move, "merge that mints w2 over x1",
+                                  {anchor.WP_ROOT_DELTA_PATH: ("160000", w2)},
+                                  [main_move, diverged])
+            commits = dict(fixture.commits)
+            commits["trust-wp"] = w2
+
+            mint = "no marked parent published child_wp"
+            self.assert_policy_refuses(fixture, minted, commits, mint)
+            with mock.patch.dict(anchor.TRUST_WP_ADMITTED_MERGE_MINTS, {minted: w2}):
+                self.assertEqual(self.policy(fixture, minted, commits)["moves"], 1)
+            with mock.patch.dict(anchor.TRUST_WP_ADMITTED_MERGE_MINTS, {minted: w1}):
+                self.assert_policy_refuses(fixture, minted, commits, mint)
+            with mock.patch.dict(anchor.TRUST_WP_ADMITTED_MERGE_MINTS, {dropping: w2}):
+                message = self.assert_policy_refuses(
+                    fixture, dropping, commits, "retained means equal to child_wp"
+                )
+                self.assertIn(x1, message)
+                self.assertNotIn(mint, message)
+                # The admission names a merge, not a binding: another merge
+                # that mints the admitted binding w2 is still a mint.
+                self.assert_policy_refuses(fixture, minted, commits, mint)
+
     def test_p2_forward_ancestry_is_any_parent_containment(self) -> None:
         """Forward means the target CONTAINS the source, through any parent.
 
@@ -3423,131 +3472,6 @@ class CommittedConstellationTests(unittest.TestCase):
                 for name in sorted(anchor.SUBMODULES)
             ] + [mock.call("trust", anchor.ROOT_URL, root_commit)]
             self.assertEqual(verify_one.call_args_list, expected_calls)
-
-    def test_real_origin_main_history_is_green_under_v3(self) -> None:
-        """The real Trust history since v1 activation, judged by P1-P4 -- GREEN.
-
-        ONLY the live ``ls-remote`` sample is stubbed: it is replaced by the
-        trust-wp submodule's remote-tracking ``refs/remotes/origin/main``, the
-        last fetched value of the very same ref.  Every marker, gitlink, lock
-        blob and ancestry edge is read from this clone's real objects, and the
-        constants are the ruling's own.  The moves the ledger records must
-        each be admissible: ``f5599702`` (72274168 -> 04e6fffe, backward,
-        same lock; on the canonical line, so clause (b)), its restoration,
-        72274168 -> 9cbcc2cb (forward), and ``8325008ba62`` (9cbcc2cb ->
-        684821d0, sideways onto main with the lock identical, clause (b)).
-        """
-        root_commit = git(REPO_ROOT, "rev-parse", "HEAD")
-        self.assertEqual(
-            git(REPO_ROOT, "cat-file", "-t", f"HEAD:{anchor.TERMINAL_POLICY_V3_MARKER_PATH}", check=False),
-            "blob",
-            "HEAD predates terminal-policy v3; this test judges the real history under v3",
-        )
-        wp = REPO_ROOT / anchor.SUBMODULES["trust-wp"][0]
-        remote_main = git(wp, "rev-parse", "--verify", "refs/remotes/origin/main", check=False)
-        self.assertRegex(
-            remote_main, r"^[0-9a-f]{40}$",
-            "first-party/trust-wp has no refs/remotes/origin/main; git -C first-party/trust-wp fetch origin main",
-        )
-        submodules = anchor.committed_submodules(REPO_ROOT, root_commit)
-        commits = {name: commit for name, (_path, _url, commit) in submodules.items()}
-
-        # The recorded shapes are really there.
-        def wp_at(commit: str) -> str:
-            return git(REPO_ROOT, "rev-parse", f"{commit}:{anchor.WP_ROOT_DELTA_PATH}")
-
-        backward, restore, forward, sideways = (
-            "f559970230e624c939f79eaa90685b0e50540e5b",
-            "6ad0c5e76f76b47b22492ee68f7270526d3b8ada",
-            "bfb7b5089a2faa87155df4fa807db7c82b0fda35",
-            "8325008ba623c1ab3443eddd2c2ed99b2562da43",
-        )
-        a72, a04, a9c, a68 = (
-            "72274168a37f133259f843941ef5f7d7615df67b",
-            "04e6fffe64d93ba474f077ad7ba2be1341f3b00d",
-            "9cbcc2cb47be6f7efd2ac110e3d5f3a4f259e1ff",
-            "684821d0f2e2a31d640a0bdc9ab24977c539b1b7",
-        )
-        # These TrustWP commits are held by trust-wp's refs/pins/* anchors, which
-        # neither a submodule update nor a default fetch brings. The judgement
-        # below fetches what it reads, by sha (PUSH-PATH-CLONE-STATE); fetch the
-        # same way before the recorded shapes are read here, or a clone without
-        # the pins reads a missing object as "not an ancestor".
-        recorded = (a72, a04, a9c, a68, anchor.TRUST_WP_PRESERVATION_FLOOR)
-        _absent, detail = anchor.fetch_absent_trust_wp_objects(wp, recorded)
-        self.assertEqual(anchor.absent_commits(wp, recorded), [], detail)
-        for root_edge in (backward, restore, forward, sideways):
-            self.assertTrue(is_ancestor(REPO_ROOT, root_edge, root_commit), root_edge)
-        self.assertEqual((wp_at(f"{backward}^"), wp_at(backward)), (a72, a04))
-        self.assertEqual((wp_at(f"{restore}^"), wp_at(restore)), (a04, a72))
-        self.assertEqual((wp_at(f"{forward}^"), wp_at(forward)), (a72, a9c))
-        self.assertEqual((wp_at(f"{sideways}^"), wp_at(sideways)), (a9c, a68))
-        self.assertTrue(is_ancestor(wp, a04, a72))
-        self.assertTrue(is_ancestor(wp, a72, a9c))
-        self.assertFalse(is_ancestor(wp, a9c, a68), "8325008ba62 really is sideways")
-        self.assertTrue(is_ancestor(wp, a68, remote_main))
-        self.assertTrue(is_ancestor(wp, anchor.TRUST_WP_PRESERVATION_FLOOR, remote_main))
-        locks = {commit: git(wp, "rev-parse", f"{commit}:{anchor.WP_DEPENDS_PATH}") for commit in (a72, a04, a9c, a68)}
-        self.assertEqual(len(set(locks.values())), 1, locks)
-
-        # The two v1-era landings that once refused every push are still in
-        # the judged DAG and are still accepted by the marked-subgraph walk.
-        propagation = "3c2c11e530bb5e0253f8a412f4a0892528915091"
-        landing = "e42bba0a61bbd72d97ebf9e27205bb0c58febb15"
-        for commit in (propagation, landing):
-            self.assertTrue(is_ancestor(REPO_ROOT, commit, root_commit), commit)
-
-        # MAIN-REDS-1: the ``-s ours`` merge that keeps a July stash reachable.
-        # Its index commit stages TrustWP eb18c757 back over its only parent's
-        # 5443d384, a binding that parent's own pre-activation ancestry had
-        # published at e5877167 (CONSTELLATION-RESTORE), so the inactive
-        # lineage mints nothing and is accepted.
-        stash_merge, stash, stash_index, stash_parent, first_publisher = (
-            "1fedcff19d84ce1300047639ef40d56b878f6a5c",
-            "50181df41833089a8f3c5d5e9f5a03c86de96951",
-            "1b0fe79fc1ba9d3b14849bf132fdb267b35b1009",
-            "38cb00023f7919397252374dc679597cc092de19",
-            "e58771678ea1d25530f4755ad5e4232f67d0055a",
-        )
-        aeb, a54 = (
-            "eb18c75702a8b60a411947296557c1405551ec1d",
-            "5443d38463d267fdbd1d151e39c7fc091f1076f7",
-        )
-        self.assertTrue(is_ancestor(REPO_ROOT, stash_merge, root_commit))
-        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{stash_merge}^2"), stash)
-        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{stash}^2"), stash_index)
-        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{stash_index}^@"), stash_parent)
-        self.assertEqual((wp_at(stash_parent), wp_at(stash_index)), (a54, aeb))
-        self.assertEqual((wp_at(f"{first_publisher}^") != aeb, wp_at(first_publisher)), (True, aeb))
-        self.assertTrue(is_ancestor(REPO_ROOT, first_publisher, stash_parent))
-
-        # CONSTELLATION-UNBOUND-ROOT: the preservation merge 3ca41eb1a3 keeps
-        # `git stash -u` commits reachable. Each stash's untracked-files parent
-        # is parentless with no first-party/ tree, so it carries no binding.
-        preservation, stash_u, untracked = (
-            "3ca41eb1a339698a4777725f1b7cdad229771eb0",
-            "32aa3e22ce659518a66c6c352c3e2283d4710aa0",
-            "68cf95644cd6aab907c68bd469a71b65bc551872",
-        )
-        self.assertTrue(is_ancestor(REPO_ROOT, preservation, root_commit))
-        self.assertIn(stash_u, git(REPO_ROOT, "rev-parse", f"{preservation}^@").split())
-        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{stash_u}^3"), untracked)
-        self.assertEqual(git(REPO_ROOT, "rev-parse", f"{untracked}^@"), "")
-        self.assertEqual(git(REPO_ROOT, "ls-tree", untracked, "first-party"), "")
-
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            verdict = anchor.validate_trust_wp_policy(REPO_ROOT, root_commit, commits, remote_main)
-        self.assertTrue(is_ancestor(REPO_ROOT, first_publisher, f"{verdict['activation_commit']}^"))
-        self.assertFalse(is_ancestor(REPO_ROOT, stash_merge, f"{verdict['activation_commit']}"))
-        self.assertEqual(verdict["wp_remote_main"], remote_main)
-        self.assertGreaterEqual(int(str(verdict["moves"])), 9)
-        pins = anchor.validate_trust_wp_binding_coherence(REPO_ROOT, root_commit, commits)
-        self.assertEqual(set(pins), anchor.WP_DEPENDS_REPOSITORIES)
-        for repository, row in pins.items():
-            checkout = REPO_ROOT if repository == "trust" else REPO_ROOT / anchor.SUBMODULES[repository][0]
-            terminal = root_commit if repository == "trust" else commits[repository]
-            self.assertTrue(is_ancestor(checkout, row, terminal), (repository, row))
 
     def test_remote_main_probe_scrubs_redirecting_git_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

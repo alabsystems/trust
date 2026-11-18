@@ -48,18 +48,50 @@ pub(super) fn cmake_generation_matches(stamp: &BuildStamp) -> bool {
         .is_some_and(|(bytes, _)| bytes == record.stamp().as_bytes())
 }
 
+/// Trust (DC-16c): the record of where a CMake build directory was configured. The
+/// generation record names the request alone, which no longer names the checkout's paths
+/// (another worktree's tree, or atpkg's `llvm-tree` package, is the same generation), while
+/// CMake refuses a build directory configured anywhere else ("CMakeCache.txt directory ... is
+/// different"): a miss keeps a CMake build only where both match. The record holds the
+/// digest of the root's canonical path, never the path, so a tree cloned elsewhere (EW-9's
+/// donor, whose audit refuses a stray spelling of the donor's paths) carries no path of it.
+pub(super) const CMAKE_BUILD_ROOT: &str = ".cmake-build-root";
+
+fn cmake_build_root_record(root: &Path) -> std::io::Result<Vec<u8>> {
+    let canonical = fs::canonicalize(root)?;
+    let digest =
+        crate::utils::trust_repo_cache::bytes_digest(canonical.as_os_str().as_encoded_bytes());
+    Ok(format!("trust.native-cmake-build-root/v1\n{digest}\n").into_bytes())
+}
+
+fn cmake_build_root_matches(root: &Path) -> bool {
+    let Ok(expected) = cmake_build_root_record(root) else {
+        return false;
+    };
+    bounded_native_evidence(&root.join(CMAKE_BUILD_ROOT), expected.len() as u64)
+        .is_some_and(|(bytes, _)| bytes == expected)
+}
+
+/// The files a CMake miss leaves in a root it began afresh: the generation records alone.
+pub(super) const FRESH_CMAKE_ROOT: [&str; 2] = [".cmake-generation-stamp", CMAKE_BUILD_ROOT];
+
 // Validate the final root before any mutation; maintained ancestor symlinks are
 // allowed. This does not promise closure against concurrent hostile path swaps.
 // Completion removal is the first mutation. Membership is request data, never
-// completed artifact identity, resource custody or provider readiness.
+// completed artifact identity, resource custody or provider readiness. Returns whether
+// the CMake build of this generation, configured at this root, was kept; otherwise the root
+// was begun afresh and holds only its generation records ([`FRESH_CMAKE_ROOT`]).
 pub(super) fn begin_cmake_miss(
     stamp: &BuildStamp,
     generation: CmakeGeneration,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let (root, exists) = cmake_output_root(stamp)?;
     stamp.remove()?;
-    if generation == CmakeGeneration::Known && cmake_generation_matches(stamp) {
-        return Ok(());
+    if generation == CmakeGeneration::Known
+        && cmake_generation_matches(stamp)
+        && cmake_build_root_matches(root)
+    {
+        return Ok(true);
     }
     if exists {
         fs::remove_dir_all(root)?;
@@ -67,8 +99,9 @@ pub(super) fn begin_cmake_miss(
     fs::create_dir_all(root)?;
     if generation == CmakeGeneration::Known {
         cmake_generation_record(stamp)?.write()?;
+        fs::write(root.join(CMAKE_BUILD_ROOT), cmake_build_root_record(root)?)?;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[derive(Clone, Copy)]

@@ -21,6 +21,8 @@ mod foreign_modules;
 mod host_dylib;
 mod native_libs;
 mod rmeta;
+// Trust (DC-18a): the `-Ztrust-path-free` refusal.
+mod trust_path_free;
 // Trust (PM-1): the crate-loader proc-macro boundary.
 mod trust_proc_macro_boundary;
 

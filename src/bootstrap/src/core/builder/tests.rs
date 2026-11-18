@@ -30,6 +30,96 @@ fn run_build(paths: &[PathBuf], config: Config) -> Cache {
     builder.cache
 }
 
+// Trust: use the actual Step graph, including std dependencies of aliases and
+// compiler assembly. Source selection is not reconstructed from CLI strings.
+#[test]
+fn selected_std_source_readiness_follows_the_native_plan() {
+    for (kind, stage, paths, expected) in [
+        ("build", 1, vec!["library"], true),
+        ("build", 1, vec!["compiler/rustc", "library"], true),
+        ("build", 1, vec!["library/std"], true),
+        ("check", 1, vec!["library/core"], true),
+        ("build", 1, vec!["src/tools/tidy"], false),
+        ("build", 1, vec!["targo-build-tool"], false),
+    ] {
+        let context = TestCtx::new();
+        let mut config = context.config(kind).stage(stage).paths(&paths);
+        if paths.contains(&"targo-build-tool") {
+            config = config.args(&["--set", "rust.omit-git-hash=false"]);
+        }
+        let mut session = Session::new(config.create_config());
+        session.config.set_dry_run(DryRun::SelfCheck);
+        let builder = Builder::new(&session);
+        builder.execute_cli();
+        assert_eq!(builder.selected_std_sources.get(), expected, "{kind} stage{stage} {paths:?}");
+    }
+}
+
+#[test]
+fn selected_tool_source_readiness_follows_the_native_plan() {
+    for (paths, required, absent) in [
+        (
+            vec!["compiler/rustc", "library"],
+            "first-party/ay/crates/ay/Cargo.toml",
+            "src/tools/tidy/Cargo.toml",
+        ),
+        (
+            vec!["src/tools/tidy"],
+            "src/tools/tidy/Cargo.toml",
+            "first-party/ay/crates/ay/Cargo.toml",
+        ),
+        (
+            vec!["targo-build-tool"],
+            "src/tools/targo/Cargo.toml",
+            "first-party/ay/crates/ay/Cargo.toml",
+        ),
+    ] {
+        let context = TestCtx::new();
+        let config = context
+            .config("build")
+            .stage(1)
+            .paths(&paths)
+            .args(&["--set", "rust.omit-git-hash=false"])
+            .create_config();
+        let mut session = Session::new(config);
+        session.config.set_dry_run(DryRun::SelfCheck);
+        let builder = Builder::new(&session);
+        builder.execute_cli();
+        let manifests = builder.selected_tool_sources.borrow();
+        assert!(manifests.contains(Path::new(required)), "{paths:?}: {manifests:?}");
+        assert!(!manifests.contains(Path::new(absent)), "{paths:?}: {manifests:?}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "status code: 1")]
+fn selected_std_readiness_does_not_promote_unsupported_stage0_builds() {
+    let context = TestCtx::new();
+    let session = Session::new(context.config("build").stage(0).path("library").create_config());
+    Builder::new(&session).execute_cli();
+}
+
+#[test]
+fn compiler_runtime_paths_resolve_llvm_only_for_built_compilers() {
+    for stage in [0, 1] {
+        let context = TestCtx::new();
+        let config = context
+            .config("test")
+            .no_override_download_ci_llvm()
+            .with_default_toml_config("[llvm]\ndownload-ci-llvm = true\n")
+            .create_config();
+        let session = Session::new(config);
+        let builder = Builder::new(&session);
+        let compiler = Compiler::new(stage, builder.host_target);
+        assert!(!builder.cache.contains::<llvm::LlvmFromCi>());
+        let paths = builder.rustc_lib_paths(compiler);
+        assert_eq!(paths.first(), Some(&builder.rustc_libdir(compiler)));
+        // A seed's runtime comes from its original sysroot. Looking up its
+        // loader path must not resolve the current source's LLVM provider.
+        assert_eq!(builder.cache.contains::<llvm::LlvmFromCi>(), stage != 0);
+    }
+}
+
 fn check_cli<const N: usize>(paths: [&str; N]) {
     run_build(
         &paths.map(PathBuf::from),

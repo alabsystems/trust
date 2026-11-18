@@ -1,5 +1,29 @@
-#!/usr/bin/env python3
-"""Structural single-source check for the native-contract support crates.
+#!/bin/sh
+""":"
+for candidate in python3.14 python3.13 python3.12 python3.11; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+        exec "$candidate" "$0" "$@"
+    fi
+done
+exec python3 "$0" "$@"
+":"""
+import os as _floor_os
+import shutil as _floor_shutil
+import sys as _floor_sys
+
+# Trust: python floor, second half (PYTHON-FLOOR-RED-1). `python3 trust_floatbits_twin_parity.py`
+# reads the sh block above as a string, so an old `python3` (3.9 on macOS
+# CommandLineTools) re-execs here.
+if __name__ == "__main__" and _floor_sys.version_info < (3, 11):
+    for _floor_candidate in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _floor_path = _floor_shutil.which(_floor_candidate)
+        if _floor_path:
+            _floor_argv = [_floor_path, _floor_os.path.abspath(__file__), *_floor_sys.argv[1:]]
+            _floor_os.execv(_floor_path, _floor_argv)
+    # None on PATH: carry on; without tomllib, refuse_named_build_program scans lines and
+    # refuses every spelling of `build` but `build = false`.
+__doc__ = """Structural single-source check for the native-contract support crates.
 
 The historical harness still invokes this file under its floatbits-specific
 name. It now accepts any of the four migrated crate roots. The retired

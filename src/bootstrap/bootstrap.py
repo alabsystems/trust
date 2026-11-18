@@ -236,6 +236,14 @@ def bootstrap_jobs(configured_jobs, cli_jobs, env):
     return str(min(jobs, int(share)))
 
 
+def stage0_unpack_jobs(component_count, configured_jobs, cli_jobs, env):
+    """Keep parallel archive extraction within the same admitted CPU share."""
+    cpus = get_cpus()
+    if env.get("BUILD_SLOT_HELD") == "1":
+        cpus = min(cpus, int(bootstrap_jobs(configured_jobs, cli_jobs, env)))
+    return min(component_count, cpus)
+
+
 def eprint(*args, **kwargs):
     kwargs["file"] = sys.stderr
     print(*args, **kwargs)
@@ -1663,12 +1671,24 @@ def apply_trust_bootstrap_compiler_policy(rustc, env):
                 "too.".format(rustc, reason)
             )
             if reason.startswith("exit 75:"):
-                eprint(
-                    "help: exit 75 is a native custody or admission refusal, not a "
-                    "capability answer. Inside a managed context run x.py under "
-                    "scripts/build-slot, which admits the probe; otherwise remove the "
-                    "custody advertisement the refusal names from the environment."
-                )
+                if "trust-serial-command: refused: command launch:" in reason:
+                    eprint(
+                        "help: the serial owner refused while preparing, launching, or "
+                        "waiting for the probe; the reported OS error is not a compiler "
+                        "capability answer. Preserve and investigate the refusal."
+                    )
+                elif "command requires an already-admitted caller" in reason:
+                    eprint(
+                        "help: the serial owner requires an admitted caller; run x.py "
+                        "under scripts/build-slot. This refusal is not a compiler "
+                        "capability answer."
+                    )
+                else:
+                    eprint(
+                        "help: exit 75 is a native custody or admission refusal, not a "
+                        "compiler capability answer. Preserve and investigate the "
+                        "reported refusal."
+                    )
             env["TRUST_NO_VERIFY"] = "1"
         return False
 
@@ -1828,6 +1848,9 @@ class RustBuild(object):
          translate_legacy_tippy) = _identity_owner.component_archives(
             self.stage0_data, self.stage0_compiler.date, rustc_channel,
             self.build, tarball_suffix)
+        pool_size = stage0_unpack_jobs(
+            len(tarballs_to_download), self.jobs, self.cli_jobs, os.environ
+        )
 
         # Stage the replacement seed NEXT TO the live one (same filesystem,
         # so the final swap is a rename) and only touch bin_root once the
@@ -1862,7 +1885,6 @@ class RustBuild(object):
 
             # Unpack the tarballs in parallel.
             # In Python 2.7, Pool cannot be used as a context manager.
-            pool_size = min(len(tarballs_download_info), get_cpus())
             if self.verbose > 0:
                 print(
                     "Choosing a pool size of",

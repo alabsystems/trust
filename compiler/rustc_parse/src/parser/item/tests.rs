@@ -1,8 +1,27 @@
 // Trust: component identity must survive the syntax-only AST summary.
 use clean_parser::{SurfaceDecl, SurfaceName, TacticPatterns};
-use rustc_span::{create_default_session_globals_then, sym};
+use rustc_ast::ast::CleanDeclKind;
+use rustc_span::create_default_session_globals_then;
+use rustc_span::symbol::sym;
 
-use super::{CleanDeclKind, clean_decl_is_private, clean_decl_kind_and_name};
+use super::{clean_decl_is_private, clean_decl_kind_and_name};
+
+#[test]
+fn clean_ast_prelude_header_is_anonymous_syntax_without_a_binding() {
+    create_default_session_globals_then(|| {
+        let decls =
+            clean_parser::parse_file_with_tactics_located("prelude\n", &TacticPatterns::new())
+                .unwrap();
+        assert_eq!(decls.len(), 1);
+        assert!(matches!(&decls[0], SurfaceDecl::Prelude { .. }));
+        let (kind, name) = clean_decl_kind_and_name(&decls[0]).unwrap();
+        assert_eq!(kind, CleanDeclKind::Prelude);
+        assert_eq!(kind.descr(), "prelude");
+        assert_eq!(name, sym::empty);
+        assert!(!kind.introduces_name());
+        assert!(!clean_decl_is_private(&decls[0]));
+    });
+}
 
 #[test]
 fn clean_ast_names_preserve_components_and_canonicalize_quotes() {

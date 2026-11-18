@@ -25,6 +25,7 @@ ELF_MACHINES = {"aarch64-unknown-linux-gnu": 183, "x86_64-unknown-linux-gnu": 62
 LOADER_NAMES = {"aarch64-unknown-linux-gnu": "ld-linux-aarch64.so.1",
                 "x86_64-unknown-linux-gnu": "ld-linux-x86-64.so.2"}
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+DYNAMIC_STRING_TOKEN = re.compile(rb"\$(?:\{(?:ORIGIN|LIB|PLATFORM)\}|(?:ORIGIN|LIB|PLATFORM)(?![a-zA-Z0-9_]))")
 
 
 def digest(path: Path) -> str:
@@ -49,11 +50,10 @@ def native_elf(path: Path, host: str) -> None:
         raise Refusal(f"{path}: ELF platform differs from native {host}")
 
 
-def command(argv: list[str], *, role='elf-metadata') -> str:
+def command(argv: list[str], *, role='elf-loader') -> str:
     if '__trust_source_loader__' in globals() and __trust_source_loader__.context is not None:
         live = __trust_source_loader__.context
-        callsite = 'seed_linux.metadata' if role == 'elf-metadata' else 'seed_linux.loader'
-        result = live.auxiliary(role,callsite,argv,Path('/'),ENV,maximum=4*2**20,seconds=60)
+        result = live.auxiliary(role,'seed_linux.loader',argv,Path('/'),ENV,maximum=4*2**20,seconds=60)
         if result.returncode:
             raise Refusal(f'{argv!r}: {result.stderr.strip()[:500]}')
         return result.stdout
@@ -65,13 +65,11 @@ def command(argv: list[str], *, role='elf-metadata') -> str:
 
 
 
-def needed_entries(path: Path) -> list[int]:
-    """Read DT_NEEDED presence from ELF64 program headers, never loader text.
+def program_inventory(path: Path) -> dict:
+    """Read the loader-visible ELF64 interpreter and dynamic metadata.
 
-    ELF64 headers bound the program-header scan to fewer than 4 MiB. Refuse
-    unsupported extended counts and dynamic tables above 1 MiB rather than
-    walking arbitrary file contents. This reads no dependency name or code.
-    Native platform/mode admission remains the caller's native_elf check.
+    Program headers are authoritative for execution. Section names and
+    diagnostic renderings do not decide whether to invoke the loader.
     """
     def refused(detail):
         raise Refusal(f"{path}: invalid ELF dynamic inventory: {detail}")
@@ -88,6 +86,7 @@ def needed_entries(path: Path) -> list[int]:
         if phcount and (phsize != 56 or phoff < 64 or phoff + phcount * phsize > size):
             refused("program headers leave the file")
         dynamic = None
+        interpreter = None
         loads = []
         for index in range(phcount):
             stream.seek(phoff + index * phsize)
@@ -99,6 +98,15 @@ def needed_entries(path: Path) -> list[int]:
                 if length > memory or offset + length > size or address + memory > (1 << 64):
                     refused("invalid PT_LOAD extent")
                 loads.append((offset, address, length, memory))
+            if kind == 3:  # The kernel reads PT_INTERP from its file extent.
+                if interpreter is not None or not 1 < length <= 4096 or offset + length > size:
+                    refused("ambiguous or out-of-bounds PT_INTERP")
+                stream.seek(offset)
+                name = stream.read(length)
+                if (len(name) != length or name[-1:] != b"\0" or b"\0" in name[:-1]
+                        or not name.startswith(b"/")):
+                    refused("PT_INTERP is not one terminated absolute path")
+                interpreter = os.fsdecode(name[:-1])
             if kind != 2:  # PT_DYNAMIC, the loader's table; section headers are not authoritative.
                 continue
             if dynamic is not None:
@@ -109,45 +117,84 @@ def needed_entries(path: Path) -> list[int]:
                 refused("PT_DYNAMIC virtual extent overflows")
             dynamic = (offset, length, address)
         if dynamic is None:
-            return []
+            return {"interpreter": interpreter, "dynamic": False, "needed": []}
+
+        def mapped_offset(start: int, length: int, field: str) -> int:
+            covering = [load for load in loads
+                        if load[1] < start + length and start < load[1] + load[3]]
+            if len(covering) != 1:
+                refused(f"{field} needs one unambiguous PT_LOAD mapping")
+            file_offset, address, file_length, _memory = covering[0]
+            if not (address <= start and start + length <= address + file_length):
+                refused(f"{field} requires a file-backed PT_LOAD mapping")
+            return file_offset + start - address
+
         offset, length, address = dynamic
-        covering = [load for load in loads
-                    if load[1] < address + length and address < load[1] + load[3]]
-        if len(covering) != 1:
-            refused("PT_DYNAMIC needs one unambiguous PT_LOAD mapping")
-        file_offset, start, file_length, _memory = covering[0]
-        if not (start <= address and address + length <= start + file_length
-                and offset == file_offset + address - start):
+        if offset != mapped_offset(address, length, "PT_DYNAMIC"):
             refused("PT_DYNAMIC file offset differs from its file-backed PT_LOAD mapping")
         stream.seek(offset)
         needed = []
+        dynamic_tags = {}
         for _ in range(dynamic[1] // 16):
             raw = stream.read(16)
             if len(raw) != 16:
                 refused("truncated dynamic entry")
             tag, value = struct.unpack("<qQ", raw)
             if tag == 0:  # DT_NULL ends the loader-visible table.
-                return needed
-            if tag == 1:  # DT_NEEDED; its string-table offset is irrelevant to emptiness.
+                break
+            if tag == 1:  # DT_NEEDED
                 needed.append(value)
-        refused("missing DT_NULL terminator")
+            if tag in (0x6ffffefb, 0x6ffffefc):  # GNU DT_DEPAUDIT and DT_AUDIT
+                refused("embedded ELF audit modules are not admitted")
+            if tag in (0x7ffffffd, 0x7fffffff):  # DT_AUXILIARY and DT_FILTER
+                refused("embedded ELF filters are not admitted")
+            if tag in (5, 10, 15, 29):  # DT_STRTAB, DT_STRSZ, DT_RPATH, DT_RUNPATH
+                if tag in dynamic_tags:
+                    refused("ambiguous dynamic string-table or search-path tag")
+                dynamic_tags[tag] = value
+        else:
+            refused("missing DT_NULL terminator")
+
+        search_paths = [dynamic_tags[tag] for tag in (15, 29) if tag in dynamic_tags]
+        if needed or search_paths:
+            string_address = dynamic_tags.get(5)
+            string_size = dynamic_tags.get(10)
+            if string_address is None or not string_size or string_address + string_size > (1 << 64):
+                refused("ELF dependencies and search paths require a bounded dynamic string table")
+            string_offset = mapped_offset(string_address, string_size, "DT_STRTAB")
+
+            def dynamic_string(name_offset: int, field: str, limit: int) -> bytes:
+                if name_offset >= string_size:
+                    refused(f"{field} is outside the dynamic string table")
+                stream.seek(string_offset + name_offset)
+                raw = stream.read(min(string_size - name_offset, limit))
+                name, terminated, _remaining = raw.partition(b"\0")
+                if not terminated:
+                    refused(f"unterminated {field}")
+                return name
+
+            anchored_prefixes = (b"/", b"$ORIGIN/", b"${ORIGIN}/")
+            for name_offset in dict.fromkeys(needed):
+                name = dynamic_string(name_offset, "DT_NEEDED name", 4096)
+                if not name:
+                    refused("empty DT_NEEDED name")
+                # Token expansion can introduce a slash before the loader resolves a name.
+                if not name.startswith(anchored_prefixes) and (b"/" in name or DYNAMIC_STRING_TOKEN.search(name)):
+                    refused("cwd-dependent DT_NEEDED path is not admitted")
+            for name_offset in search_paths:
+                name = dynamic_string(name_offset, "ELF search path", 1 << 20)
+                if any(not entry.startswith(anchored_prefixes) for entry in name.split(b":")):
+                    refused("cwd-dependent ELF search path is not admitted")
+        return {"interpreter": interpreter, "dynamic": True, "needed": needed}
+
+
+def needed_entries(path: Path) -> list[int]:
+    return program_inventory(path)["needed"]
 
 
 def metadata(path: Path, host: str) -> dict:
     native_elf(path, host)
-    needed = needed_entries(path)
-    output = command(["/usr/bin/readelf", "--wide", "--program-headers", "--dynamic", str(path)])
-    if re.search(r"\((?:AUDIT|DEPAUDIT)\)", output):
-        raise Refusal(f"{path}: embedded ELF audit modules are not admitted")
-    for value in re.findall(r"\((?:RPATH|RUNPATH)\).*\[([^]]*)\]", output):
-        if any(not entry or not entry.startswith(("/", "$ORIGIN/", "${ORIGIN}/"))
-               for entry in value.split(":")):
-            raise Refusal(f"{path}: cwd-dependent ELF search path is not admitted")
-    interpreters = re.findall(r"Requesting program interpreter: ([^]]+)\]", output)
-    if len(interpreters) > 1:
-        raise Refusal(f"{path}: ambiguous ELF interpreter")
-    return {"interpreter": interpreters[0] if interpreters else None,
-            "dynamic": "Dynamic section at offset" in output, "needed": needed}
+    return program_inventory(path)
 
 
 def loader_rows(output: str, binary: Path, *, needed: list[int] | None = None) -> list[tuple[str, Path]]:

@@ -89,6 +89,9 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 
 pub struct TestOptions {
+    /// Independent ordinary-child narrowing DATA, combined with effective
+    /// configuration by the actual test owner. It supplies no admission.
+    pub child_supervision: Option<cargo_util::ChildSupervision>,
     pub compile_opts: ops::CompileOptions,
     pub no_run: bool,
     pub no_fail_fast: bool,
@@ -1829,7 +1832,7 @@ impl UnitTestError {
 /// On error, the returned [`CliError`] will have the appropriate process exit
 /// code that Cargo should use.
 pub fn run_tests(ws: &Workspace<'_>, options: &TestOptions, test_args: &[&str]) -> CliResult {
-    if try_run_prepared_tests(ws.gctx())? {
+    if try_run_prepared_tests(ws.gctx(), options.child_supervision)? {
         return Ok(());
     }
     if crate::trust_verified_targo() && !options.no_run {
@@ -1858,6 +1861,10 @@ pub fn run_tests(ws: &Workspace<'_>, options: &TestOptions, test_args: &[&str]) 
             error
         }
     })?;
+    let supervision = match &route {
+        graph::TestRoute::Graph(request) => request.policy.supervision(),
+        graph::TestRoute::Sequential(policy) => policy.supervision(),
+    };
     let mut compilation = match route {
         graph::TestRoute::Graph(request) => {
             let mut compilation = ops::cargo_compile::compile_with_test_execution(
@@ -1906,11 +1913,23 @@ pub fn run_tests(ws: &Workspace<'_>, options: &TestOptions, test_args: &[&str]) 
         )
         .into());
     }
+    if supervision.is_some() && !compilation.to_doc_test.is_empty() {
+        return Err(anyhow::anyhow!(
+            "configured native activity supervision cannot cover rustdoc-owned generated test processes; no legacy doctest execution was started"
+        ).into());
+    }
     let mut errors = if let Some(execution) = compilation.test_execution.take() {
         // Trust: each action carries its own arguments.
         graph::consume(ws, options, execution)?
     } else {
-        run_unit_tests(ws, options, test_args, &compilation, TestKind::Test)?
+        run_unit_tests(
+            ws,
+            options,
+            test_args,
+            &compilation,
+            TestKind::Test,
+            supervision,
+        )?
     };
 
     if ws.gctx().has_retained_test() {
@@ -2085,6 +2104,7 @@ fn execute_judged(
     who: Option<&str>,
     watch: Option<&plan_judge::Watch>,
     sink: graph::OutputSink,
+    supervision: Option<cargo_util::ChildSupervision>,
 ) -> CargoResult<()> {
     use crate::util::machine_message::TestOutputStream;
     use std::cell::RefCell;
@@ -2111,7 +2131,10 @@ fn execute_judged(
             sink.write(TestOutputStream::Stderr, line)
         },
         false,
-        graph::harness_output_limits(),
+        match supervision {
+            Some(policy) => graph::harness_output_limits().with_child_supervision(policy),
+            None => graph::harness_output_limits(),
+        },
     );
     let summary = summary.into_inner();
     // A failed exit is recorded with what the harness reported before it.
@@ -2146,7 +2169,7 @@ pub fn run_benches(ws: &Workspace<'_>, options: &TestOptions, args: &[&str]) -> 
     let mut args = args.to_vec();
     args.push("--bench");
 
-    let errors = run_unit_tests(ws, options, &args, &compilation, TestKind::Bench)?;
+    let errors = run_unit_tests(ws, options, &args, &compilation, TestKind::Bench, None)?;
     no_fail_fast_err(ws, &options.compile_opts, &errors)
 }
 
@@ -2166,10 +2189,14 @@ fn run_unit_tests(
     test_args: &[&str],
     compilation: &Compilation<'_>,
     test_kind: TestKind,
+    supervision: Option<cargo_util::ChildSupervision>,
 ) -> Result<Vec<UnitTestError>, CliError> {
     let gctx = ws.gctx();
     let cwd = gctx.cwd();
     let mut errors = Vec::new();
+    let signals = supervision
+        .map(|_| cargo_util::StreamingProcessScope::new())
+        .transpose()?;
 
     // Trust: only ordinary native Rust harnesses participate in this cooperative
     // policy. Prepared/authenticated commands, benches and custom runners retain
@@ -2214,6 +2241,10 @@ fn run_unit_tests(
             cmd.display_env_vars();
         }
 
+        if let Some(signals) = &signals {
+            cmd.supervised_by(signals);
+        }
+
         gctx.shell()
             .concise(|shell| shell.status("Running", &exe_display))?;
         gctx.shell()
@@ -2227,12 +2258,26 @@ fn run_unit_tests(
         let execution_result = if required {
             // Trust: the judge names who requires the result.
             let who = format!("required test binary `{}`", unit.target.name());
-            execute_judged(&cmd, Some(&who), None, graph::OutputSink::Raw)
+            execute_judged(&cmd, Some(&who), None, graph::OutputSink::Raw, supervision)
         } else if matches!(test_kind, TestKind::Bench) {
             // Trust: compilation has returned its queue/credits. Direct bench
             // leaves use the same funded target owner as run, never a second
             // admission or the already-managed test-action queue's scheduler.
             compilation.prepare_target_execution(cmd)?.exec()
+        } else if let Some(policy) = supervision {
+            cmd.exec_with_streaming_limits(
+                &mut |line| {
+                    graph::OutputSink::Raw
+                        .write(crate::util::machine_message::TestOutputStream::Stdout, line)
+                },
+                &mut |line| {
+                    graph::OutputSink::Raw
+                        .write(crate::util::machine_message::TestOutputStream::Stderr, line)
+                },
+                false,
+                graph::harness_output_limits().with_child_supervision(policy),
+            )
+            .map(drop)
         } else {
             cmd.exec()
         };

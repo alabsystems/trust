@@ -90,6 +90,7 @@ pub struct Config {
     c_cfg: Option<cc::Build>,
     cxx_cfg: Option<cc::Build>,
     env_cache: HashMap<String, Option<OsString>>,
+    cache_roots: Vec<PathBuf>,
 }
 
 /// Builds the native library rooted at `path` with the default cmake options.
@@ -220,7 +221,19 @@ impl Config {
             c_cfg: None,
             cxx_cfg: None,
             env_cache: HashMap::new(),
+            cache_roots: Vec::new(),
         }
+    }
+
+    /// Writes the directory `root` as a token wherever the request key
+    /// ([`Prepared::cache_inputs`]) would spell it, so two checkouts that differ only in where
+    /// they lie request the same build. Only the key changes: every command still names the
+    /// real paths. A root is replaced only where it stands as a whole path (the byte after it
+    /// ends a path component, the byte before it does not continue one); the roots are tried
+    /// in the order given.
+    pub fn cache_root<P: AsRef<Path>>(&mut self, root: P) -> &mut Config {
+        self.cache_roots.push(root.as_ref().to_owned());
+        self
     }
 
     /// Sets flag for PIC. Otherwise use cc::Build platform default
@@ -949,8 +962,9 @@ impl Config {
         let mut cleanup_inputs = None;
         if let Some(parent_cwd) = parent_cwd {
             let mut selection = Vec::new();
-            let bound = freeze_program(&mut configure, &mut selection, parent_cwd)
-                && freeze_program(&mut cmd, &mut selection, parent_cwd);
+            let roots = &self.cache_roots;
+            let bound = freeze_program_relocated(&mut configure, &mut selection, parent_cwd, roots)
+                && freeze_program_relocated(&mut cmd, &mut selection, parent_cwd, roots);
             if bound && !cleanup_opaque && reusable_configuration(self, &generator, &target) {
                 let mut paths = self
                     .input_paths
@@ -1386,6 +1400,50 @@ fn frame(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(value);
 }
 
+/// `value` with each of `roots` written as its token `\0trust-cmake-root-<index>\0` where it
+/// stands as a whole path: the byte after it is absent or ends a path component (`/`, or any
+/// byte but an ASCII letter, digit, `.`, `_` or `-`), and the byte before it is absent or is no
+/// such byte and no `/` either. A root that is empty or `/` alone is never replaced.
+fn relocated<'a>(value: &'a [u8], roots: &[PathBuf]) -> std::borrow::Cow<'a, [u8]> {
+    let continues = |byte: u8| byte.is_ascii_alphanumeric() || b"._-".contains(&byte);
+    let mut out = std::borrow::Cow::Borrowed(value);
+    for (index, root) in roots.iter().enumerate() {
+        let root = root.as_os_str().as_encoded_bytes();
+        let root = root.strip_suffix(b"/").unwrap_or(root);
+        if root.is_empty() {
+            continue;
+        }
+        let token = format!("\0trust-cmake-root-{index}\0").into_bytes();
+        let data = out.as_ref();
+        let mut next = Vec::with_capacity(data.len());
+        let (mut at, mut copied, mut changed) = (0, 0, false);
+        while let Some(found) = data[at..].windows(root.len()).position(|window| window == root) {
+            let start = at + found;
+            let end = start + root.len();
+            let before = start.checked_sub(1).map(|i| data[i]);
+            let whole = before.is_none_or(|byte| !continues(byte) && byte != b'/')
+                && data.get(end).is_none_or(|&byte| !continues(byte));
+            if whole {
+                next.extend_from_slice(&data[copied..start]);
+                next.extend_from_slice(&token);
+                copied = end;
+                changed = true;
+                at = end;
+            } else {
+                at = start + 1;
+            }
+            if at + root.len() > data.len() {
+                break;
+            }
+        }
+        if changed {
+            next.extend_from_slice(&data[copied..]);
+            out = std::borrow::Cow::Owned(next);
+        }
+    }
+    out
+}
+
 fn execution_only_build_args(args: &[OsString]) -> bool {
     fn positive_jobs(jobs: &str) -> bool {
         !jobs.is_empty()
@@ -1423,7 +1481,12 @@ fn reusable_configuration(
         && !resolved_target.contains("emscripten")
 }
 
-fn frame_selected_args(bytes: &mut Vec<u8>, command: &Command, execution: &[usize]) {
+fn frame_selected_args(
+    bytes: &mut Vec<u8>,
+    command: &Command,
+    execution: &[usize],
+    roots: &[PathBuf],
+) {
     let selected = command
         .get_args()
         .enumerate()
@@ -1432,7 +1495,7 @@ fn frame_selected_args(bytes: &mut Vec<u8>, command: &Command, execution: &[usiz
         .collect::<Vec<_>>();
     frame(bytes, &(selected.len() as u64).to_le_bytes());
     for value in selected {
-        frame(bytes, value.as_encoded_bytes());
+        frame(bytes, &relocated(value.as_encoded_bytes(), roots));
     }
 }
 
@@ -1449,13 +1512,17 @@ fn snapshot_inputs(
     if !reusable_configuration(config, generator, resolved_target) {
         return None;
     }
+    let roots = &config.cache_roots;
+    // A value is framed as the request names it, each root written as its token
+    // ([`Config::cache_root`]); counts and flags are framed as they are.
+    let named = |bytes: &mut Vec<u8>, text: &[u8]| frame(bytes, &relocated(text, roots));
     let mut bytes = b"trust-cmake:resolved-request:v2".to_vec();
     // Upstream find_exe uses the parent search context, independently of
     // explicit child PATH overrides. Record that request, not binary identity.
     let parent_path = env::var_os("PATH");
     bytes.push(u8::from(parent_path.is_some()));
     if let Some(path) = parent_path {
-        frame(&mut bytes, path.as_encoded_bytes());
+        named(&mut bytes, path.as_encoded_bytes());
     }
     // Record the selector observations themselves, including absent higher-priority
     // candidates. Shadowed lower-priority candidates are never queried.
@@ -1463,39 +1530,40 @@ fn snapshot_inputs(
     observations.sort_by_key(|(key, _)| *key);
     frame(&mut bytes, &(observations.len() as u64).to_le_bytes());
     for (key, value) in observations {
-        frame(&mut bytes, key.as_bytes());
+        named(&mut bytes, key.as_bytes());
         bytes.push(u8::from(value.is_some()));
         if let Some(value) = value {
-            frame(&mut bytes, value.as_encoded_bytes());
+            named(&mut bytes, value.as_encoded_bytes());
         }
     }
     for (index, command) in [configure, build].into_iter().enumerate() {
-        frame(&mut bytes, command.get_program().as_encoded_bytes());
+        named(&mut bytes, command.get_program().as_encoded_bytes());
         frame_selected_args(
             &mut bytes,
             command,
             if index == 0 { execution_configure_args } else { &[] },
+            roots,
         );
         frame(&mut bytes, &(command.get_envs().count() as u64).to_le_bytes());
         for (key, value) in command.get_envs() {
-            frame(&mut bytes, key.as_encoded_bytes());
+            named(&mut bytes, key.as_encoded_bytes());
             bytes.push(u8::from(value.is_some()));
             if let Some(value) = value {
-                frame(&mut bytes, value.as_encoded_bytes());
+                named(&mut bytes, value.as_encoded_bytes());
             }
         }
-        frame(&mut bytes, command.get_current_dir()?.as_os_str().as_encoded_bytes());
+        named(&mut bytes, command.get_current_dir()?.as_os_str().as_encoded_bytes());
     }
     for tool in tools {
-        frame(&mut bytes, tool.path().as_os_str().as_encoded_bytes());
+        named(&mut bytes, tool.path().as_os_str().as_encoded_bytes());
         frame(&mut bytes, &(tool.args().len() as u64).to_le_bytes());
         for arg in tool.args() {
-            frame(&mut bytes, arg.as_encoded_bytes());
+            named(&mut bytes, arg.as_encoded_bytes());
         }
         frame(&mut bytes, &(tool.env().len() as u64).to_le_bytes());
         for (key, value) in tool.env() {
-            frame(&mut bytes, key.as_encoded_bytes());
-            frame(&mut bytes, value.as_encoded_bytes());
+            named(&mut bytes, key.as_encoded_bytes());
+            named(&mut bytes, value.as_encoded_bytes());
         }
         bytes.extend_from_slice(&[
             u8::from(tool.is_like_gnu()),
@@ -1509,6 +1577,18 @@ fn snapshot_inputs(
 }
 
 fn freeze_program(command: &mut Command, observations: &mut Vec<u8>, parent_cwd: &Path) -> bool {
+    freeze_program_relocated(command, observations, parent_cwd, &[])
+}
+
+/// [`freeze_program`], recording its observations with `roots` written as tokens
+/// ([`Config::cache_root`]).
+fn freeze_program_relocated(
+    command: &mut Command,
+    observations: &mut Vec<u8>,
+    parent_cwd: &Path,
+    roots: &[PathBuf],
+) -> bool {
+    let frame = |bytes: &mut Vec<u8>, value: &[u8]| frame(bytes, &relocated(value, roots));
     // Portable unsupported search contexts stay nonreusable. No executable byte
     // identity is inferred from this lexical selection.
     if cfg!(windows) {
@@ -1785,6 +1865,27 @@ mod prepared_tests {
                 .then(|| "host-program".into())),
             Some("host-program".into())
         );
+    }
+
+    #[test]
+    fn a_cache_root_is_written_as_a_token_only_where_it_stands_as_a_whole_path() {
+        let roots = [PathBuf::from("/w/one"), PathBuf::from("/w/one/build/")];
+        let token = |text: &str| relocated(text.as_bytes(), &roots).into_owned();
+        // The same request in two trees: equal once each names its own root.
+        let other = [PathBuf::from("/elsewhere/two"), PathBuf::from("/elsewhere/two/build")];
+        assert_eq!(
+            token("-DCMAKE_INSTALL_PREFIX=/w/one/build/llvm;/w/one"),
+            relocated(b"-DCMAKE_INSTALL_PREFIX=/elsewhere/two/build/llvm;/elsewhere/two", &other)
+                .into_owned()
+        );
+        assert_eq!(token("/w/one/src"), b"\0trust-cmake-root-0\0/src".to_vec());
+        // Another directory that only begins with the root's spelling keeps it.
+        for kept in ["/w/one-two/src", "/w/oneself", "/x/w/one", "/w/one.d"] {
+            assert_eq!(token(kept), kept.as_bytes().to_vec(), "{kept}");
+        }
+        assert_eq!(relocated(b"/", &[PathBuf::from("/")]).into_owned(), b"/".to_vec());
+        // No root, no change: the key of a configuration that names none is as before.
+        assert!(matches!(relocated(b"/w/one", &[]), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
@@ -2068,7 +2169,7 @@ mod prepared_tests {
             command.arg("source");
             let execution = config.append_definitions(&mut command);
             let mut bytes = Vec::new();
-            frame_selected_args(&mut bytes, &command, &execution);
+            frame_selected_args(&mut bytes, &command, &execution, &[]);
             (command, bytes)
         };
         let first = request("1");

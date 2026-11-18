@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "trust-disasm"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "thiserror",
 ]
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "trust-machine-sem"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "thiserror",
  "trust-disasm",
@@ -241,11 +241,11 @@ dependencies = [
 
 [[package]]
 name = "trust-sha2"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-types"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "indexmap",
  "libc",

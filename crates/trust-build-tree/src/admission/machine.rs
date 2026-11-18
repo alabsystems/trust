@@ -19,8 +19,10 @@ mod quiet;
 #[cfg(feature = "native-exec")]
 #[path = "machine/runtime.rs"]
 mod runtime;
+#[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
+pub use handoff::ExecutionStartPipe;
 pub use handoff::{
-    EarlyFixedClaim, FIXED_HANDOFF_ENV, FixedCommandSignal, InheritedFixedClaim,
+    EarlyFixedClaim, FIXED_HANDOFF_ENV, FixedCommandSignal, InheritedFixedClaim, MemberDirectory,
     PreparedFixedCommand, RunningFixedCommand, RunningFixedGroup,
 };
 #[cfg(all(feature = "native-exec", target_os = "macos", target_arch = "aarch64"))]
@@ -28,6 +30,12 @@ pub use handoff::{PreparedNestedFixedCommand, RunningNestedFixedCommand};
 pub use policy::{FixedCommandAdmission, FixedCpuRequest};
 #[cfg(feature = "native-exec")]
 pub use runtime::{RuntimeClaimCurrency, RuntimeFixedClaim};
+
+#[derive(Clone, Copy)]
+enum FixedPublication {
+    ExistingLease,
+    UnlaunchedCommand,
+}
 
 impl Coordinator {
     /// Acquire worktree, legacy slots and actual native CPU room as one
@@ -70,7 +78,14 @@ impl Coordinator {
         pool: &Pool,
         budget: impl FnOnce(&Reservation) -> io::Result<NonZeroU32>,
     ) -> io::Result<Attempt<FixedClaim>> {
-        self.attempt_fixed_with_pool(memory, maximum, |_| Ok(pool.clone()), |_| Ok(()), budget)
+        self.attempt_fixed_with_pool(
+            memory,
+            maximum,
+            |_| Ok(pool.clone()),
+            |_| Ok(()),
+            budget,
+            FixedPublication::ExistingLease,
+        )
     }
 
     /// The pool opener runs only after the original legacy reservation is
@@ -83,6 +98,7 @@ impl Coordinator {
         open_pool: impl FnOnce(&Reservation) -> io::Result<Pool>,
         before_publish: impl FnOnce(&Reservation) -> io::Result<()>,
         budget: impl FnOnce(&Reservation) -> io::Result<NonZeroU32>,
+        publication: FixedPublication,
     ) -> io::Result<Attempt<FixedClaim>> {
         let mut native_wait = None;
         let result = self.attempt_with(memory, maximum, |mut reservation| {
@@ -91,9 +107,7 @@ impl Coordinator {
             }
             reservation.check_current()?;
             if reservation.slots.is_empty() {
-                return Err(invalid(
-                    "machine initialization requires original legacy exclusion",
-                ));
+                return Err(invalid("machine initialization requires original legacy exclusion"));
             }
             let pool = match open_pool(&reservation) {
                 Ok(pool) => pool,
@@ -111,7 +125,7 @@ impl Coordinator {
             // a prepared intent observed here must still refuse publication.
             before_publish(&reservation)?;
             let selected = budget(&reservation)?;
-            let claim = reservation.publish_fixed(pool.slots(), selected)?;
+            let claim = reservation.publish_fixed(pool.slots(), selected, publication)?;
             let original_admission = claim.original_exclusive_admission()?;
             let room = transaction.observe(
                 &claim.reservation.namespace,
@@ -140,11 +154,15 @@ impl Coordinator {
 /// native workers drain. No path, integer budget or marker constructs this type.
 pub struct FixedClaim {
     reservation: Reservation,
+    // Original SH queue fence, not another CPU lease and never serialized or
+    // delivered to a child. Keep it until the explicit launch/runtime handoff.
+    prelaunch_admission: Option<HeldLease>,
     lease_id: String,
     cpus: NonZeroU32,
     budget: NonZeroU32,
     record_pool_slots: u32,
     record: Vec<u8>,
+    output: Option<handoff::output_member::Issued>,
 }
 
 impl Reservation {
@@ -152,7 +170,12 @@ impl Reservation {
     /// CPU count is a measured machine width, not a caller's parallelism. The
     /// requested budget must fit the ACTUAL retained legacy slot share.
     /// This consumes no native CPU lease and launches nothing.
-    fn publish_fixed(self, cpus: NonZeroU32, budget: NonZeroU32) -> io::Result<FixedClaim> {
+    fn publish_fixed(
+        self,
+        cpus: NonZeroU32,
+        budget: NonZeroU32,
+        publication: FixedPublication,
+    ) -> io::Result<FixedClaim> {
         self.check_current()?;
         if cpus.get() > trust_build_cpu::MAX_SLOTS {
             return Err(invalid("fixed machine width exceeds the native bound"));
@@ -186,15 +209,19 @@ impl Reservation {
         }
         let mut claim = FixedClaim {
             reservation: self,
+            prelaunch_admission: None,
             lease_id,
             cpus,
             budget,
             record_pool_slots,
             record: Vec::new(),
+            output: None,
         };
         claim.publish_owner(std::process::id(), None)?;
-        // Ordinary fixed commands release admission after publishing their
-        // complete slot records. Exclusive commands retain the same EX fence.
+        // A generic V1 lease retains its existing publication semantics.
+        // An unlaunched command must keep its ORIGINAL SH fence: a later EX
+        // drain waiter is not new CPU work, but would otherwise become an
+        // UnknownExternal veto before this already-admitted command starts.
         if !claim.reservation.exclusive {
             let admission = claim
                 .reservation
@@ -205,7 +232,10 @@ impl Reservation {
                 return Err(invalid("fixed claim admission identity changed"));
             }
             admission.check()?;
-            drop(admission);
+            match publication {
+                FixedPublication::ExistingLease => drop(admission),
+                FixedPublication::UnlaunchedCommand => claim.prelaunch_admission = Some(admission),
+            }
         }
         claim.reservation.check_current()?;
         Ok(claim)
@@ -235,6 +265,10 @@ impl FixedClaim {
     /// Revalidate actual retained namespace/record owners and observe the SAME
     /// existing native manifest. Never creates or repairs a native CPU pool.
     pub fn observe_native_room(&self) -> io::Result<LegacyFixedRoom> {
+        self.observe_in_pool(&self.original_native_pool()?)
+    }
+
+    fn original_native_pool(&self) -> io::Result<Pool> {
         let (canonical_legacy, _) = trust_build_cpu::LegacyRetirement::canonical_layout()?;
         if fs::canonicalize(canonical_legacy)? != fs::canonicalize(&self.reservation.namespace)? {
             return Err(invalid(
@@ -244,7 +278,44 @@ impl FixedClaim {
         let pool = Pool::open_existing(&trust_build_cpu::capacity_dir()?)?.ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "original native CPU pool is unavailable")
         })?;
-        self.observe_in_pool(&pool)
+        Ok(pool)
+    }
+
+    fn observe_native_room_before(
+        &self,
+        deadline: std::time::Instant,
+        busy: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<LegacyFixedRoom> {
+        self.observe_in_pool_before(&self.original_native_pool()?, deadline, busy)
+    }
+
+    fn observe_in_pool_before(
+        &self,
+        pool: &Pool,
+        deadline: std::time::Instant,
+        busy: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<LegacyFixedRoom> {
+        self.check_current()?;
+        if pool.slots() != self.cpus {
+            return Err(invalid("fixed claim and original native machine width differ"));
+        }
+        let transaction = handoff::original_transaction_before_checked(pool, deadline, busy)?;
+        let observed = transaction.observe(
+            &self.reservation.namespace,
+            NonZeroU32::new(self.reservation.minimum_slots).unwrap(),
+            self.original_exclusive_admission()?,
+        )?;
+        self.check_current()?;
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original fixed prelaunch observation exceeded its deadline",
+            ));
+        }
+        // Readiness is not a launch grant. Never fork or execute a child while
+        // retaining the native manifest transaction.
+        drop(transaction);
+        Ok(observed)
     }
 
     fn observe_in_pool(&self, pool: &Pool) -> io::Result<LegacyFixedRoom> {
@@ -265,12 +336,22 @@ impl FixedClaim {
     /// Native observations do not substitute for original record custody.
     pub fn check_current(&self) -> io::Result<()> {
         self.reservation.check_current()?;
+        if let Some(output) = &self.output {
+            output.check()?;
+        }
+        if let Some(admission) = &self.prelaunch_admission {
+            admission.check()?;
+        }
         for lease in self.reservation.held.iter().chain(&self.reservation.slots) {
             if read_record(&lease.file)? != self.record {
                 return Err(invalid("original fixed reservation record changed"));
             }
         }
         Ok(())
+    }
+
+    fn release_prelaunch_admission(&mut self) {
+        drop(self.prelaunch_admission.take());
     }
 
     fn publish_owner(&mut self, pid: u32, supervisor_pid: Option<u32>) -> io::Result<()> {
@@ -281,16 +362,20 @@ impl FixedClaim {
             SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?.as_secs_f64();
         let cwd = std::env::current_dir()?;
         let (claim_file_count, claim_files_sha256) = handoff::fingerprint_claim(self)?;
-        let record = serde_json::to_vec(&serde_json::json!({
+        let mut record = serde_json::json!({
             "pid":pid,"supervisor_pid":supervisor_pid,"cmd":"native fixed command",
             "cwd":cwd.to_string_lossy(),"cwd_bytes":cwd.as_os_str().as_bytes(),"started":started,
             "cpu_mode":"fixed-v1","cpu_budget":self.budget.get(),
             "pool_slots":self.record_pool_slots,"lease_id":self.lease_id,
-            "exclusive":self.reservation.exclusive,"native_fixed_version":1,
+            "exclusive":self.reservation.exclusive,"native_fixed_version":if self.output.is_some() { 2 } else { 1 },
             "machine_cpus":self.cpus.get(),"minimum_slots":self.reservation.minimum_slots,
             "claim_file_count":claim_file_count,"claim_files_sha256":claim_files_sha256
-        }))
-        .map_err(io::Error::other)?;
+        });
+        if let Some(output) = &self.output {
+            record["output_member_sha256"] =
+                serde_json::to_value(output.wire()?.digest()?).map_err(io::Error::other)?;
+        }
+        let record = serde_json::to_vec(&record).map_err(io::Error::other)?;
         if record.len() as u64 > MAX_RECORD {
             return Err(invalid("fixed owner record exceeds its bound"));
         }

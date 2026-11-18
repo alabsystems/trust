@@ -20,7 +20,10 @@ pub const EXECUTION_VERSION: u32 = 1;
 // Trust: declares complete primary-process observations, separately from
 // dispatch. An old log without this declaration never establishes zero work.
 pub const COMPILER_OBSERVATION_VERSION: u32 = 1;
-pub const SHARED_DEPENDENCY_POLICY_VERSION: u32 = 1;
+// Trust (DC-18b): 2 admits workspace members and their six exclusions.
+// Trust (DC-18c): 3 admits members with a build script or a proc-macro
+// dependency, names the units they are keyed on, and adds two exclusions.
+pub const SHARED_DEPENDENCY_POLICY_VERSION: u32 = 3;
 
 /// A diagnostic description of the scheduler's actual sharing policy.
 /// This never grants cache, compiler, proof or resource authority.
@@ -30,8 +33,37 @@ pub enum SharedDependencyDecision {
     // An empty struct (rather than a unit variant) enforces unknown-field
     // rejection in serde's internally tagged representation.
     Eligible {},
-    Excluded { reason: SharedDependencyExclusion },
-    DependencyBlocked { dependencies: Vec<UnitIndex> },
+    Excluded {
+        reason: SharedDependencyExclusion,
+    },
+    DependencyBlocked {
+        dependencies: Vec<UnitIndex>,
+    },
+    /// Trust (DC-24a): an eligible unit whose check missed under its lock was
+    /// staged by the build's unit source, and the check then passed: the
+    /// build used it and compiled nothing for it. Logged during execution.
+    Taken {},
+    /// Trust (DC-24a): the unit source staged the unit and the build refused
+    /// it, so it compiled. Logged during execution.
+    Refused {
+        reason: UnitSourceRefusal,
+    },
+}
+
+/// Trust (DC-24a): why a unit a unit source staged was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnitSourceRefusal {
+    /// The staged fingerprint record is not the one this build computed: the
+    /// unit was recorded for other inputs. Nothing was placed.
+    FingerprintDiffers,
+    /// Placed, and its outputs do not match the receipt recorded with them.
+    OutputIntegrity,
+    /// The staged folder lacks the unit's fingerprint record, holds a planned
+    /// file that is not a plain file, or a planned file could not be placed.
+    Incomplete,
+    /// Placed, and the check under the lock still missed for another reason.
+    Stale,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -45,6 +77,42 @@ pub enum SharedDependencyExclusion {
     BuildScriptPackage,
     UnsupportedMode,
     UnsupportedCrateType,
+    /// Trust (DC-18b): a workspace member's library that cannot be confined:
+    /// its package directory holds or sits in a build output, the cargo home
+    /// or the store, it would write an unremap file naming the workspace, the
+    /// caller's flags remap paths, the compiler cannot show it path-free, or
+    /// the build runs under a native resource owner, a `targo fix` proxy or a
+    /// forced rebuild.
+    MemberNotConfined,
+    /// Trust (DC-18b): git reports a change at or below the member's package
+    /// directory: only committed sources are shared, and the member being
+    /// edited keeps its incremental state.
+    MemberUncommitted,
+    /// Trust (DC-18b): the member's package tree cannot be captured (a link,
+    /// a special file, a bound exceeded), or it moved while this process built
+    /// it.
+    MemberSourceUncaptured,
+    /// Trust (DC-18b): `-Ztrust-path-free` refused this member's metadata for
+    /// this environment, compiler, lockfile and manifest: it needs its real
+    /// path.
+    PathBound,
+    /// Trust (DC-18b): the member's shared compile failed for these sources,
+    /// environment and compiler (a read outside its package, say).
+    MemberCompileFailed,
+    /// Trust (DC-18b): the member's store slot holds a unit recorded for other
+    /// bytes than this build's. The slot is never written over.
+    MemberSlotDiffers,
+    /// Trust (DC-18c): what the member is keyed on beyond its sources (the
+    /// output of a build script whose output reaches its command, its own
+    /// script's `OUT_DIR`, a proc macro's library) cannot be read whole (a
+    /// link in `OUT_DIR`, a bound exceeded), or it changed after the build
+    /// was planned twice in this invocation.
+    MemberInputsMoved,
+    /// Trust (DC-18c): a library outside the workspace whose command takes
+    /// the output of a workspace member's build script (the script's link
+    /// search paths reach every library that links the member), which its
+    /// slot, named by its unit, does not hold.
+    MemberScriptDependency,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,12 +166,19 @@ pub enum LogMessage {
     /// Trust: queue accounting uses the preceding UnitRegistered denominator.
     /// This scope covers compilation jobs, including fresh/no-op and build
     /// script jobs; it does not declare a unified verification/test graph.
-    ExecutionEnabled {
-        version: u32,
-    },
+    ExecutionEnabled { version: u32 },
     SharedDependencyPolicy {
         version: u32,
         enabled: bool,
+        /// Trust (DC-18b): the units of workspace members, whose packages are
+        /// requested and may still be shared.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<UnitIndex>,
+        /// Trust (DC-18c): the build-script runs and proc macros a member may
+        /// be keyed on rather than share: they stay per checkout, and a
+        /// member's slot is named by their output.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keyed: Vec<UnitIndex>,
     },
     SharedDependencyDecision {
         index: UnitIndex,
@@ -138,9 +213,7 @@ pub enum LogMessage {
         not_executed: u64,
     },
     /// Trust: the file logger supports scoped build-script input accounting.
-    InputWorkEnabled {
-        version: u32,
-    },
+    InputWorkEnabled { version: u32 },
     /// Trust: capture IDs are allocated within this build, before scanning.
     InputWorkStarted {
         capture: u64,
@@ -157,9 +230,7 @@ pub enum LogMessage {
     },
     /// Trust: the coordinator drained the jobs and accounts for every allocated
     /// capture. An aborted queue must not synthesize this acknowledgement.
-    InputWorkFinalized {
-        captures: u64,
-    },
+    InputWorkFinalized { captures: u64 },
     /// Trust: emitted after all queued events; this is not build-success evidence.
     InputWorkClosed {
         version: u32,

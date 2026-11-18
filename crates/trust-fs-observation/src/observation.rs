@@ -168,25 +168,32 @@ impl Window {
     }
 
     pub fn covers(&self, after: &Observation) -> bool {
+        self.check_covers(after).is_ok()
+    }
+
+    // Preserve the exact coverage comparison while retaining its first failing
+    // path for callers which can report the original observation refusal.
+    pub(crate) fn check_covers(&self, after: &Observation) -> CargoResult<()> {
         // Other platforms without a reliable non-restorable change stamp are
         // conservatively uncacheable after execution.
         if !cfg!(unix) {
-            return false;
+            bail!("execution-window change stamps are unsupported on this platform");
         }
         let before: std::collections::BTreeMap<_, _> = self
             .observed
             .iter()
             .map(|(path, metadata)| (path, metadata))
             .collect();
-        after.observed.iter().all(|(path, metadata)| {
-            before
-                .get(path)
-                .is_some_and(|before| match (before, metadata) {
-                    (Some(before), Some(after)) => same(before, after),
-                    (None, None) => true,
-                    _ => false,
-                })
-        })
+        for (path, metadata) in &after.observed {
+            match before.get(path) {
+                Some(before)
+                    if matches!((before, metadata), (Some(a), Some(b)) if same(a, b))
+                        || matches!((before, metadata), (None, None)) => {}
+                Some(_) => bail!("execution-window input changed at {path:?}"),
+                None => bail!("execution-window input was not originally observed at {path:?}"),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -267,12 +274,26 @@ impl Capture {
     }
 
     fn revalidate(&mut self) -> CargoResult<()> {
-        let validate =
-            |path: &Path, before: &Option<Metadata>| match (before, fs::symlink_metadata(path)) {
-                (Some(before), Ok(after)) if same(before, &after) => Ok(()),
-                (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                _ => bail!("build-script input inventory changed during capture"),
-            };
+        let validate = |path: &Path, before: &Option<Metadata>| match (
+            before,
+            fs::symlink_metadata(path),
+        ) {
+            (Some(before), Ok(after)) if same(before, &after) => Ok(()),
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            (_, Err(error)) => Err(error).with_context(|| {
+                format!("build-script input inventory changed during capture at {path:?}")
+            }),
+            (Some(_), Ok(_)) => {
+                bail!(
+                    "build-script input inventory changed during capture at {path:?}: metadata changed"
+                )
+            }
+            (None, Ok(_)) => {
+                bail!(
+                    "build-script input inventory changed during capture at {path:?}: entry appeared"
+                )
+            }
+        };
         if self.reuse_prefixes {
             // Preserve the FIRST observation, including misses and links.
             // A fresh conflicting duplicate cannot replace original custody.
@@ -283,7 +304,7 @@ impl Capture {
                 if !matches!((*original, metadata), (None, None))
                     && !matches!((*original, metadata), (Some(a), Some(b)) if same(a, b))
                 {
-                    bail!("conflicting build-script input observations during capture");
+                    bail!("conflicting build-script input observations during capture at {path:?}");
                 }
             }
             for (path, before) in first {
@@ -1325,6 +1346,43 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn capture_refusal_names_the_changed_entry_without_extra_metadata_reads() {
+        settled(|world| {
+            let unchanged = world.path().join("a-unchanged");
+            let changed = world.path().join("z-changed");
+            let missing = world.path().join("zz-missing");
+            fs::write(&unchanged, b"stable").unwrap();
+            for reuse in [false, true] {
+                fs::write(&changed, b"old").unwrap();
+                let mut capture = Capture::new(Purpose::Content, reuse);
+                for path in [&unchanged, &changed] {
+                    capture
+                        .record(path.to_owned(), Some(fs::symlink_metadata(path).unwrap()))
+                        .unwrap();
+                }
+                capture.record(missing.clone(), None).unwrap();
+                capture.revalidate().unwrap();
+                let before = capture.work();
+                fs::write(&changed, b"new, longer contents").unwrap();
+                let error = capture.revalidate().unwrap_err().to_string();
+                assert!(error.contains(&changed.display().to_string()), "{error}");
+                assert!(!error.contains(&unchanged.display().to_string()), "{error}");
+                assert_eq!(capture.metadata_reads - before.metadata_reads, 2);
+                assert_eq!(capture.revalidations - before.revalidations, 2);
+
+                let mut absent = Capture::new(Purpose::Content, reuse);
+                absent.record(missing.clone(), None).unwrap();
+                absent.revalidate().unwrap();
+                fs::write(&missing, b"appeared").unwrap();
+                let error = absent.revalidate().unwrap_err().to_string();
+                assert!(error.contains(&missing.display().to_string()), "{error}");
+                fs::remove_file(&missing).unwrap();
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fresh_conflicting_duplicates_cannot_replace_first_observations() {
         settled(|world| {
             let root = world.path().canonicalize().unwrap();
@@ -1534,6 +1592,8 @@ mod tests {
             let after = observe(world.path(), &paths, true).unwrap();
             assert_eq!(before_content, after.snapshot);
             assert!(!before.covers(&after));
+            let error = before.check_covers(&after).unwrap_err().to_string();
+            assert!(error.contains(&path.display().to_string()), "{error}");
         })
     }
 

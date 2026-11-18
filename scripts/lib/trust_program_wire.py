@@ -53,10 +53,13 @@ def _names(value, name):
 def inspect_wire(stderr, stdout, *, crate_name, session, required_functions):
     """Reconcile every observed function; required bodies are a floor, never a filter.
 
+    Pass None when the caller has no independent list of expected bodies.
     This validates accounting and reported outcomes, not proof artifacts or the
     independent Lean registry. An empty obligation list earns zero proved rows.
     """
-    if not required_functions or not all(isinstance(x, str) and x for x in required_functions):
+    if required_functions is not None and (
+        not required_functions or not all(isinstance(x, str) and x for x in required_functions)
+    ):
         raise WireError("at least one expected fixture function is required")
     if "TRUST_JSON" in stdout:
         raise WireError("verification transport appeared on stdout")
@@ -106,7 +109,7 @@ def inspect_wire(stderr, stdout, *, crate_name, session, required_functions):
         raise WireError("function coverage is empty or incomplete")
     if _count(coverage, "eligible") != len(eligible) or _count(coverage, "processed") != len(processed):
         raise WireError("coverage counts disagree with their function inventories")
-    if not set(required_functions) <= set(eligible):
+    if required_functions is not None and not set(required_functions) <= set(eligible):
         raise WireError("expected fixture function is missing from coverage")
     # T3 L4 C09w: the coverage row carries a required memory summary.
     memory = coverage.get("memory")
@@ -162,7 +165,8 @@ def inspect_wire(stderr, stdout, *, crate_name, session, required_functions):
     }
     if any(_count(summaries[0], key) != value for key, value in expected_summary.items()):
         raise WireError("crate summary disagrees with complete function result population")
-    return {"functions": sorted(functions), "counts": dict(totals), "nonclean": nonclean}
+    return {"functions": sorted(functions), "function_results": functions,
+            "counts": dict(totals), "nonclean": nonclean}
 
 
 def acceptable(report, allowed_unknown_kind=None):

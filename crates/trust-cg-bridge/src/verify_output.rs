@@ -224,6 +224,14 @@ pub enum ProvenEvidence {
     ///       ordered input, unreduced goal and proof SHA256. Its Rust Formula-to-CIC
     ///       translation remains trusted; execution coverage/freshness/frame
     ///       authority must be supplied separately by the consumer.
+    ///   (d) CANONICAL ORIGINAL FORMULA (model four, opt-in): the exact full
+    ///       typed input bytes are data for TrustIR's Lean-owned parser and
+    ///       original semantics. A checked canonical relation connects those
+    ///       semantics to the actual goal, and the final original proposition
+    ///       must itself pass the kernel. Its retained label/evidence lists
+    ///       the canonical foundational axioms; it makes no empty-axiom,
+    ///       compiled-checker or compiler self-proof claim. CER replay also
+    ///       checks its independently rebuilt canonical preconditions.
     KernelInstantiated {
         /// The clean lemma(s) the discharge rests on (for the report / audit).
         theorem: String,
@@ -3931,6 +3939,10 @@ pub(crate) enum AbiDischarge {
     /// ay proved every residual conjunct valid. ay is the SOLE authority for
     /// them, so the function's grade is capped at [VALIDATED].
     SolverValidated,
+    /// The retained original conjunction must check every actual residual.
+    /// This is only a replay plan; no grade survives without that proof.
+    #[cfg(feature = "fmrel")]
+    RetainedOriginal,
     /// O0 ended in a non-Proven verdict (`Refuted` or `Unknown`).
     Verdict(OutputVerdict),
 }

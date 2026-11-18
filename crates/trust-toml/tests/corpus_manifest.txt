@@ -1,3 +1,4 @@
+# 2026-11-16: include incoming boxed_closure_attachment/Cargo.toml; 1516 -> 1517 documents, one addition and no removals.
 # 2026-11-15: follow the actual stage-0 channel manifest rename 2026-11-07 -> 2026-11-15; 1515 documents, one dated input replaced, no exclusion.
 # 2026-11-14: include pointer_parts_operational/lakefile.toml, the retained Lean proof probe input; 1511 -> 1512 documents, no removals.
 # 2026-11-15: retain incoming native_check_all_targets fixture manifest; one document added, none removed.
@@ -358,6 +359,7 @@ crates/trust-cg-bridge/Cargo.toml
 crates/trust-checksum/Cargo.toml
 crates/trust-clean-carrier/Cargo.toml
 crates/trust-clean-ir-gate/Cargo.toml
+crates/trust-clean-ir-gate/probes/boxed_closure_attachment/Cargo.toml
 crates/trust-clean-ir/Cargo.toml
 crates/trust-clean-origin/Cargo.toml
 crates/trust-clean/Cargo.toml

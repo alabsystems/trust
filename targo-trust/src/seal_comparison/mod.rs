@@ -86,6 +86,8 @@ pub(crate) enum NewRed {
     Ending { deployed: String, candidate: String },
     /// A named red (a failing test) of the candidate that the deployed run lacks.
     Named(String),
+    /// A failed test reported by a concluded libtest harness.
+    Test { package: String, case: String },
     /// A proof at a site both records hold: proved before, not proved now.
     LostProof { site: Site, proved_before: usize, proved_now: usize, now: String, clock: bool },
     /// Proofs at sites the candidate no longer has, in a function whose new
@@ -100,6 +102,7 @@ impl NewRed {
                 format!("ending\tdeployed {deployed}\tcandidate {candidate}")
             }
             Self::Named(name) => format!("named red\t{name}"),
+            Self::Test { package, case } => format!("failed test\t{package}\t{case}"),
             Self::LostProof { site, proved_before, proved_now, now, clock } => format!(
                 "lost proof{}\t{}\t{}\t{}\t{}:{}:{}\tproved {proved_before} -> {proved_now}\tnow {now}",
                 if *clock { " (clock-stopped)" } else { "" },
@@ -155,7 +158,23 @@ pub(crate) struct Comparison {
 }
 
 /// Why a pair of finished runs cannot be compared.
-pub(crate) fn incomparable(deployed: &RunRecord, candidate: &RunRecord) -> Option<String> {
+pub(crate) fn incomparable(deployed: &Run, candidate: &Run) -> Option<String> {
+    let (deployed_record, candidate_record) = (&deployed.record, &candidate.record);
+    if let Some(why) = incomparable_records(deployed_record, candidate_record) {
+        return Some(why);
+    }
+    if !deployed.tests.keys().eq(candidate.tests.keys()) {
+        return Some("the runs report test evidence for different packages".into());
+    }
+    for (package, old) in &deployed.tests {
+        if !candidate.tests.get(package).is_some_and(|new| old.population_matches(new)) {
+            return Some(format!("the runs report different test populations for {package:?}"));
+        }
+    }
+    None
+}
+
+fn incomparable_records(deployed: &RunRecord, candidate: &RunRecord) -> Option<String> {
     if deployed.consumer != candidate.consumer {
         return Some(format!(
             "the runs are of different consumers: deployed {:?}, candidate {:?}",
@@ -239,6 +258,13 @@ pub(crate) fn compare(deployed: &Run, candidate: &Run) -> Comparison {
     for name in &candidate.record.reds {
         if !known.contains(name) {
             new_reds.insert(NewRed::Named(name.clone()));
+        }
+    }
+    for (package, measurement) in &candidate.tests {
+        for case in measurement.failures() {
+            if !deployed.tests.get(package).is_some_and(|old| old.failed(case)) {
+                new_reds.insert(NewRed::Test { package: package.clone(), case: case.clone() });
+            }
         }
     }
 

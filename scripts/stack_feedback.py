@@ -126,7 +126,7 @@ def source_identity(root: Path, require_lock: bool = True, *, cargo_checkout: bo
         raise Refused(f"source has assume-unchanged/skip-worktree paths: {root}")
     rows = [row for row in git(root, "ls-tree", "-r", "-z", "HEAD").split("\0") if row]
     bound_files = {root / row.split("\t", 1)[1] for row in rows
-                   if row.split("\t", 1)[0].split()[1] == "blob"}
+                   if row.startswith(("100644 blob ", "100755 blob "))}
     digest = hashlib.sha256()
     for row in rows:
         if not row:
@@ -134,6 +134,7 @@ def source_identity(root: Path, require_lock: bool = True, *, cargo_checkout: bo
         header, name = row.split("\t", 1)
         mode, kind, oid = header.split()
         path = root / name
+        resolved_target = None
         if mode == "160000":
             child = source_identity(path.resolve(), require_lock=False)
             if child["commit"] != oid:
@@ -143,12 +144,12 @@ def source_identity(root: Path, require_lock: bool = True, *, cargo_checkout: bo
             if not path.is_symlink():
                 raise Refused(f"source symlink changed kind: {path}")
             content = os.fsencode(os.readlink(path))
-            # Hashing link text alone does not bind bytes the compiler reads.
-            # Only a regular-file target already covered by this Git closure
-            # is admitted. Directory links and links into ignored files refuse.
+            # Bind which regular file this link selects as well as its Git
+            # blob. An ignored intermediate hop can select a different file.
             target = path.resolve(strict=True)
             if target not in bound_files or not target.is_file():
                 raise Refused(f"source link escapes the fully bound file closure: {path}")
+            resolved_target = target.relative_to(root)
         elif kind == "blob" and path.is_file() and not path.is_symlink():
             content = path.read_bytes()
             actual_mode = "100755" if path.stat().st_mode & 0o111 else "100644"
@@ -161,6 +162,8 @@ def source_identity(root: Path, require_lock: bool = True, *, cargo_checkout: bo
             if hashlib.sha1(blob).hexdigest() != oid:
                 raise Refused(f"working source bytes differ from HEAD: {path}")
         digest.update(os.fsencode(name) + b"\0" + content + b"\0")
+        if resolved_target is not None:
+            digest.update(os.fsencode(resolved_target) + b"\0")
     result = {"path": str(root), "commit": git(root, "rev-parse", "HEAD").strip(),
             "tree": git(root, "rev-parse", "HEAD^{tree}").strip(), "working_sha256": digest.hexdigest(),
             "lock_sha256": sha(root / "Cargo.lock") if require_lock or (root / "Cargo.lock").is_file() else None}
@@ -212,8 +215,10 @@ def dependency_identity(root: Path) -> str:
                 raise Refused(f"unsupported dependency source input: {path}")
             digest.update(os.fsencode(path.relative_to(root)) + b"\0" + str(mode).encode() + b"\0" + content + b"\0")
     for path in links:
-        if path.resolve(strict=True) not in bound_files:
+        target = path.resolve(strict=True)
+        if target not in bound_files:
             raise Refused(f"dependency link escapes the fully bound file closure: {path}")
+        digest.update(os.fsencode(target.relative_to(root)) + b"\0")
     return digest.hexdigest()
 
 
@@ -228,9 +233,13 @@ def tree_stats(root: Path, exclude_git: bool = False) -> dict:
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
             info = path.lstat()
-            if path.is_symlink() and not path.resolve().is_relative_to(root):
-                raise Refused(f"toolchain link escapes its immutable root: {path}")
-            result[relative] = [info.st_mode, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+            entry = [info.st_mode, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+            if stat.S_ISLNK(info.st_mode):
+                target = path.resolve()
+                if not target.is_relative_to(root):
+                    raise Refused(f"toolchain link escapes its immutable root: {path}")
+                entry.append(target.relative_to(root).as_posix())
+            result[relative] = entry
     return result
 
 

@@ -3571,7 +3571,8 @@ def check_config_drift(root: Path, cfg: dict, rep: Report) -> None:
              "   # regenerate (rewrites machine paths too - re-check them after)"])
 
 
-def check_misc(root: Path, cfg: dict, rep: Report, *, standalone_tool: bool = False) -> None:
+def check_misc(root: Path, cfg: dict, rep: Report, *, standalone_tool: bool = False,
+               build_dir: str | None = None, invocation_cwd: Path | None = None) -> None:
     check = "4. BUILD ENVIRONMENT"
     build = cfg.get("build") or {}
     py = build.get("python")
@@ -3588,13 +3589,34 @@ def check_misc(root: Path, cfg: dict, rep: Report, *, standalone_tool: bool = Fa
             rep.add(FAIL, check, "codegen-backends lists trust-cg but its source is absent", [],
                     [SUBMODULE_RESTORE])
 
-    free = shutil.disk_usage(root).free / 1e9
+    # Bootstrap resolves relative build paths against its invocation directory,
+    # and the CLI selector overrides the effective TOML setting. A fresh target
+    # need not exist yet: its nearest existing directory owns its volume.
+    selected = build_dir if build_dir is not None else build.get("build-dir", "build")
+    try:
+        if not isinstance(selected, str) or not selected:
+            raise ValueError("build directory must be a nonempty path string")
+        destination = Path(selected)
+        if not destination.is_absolute():
+            destination = (invocation_cwd or root) / destination
+        destination = destination.resolve()
+        volume = destination
+        while not volume.exists() and volume != volume.parent:
+            volume = volume.parent
+        if not volume.is_dir():
+            raise ValueError(f"build directory ancestor is not a directory: {volume}")
+        free = shutil.disk_usage(volume).free / 1e9
+    except (OSError, RuntimeError, ValueError) as error:
+        rep.add(FAIL, check, "cannot measure the selected build volume", [str(error)])
+        return
     if free < 25:
         rep.add(FAIL if free < 10 else WARN, check,
-                f"only {free:.1f} GB free - a stage2 build needs ~25-40 GB", [],
-                [f"# free space under {root}/build before starting"])
+                f"only {free:.1f} GB free - a stage2 build needs ~25-40 GB",
+                [f"selected build directory: {destination}", f"measured existing ancestor: {volume}"],
+                [f"# free space on the volume containing {destination} before starting"])
     else:
-        rep.add(INFO, check, f"{free:.0f} GB free on the build volume")
+        rep.add(INFO, check, f"{free:.0f} GB free on the build volume",
+                [f"selected build directory: {destination}", f"measured existing ancestor: {volume}"])
 
 
 def check_lock_mtimes(root: Path, workspaces: list[Path], rep: Report) -> None:
@@ -3704,6 +3726,8 @@ def main() -> int:
                     help="audit a candidate config instead of <repo>/bootstrap.toml")
     ap.add_argument("--bootstrap-cwd", default=None,
                     help=argparse.SUPPRESS)
+    ap.add_argument("--build-dir", default=None,
+                    help="audit the explicit bootstrap build directory (overrides build.build-dir)")
     ap.add_argument("--set", dest="bootstrap_set", action="append", default=[],
                     help="apply a bootstrap --set override before auditing")
     ap.add_argument("--deep", action="store_true",
@@ -3809,7 +3833,8 @@ def main() -> int:
         with build_phase("config-drift", args.for_build):
             check_config_drift(root, cfg, rep)
         with build_phase("misc", args.for_build):
-            check_misc(root, cfg, rep, standalone_tool=standalone_tool)
+            check_misc(root, cfg, rep, standalone_tool=standalone_tool,
+                       build_dir=args.build_dir, invocation_cwd=bootstrap_cwd)
 
     rc = rep.emit(time.time() - t0, checks_run)
     if args.verdict_file:

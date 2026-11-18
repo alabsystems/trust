@@ -380,6 +380,13 @@ pub enum FixableWarnings {
 
 pub struct ErrorsDuringDrain {
     pub count: usize,
+    /// Trust (DC-18c): how many of `count` are shared members refused for
+    /// this attempt (`shared_dependencies::MemberRefusal`). A refusal ends
+    /// the attempt as failed, which plans the build again, but it stops only
+    /// the refused unit's dependents: independent work, a build script or
+    /// proc macro another member waits for included, still runs, so the next
+    /// attempt finds what this one could not name.
+    pub refused: usize,
 }
 
 struct ErrorToHandle {
@@ -484,7 +491,8 @@ enum Message {
     RecheckFreshness {
         id: JobId,
         force: bool,
-        reply: std::sync::mpsc::Sender<CargoResult<bool>>,
+        staged: bool,
+        reply: std::sync::mpsc::Sender<CargoResult<super::unit_source::Recheck>>,
     },
     Stdout(String),
     Stderr(String),
@@ -1382,15 +1390,44 @@ impl<'gctx> DrainState<'gctx> {
                     logger.log(message);
                 }
             }
-            Message::RecheckFreshness { id, force, reply } => {
+            Message::RecheckFreshness {
+                id,
+                force,
+                staged,
+                reply,
+            } => {
                 let unit = self.active[&id].clone();
-                let result = super::fingerprint::recheck_after_lock(build_runner, &unit, force);
+                // Trust: DC-24a. A staged unit is judged by its own fingerprint
+                // and receipt only where this build compiled none of its
+                // dependencies; otherwise it compiles as it would with no source
+                // (`fingerprint::recheck_after_lock` says why that is enough).
+                let check = if staged {
+                    super::unit_source::Check::Staged {
+                        dependency_compiled: build_runner
+                            .unit_deps(&unit)
+                            .iter()
+                            .filter(|dep| {
+                                super::fingerprint::dependency_rebuilds(
+                                    build_runner.bcx,
+                                    &unit,
+                                    dep,
+                                )
+                            })
+                            .any(|dep| {
+                                self.ran.ran(&dep.unit) != Some(super::build_receipt::Ran::Fresh)
+                            }),
+                    }
+                } else {
+                    super::unit_source::Check::AfterLock
+                };
+                let result =
+                    super::fingerprint::recheck_after_lock(build_runner, &unit, force, check);
                 // Trust: DC-12a. The recheck under the lock found the unit
                 // fresh: this build used it and did not build it. (A build that
                 // waited for another's lease plans again before dispatch, so
                 // such a unit is usually dispatched fresh and never rechecked;
                 // tests/build_receipt.rs holds the receipt to that outcome.)
-                if matches!(result, Ok(true)) {
+                if matches!(result, Ok(super::unit_source::Recheck { fresh: true, .. })) {
                     self.ran.found_fresh(unit);
                 }
                 // A failed check goes back to the worker and follows the same
@@ -1685,7 +1722,10 @@ impl<'gctx> DrainState<'gctx> {
         // successful and otherwise wait for pending work to finish if it failed
         // and then immediately return (or keep going, if requested by the build
         // config).
-        let mut errors = ErrorsDuringDrain { count: 0 };
+        let mut errors = ErrorsDuringDrain {
+            count: 0,
+            refused: 0,
+        };
         // Trust: FinishOnDrop publishes All before JobState releases its
         // remaining lock-manager references. Keep actual handles so compiler
         // lease retirement observes worker return, not merely that message.
@@ -1704,9 +1744,7 @@ impl<'gctx> DrainState<'gctx> {
                 self.root_cancelled = true;
                 self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, error);
             }
-            if !self.root_cancelled
-                && (errors.count == 0 || build_runner.bcx.build_config.keep_going)
-            {
+            if !self.root_cancelled && errors.admitting(build_runner.bcx.build_config.keep_going) {
                 if let Err(e) = self.spawn_work_if_possible(
                     build_runner,
                     jobserver_helper,
@@ -1720,9 +1758,7 @@ impl<'gctx> DrainState<'gctx> {
             // A stopped frontier cannot consume an outstanding ready-only
             // request. Return any raced credit before active peers drain, so
             // their nested same-pool work retains forward progress.
-            if self.root_cancelled
-                || (errors.count != 0 && !build_runner.bcx.build_config.keep_going)
-            {
+            if self.root_cancelled || !errors.admitting(build_runner.bcx.build_config.keep_going) {
                 if let Err(error) = self.retire_ready_tokens() {
                     self.root_cancelled = true;
                     self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, error);
@@ -1747,7 +1783,7 @@ impl<'gctx> DrainState<'gctx> {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if self.workload_script.is_some() && self.active.is_empty() {
                 let admitting = !self.root_cancelled
-                    && (errors.count == 0 || build_runner.bcx.build_config.keep_going);
+                    && errors.admitting(build_runner.bcx.build_config.keep_going);
                 match self.advance_workload_script(build_runner, &mut compiler_workers, admitting) {
                     Ok(true) => continue,
                     Ok(false) => {}
@@ -1764,8 +1800,8 @@ impl<'gctx> DrainState<'gctx> {
             // has stopped after failure/cancellation), no future compiler can
             // make progress. Finalize and retire its leases before waiting on
             // a test that may itself start a same-target nested build.
-            let compile_admission_stopped = self.root_cancelled
-                || (errors.count != 0 && !build_runner.bcx.build_config.keep_going);
+            let compile_admission_stopped =
+                self.root_cancelled || !errors.admitting(build_runner.bcx.build_config.keep_going);
             if !self.compiler_finalized
                 && self.active.is_empty()
                 && (compile_admission_stopped || !self.pending_compile())
@@ -1816,8 +1852,8 @@ impl<'gctx> DrainState<'gctx> {
 
             // If after all that we're not actually running anything then we're
             // done!
-            let admitting = !self.root_cancelled
-                && (errors.count == 0 || build_runner.bcx.build_config.keep_going);
+            let admitting =
+                !self.root_cancelled && errors.admitting(build_runner.bcx.build_config.keep_going);
             // Trust: tests held at a test plan's barrier are released by a
             // file, which no queue event announces: keep the paced look.
             let held_at_barrier = self.tests.is_some()
@@ -2135,7 +2171,11 @@ impl<'gctx> DrainState<'gctx> {
                 ),
             );
         }
-        if build_runner.bcx.build_config.emit_json() {
+        // Trust (DC-18b): an attempt that refused a member unit is not the
+        // build's end: the build is planned again, which reports its end.
+        if build_runner.bcx.build_config.emit_json()
+            && !super::shared_dependencies::replan_pending()
+        {
             let mut shell = build_runner.bcx.gctx.shell();
             let msg = machine_message::BuildFinished {
                 success: compile_succeeded && !self.root_cancelled && errors.count == 0,
@@ -2282,6 +2322,21 @@ impl<'gctx> DrainState<'gctx> {
         new_err: impl Into<ErrorToHandle>,
     ) {
         let new_err = new_err.into();
+        // Trust (DC-18b): a member unit refused for sharing is planned again
+        // as a private unit, which reports what it reports. Nothing is shown
+        // for the refused attempt, which fails; only the refused unit's
+        // dependents stop (DC-18c, `ErrorsDuringDrain::refused`).
+        if new_err
+            .error
+            .downcast_ref::<super::shared_dependencies::MemberRefusal>()
+            .is_some()
+        {
+            tracing::debug!("{:?}", new_err.error);
+            err_state.count += 1;
+            err_state.refused += 1;
+            return;
+        }
+        super::shared_dependencies::note_failure();
         if new_err.print_always || err_state.count == 0 {
             crate::display_error(&new_err.error, shell);
             if err_state.count == 0 && self.active_count() != 0 {
@@ -3004,6 +3059,12 @@ mod trust_tests {
 }
 
 impl ErrorsDuringDrain {
+    /// Whether new work may start: no error yet but member refusals, or
+    /// `--keep-going`.
+    fn admitting(&self, keep_going: bool) -> bool {
+        self.count == self.refused || keep_going
+    }
+
     fn to_error(&self) -> Option<anyhow::Error> {
         match self.count {
             0 => None,

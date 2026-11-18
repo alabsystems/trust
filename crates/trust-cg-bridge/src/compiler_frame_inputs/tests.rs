@@ -3,7 +3,7 @@ use trust_cg_codegen::target::TargetSpec;
 use trust_machine_sem::{Aarch64Semantics, ConcreteState, Effect, MachineState, Semantics};
 
 use super::*;
-use crate::compiler_input_capture::CompilerInputCapture;
+use crate::compiler_input_capture::{CompilerInputCapture, historical_b8_data_for_tests};
 use crate::f1_compile::{
     F1CompileConfig, F1CompileInput, F1OptLevel, F1Refusal, F1Target,
     compile_and_verify_trust_ir_module_captured, f1_codegen_license,
@@ -55,10 +55,37 @@ fn check_actual() {
         "e4b0e9030c002ebfa9d3a6395e6322197dffe6f96d5b524e913ddb7eea67cd38"
     );
     let data = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
-    assert_eq!(
-        artifact_digest(&data.object),
-        "b20aa8af874f0bc71b54e3144632d0df1c1d17dc4b821f9d402b50d23f17d01b"
+    check_inputs(
+        data,
+        "b20aa8af874f0bc71b54e3144632d0df1c1d17dc4b821f9d402b50d23f17d01b",
+        historical_b8_data_for_tests(),
     );
+}
+
+#[test]
+fn original_b8_migration_retains_frame_inputs_without_claiming_missing_semantics() {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn_scoped(scope, || {
+                check_inputs(
+                    historical_b8_data_for_tests(),
+                    "c4b9e1fcbc611f998c791cacd906ae735a5371528725829739995fe92c24e941",
+                    CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap(),
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    });
+}
+
+fn check_inputs(
+    data: crate::compiler_input_capture::DecodedCompilerInputs,
+    expected_object: &str,
+    other: crate::compiler_input_capture::DecodedCompilerInputs,
+) {
+    assert_eq!(artifact_digest(&data.object), expected_object);
     assert!(data.m_cg.closure_layouts.is_empty());
     assert!(
         data.m_cg
@@ -109,6 +136,10 @@ fn check_actual() {
     let request = caller.frame_inputs.as_ref().unwrap();
     assert_eq!(request.producer_frame_bytes, Some(16));
     assert!(request.producer_slots.is_empty());
+    assert_eq!(request.schema, "trust.pending-semR-frame-input.v2");
+    let allocations = request.source_stack_allocations.as_ref().unwrap();
+    assert_eq!(allocations.symbol(), CALLER);
+    assert!(allocations.records().is_empty());
     assert!(matches!(request.envelope, FrameEnvelopeInput::ObservedFpLr16DirectCall { .. }));
     assert_eq!(request.outstanding.len(), 7);
     assert!(request.outstanding.contains(&FrameInputObligation::SemRAllocationEmbedding));
@@ -199,6 +230,19 @@ fn check_actual() {
         FrameEnvelopeInput::MissingProducerLayout
     ));
     assert!(missing_report.ships(EmitPolicy::StrictProvenOnly).is_err());
+    assert!(
+        missing_report
+            .certificates
+            .iter()
+            .find(|row| row.symbol == CALLER)
+            .unwrap()
+            .frame_inputs
+            .as_ref()
+            .unwrap()
+            .source_stack_allocations
+            .is_err(),
+        "changing the retained layout cannot transfer source allocation data"
+    );
     for mutation in 0..3 {
         let mut changed = result.aarch64_frame_inputs.clone();
         match mutation {
@@ -229,7 +273,21 @@ fn check_actual() {
     // for this function"), so attaching retains no frame request for it and refuses nothing.
     // Before the fix `attach` refused the whole module ("frame has no actual P entry"), a
     // module-level `[f1-output-gate:binding]` under allow-unknown too (809eeaba39).
-    let mut unplaced = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    // Keep this mutation on the SAME actual source/object population. The
+    // historical b8 callee has a different symbol and object from e76.
+    let mut unplaced = crate::compiler_input_capture::DecodedCompilerInputs {
+        m_cg: data.m_cg.clone(),
+        producers: data.producers.clone(),
+        bodies: data.bodies.clone(),
+        placements: data.placements.clone(),
+        object: data.object.clone(),
+        relocation: data.relocation,
+    };
+    let mut other_report = crate::call_event::verify_compiled_module(&other.input()).unwrap();
+    assert!(
+        attach(&other.input(), &result.aarch64_frame_inputs, &mut other_report).is_err(),
+        "another capture's frame population must not authorize this object"
+    );
     assert!(unplaced.placements.remove(CALLER).is_some());
     let mut unplaced_report = crate::call_event::verify_compiled_module(&unplaced.input()).unwrap();
     let grades = |report: &CerReport| {
@@ -280,7 +338,7 @@ fn refusal_context_names_each_blocker_and_only_the_refutation_when_refuted() {
 
 fn check_unproved_blockers() {
     use crate::verify_output::ProvenEvidence;
-    let data = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    let data = historical_b8_data_for_tests();
     let mut report = crate::call_event::verify_compiled_module(&data.input()).unwrap();
     let caller = report.certificates.iter().position(|row| row.symbol == CALLER).unwrap();
     let callee = report.certificates[caller]

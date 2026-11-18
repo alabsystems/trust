@@ -311,5 +311,5 @@ fn capture_target(
 mod tests;
 
 #[cfg(test)]
-#[path = "engineering_pairing/descriptor_tests.rs"]
+#[path = "engineering_pairing/tests/descriptor.rs"]
 mod descriptor_tests;

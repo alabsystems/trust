@@ -1586,6 +1586,25 @@ class TrustBootstrapCompilerPolicy(unittest.TestCase):
                 self.assertIn("could not probe the Stage0 driver's Trust flag surface "
                               "(rustc: exit {}: {})".format(code, text.strip()), warning)
                 self.assertEqual("scripts/build-slot" in warning, hint)
+        for refusal, expected in (
+            ("trust-serial-command: refused: command launch: Operation not permitted (os error 1)",
+             "preparing, launching, or waiting"),
+            ("trust-serial-command: refused: SDK capture: unavailable",
+             "native custody or admission refusal"),
+        ):
+            with self.subTest(refusal=refusal):
+                bootstrap.clear_stage0_z_help_cache()
+                env = {"BUILD_SLOT_HELD": "1"}
+                stderr = io.StringIO()
+                with patch.object(bootstrap, "bootstrap_capability_command",
+                                  return_value=completed_z_help(refusal, 75)), \
+                        patch.object(bootstrap.sys, "stderr", stderr):
+                    self.assertFalse(bootstrap.apply_trust_bootstrap_compiler_policy("rustc", env))
+                self.assertEqual(env["TRUST_NO_VERIFY"], "1")
+                self.assertIn(refusal, stderr.getvalue())
+                self.assertIn(expected, stderr.getvalue())
+                self.assertNotIn("scripts/build-slot", stderr.getvalue())
+                self.assertNotIn("remove the custody", stderr.getvalue())
         # An exception's text is the reason too, after the retry.
         bootstrap.clear_stage0_z_help_cache()
         with patch.object(bootstrap, "bootstrap_capability_command",
@@ -2112,6 +2131,45 @@ class Stage0FailClosedRefresh(unittest.TestCase):
         build.download_toolchain()
         with open(build.rustc()) as stream:
             self.assertEqual(stream.read(), "next-trustc")
+        self.assert_no_refresh_residue(build)
+
+    def test_admitted_refresh_caps_actual_unpack_pool_and_keeps_complete_surface(self):
+        for index, (configured, cli, expected) in enumerate([
+            ("default", None, 2), ("28", None, 2), ("1", None, 1),
+            ("1", 28, 2), ("28", 1, 1),
+        ]):
+            with self.subTest(configured=configured, cli=cli):
+                self.build_dir = os.path.join(self.container, "build-" + str(index))
+                self.dist_root = os.path.join(self.container, "dist-" + str(index))
+                build = self.make_build()
+                build.jobs, build.cli_jobs = configured, cli
+                self.write_seed(build)
+                self.make_archives(build)
+                with (
+                    patch.dict(os.environ, {"BUILD_SLOT_HELD": "1", "CARGO_BUILD_JOBS": "2"}),
+                    patch.object(bootstrap, "get_cpus", return_value=28),
+                    patch.object(bootstrap, "Pool", wraps=bootstrap.Pool) as pool,
+                ):
+                    build.download_toolchain()
+                pool.assert_called_once_with(expected)
+                build.assert_stage0_tool_surface()
+                with open(build.rustc()) as stream:
+                    self.assertEqual(stream.read(), "new-trustc")
+                self.assert_no_refresh_residue(build)
+
+    def test_invalid_admitted_unpack_share_refuses_before_download_and_keeps_seed(self):
+        build = self.make_build()
+        seed = self.write_seed(build)
+        self.make_archives(build)
+        before = self.snapshot(seed)
+        with (
+            patch.dict(os.environ, {"BUILD_SLOT_HELD": "1", "CARGO_BUILD_JOBS": "0"}),
+            patch.object(bootstrap, "download_component", side_effect=AssertionError("downloaded")),
+            patch.object(bootstrap, "Pool", side_effect=AssertionError("unpacked")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "positive u32 CARGO_BUILD_JOBS"):
+                build.download_toolchain()
+        self.assertEqual(self.snapshot(seed), before)
         self.assert_no_refresh_residue(build)
 
     def test_same_commit_changed_archive_digest_reextracts_and_checks_existing_cache(self):

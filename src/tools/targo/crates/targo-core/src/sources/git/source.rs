@@ -2,6 +2,7 @@
 
 use crate::sources::IndexSummary;
 use crate::sources::RecursivePathSource;
+use crate::sources::git::utils::CheckoutKind;
 use crate::sources::git::utils::GitDatabase;
 use crate::sources::git::utils::GitRemote;
 use crate::sources::git::utils::rev_to_oid;
@@ -300,8 +301,14 @@ impl<'gctx> GitSource<'gctx> {
             .join(&self.ident)
             .join(short_id.as_str());
         let checkout_path = checkout_path.into_path_unlocked();
-        db.copy_to(actual_rev, &checkout_path, self.gctx, self.quiet)
-            .with_context(|| object_source_context(*self.source_id.borrow(), actual_rev))?;
+        db.copy_to(
+            actual_rev,
+            &checkout_path,
+            CheckoutKind::Dependency,
+            self.gctx,
+            self.quiet,
+        )
+        .with_context(|| object_source_context(*self.source_id.borrow(), actual_rev))?;
 
         let source_id = self
             .source_id

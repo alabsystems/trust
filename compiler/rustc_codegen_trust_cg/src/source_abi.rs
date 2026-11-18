@@ -15,8 +15,22 @@ mod agreement;
 mod module_carrier;
 #[path = "source_abi/foreign_declarations.rs"]
 mod foreign_declarations;
+mod closure_once;
 pub(crate) use foreign_declarations::check as check_foreign_declarations;
 use agreement::{Extension, Lane, ObservedFrame, RegisterUse, Scalar, Transport};
+
+/// An actual compiler-owned shim selection, never a source definition row.
+/// Only the exact rustc FnAbi/protocol check below can mint this identity.
+#[derive(Clone)]
+pub(crate) struct ClosureOnceAdapterIdentity {
+    source: std::sync::Arc<Module>,
+    function: FuncId,
+}
+impl ClosureOnceAdapterIdentity {
+    pub(crate) fn matches(&self, source: &Module, function: FuncId) -> bool {
+        std::ptr::eq(self.source.as_ref(), source) && self.function == function
+    }
+}
 
 /// Retain the complete borrowed FnAbi, including pointee/value attributes.
 /// They are Rust value preconditions, not permission to discard an extension
@@ -26,15 +40,22 @@ pub(crate) struct SourceAbiAgreement<'tcx, 'module> {
     function: FuncId,
     pub(crate) fn_abi: &'tcx FnAbi<'tcx, Ty<'tcx>>,
     pub(crate) placement: Option<trust_cg_bridge::call_event::FnPlacement>,
+    argument_start: usize,
+    adapter_identity: Option<ClosureOnceAdapterIdentity>,
 }
 
 impl SourceAbiAgreement<'_, '_> {
+    pub(crate) fn adapter_identity(&self) -> Option<ClosureOnceAdapterIdentity> {
+        self.adapter_identity.clone()
+    }
+
     pub(crate) fn param_extensions(&self, tcx: TyCtxt<'_>) -> trust_cg_bridge::AbiParamExtensions {
         trust_cg_bridge::AbiParamExtensions {
             per_param: self
                 .fn_abi
                 .args
                 .iter()
+                .skip(self.argument_start)
                 .map(|arg| match &arg.mode {
                     PassMode::Direct(attrs) => Some(match attrs.arg_ext {
                         ArgExtension::None => trust_cg_bridge::AbiArgExtension::None,
@@ -133,6 +154,8 @@ fn closure_arg<'tcx>(
         captures: captures.iter().map(|ty| source_scalar(tcx, ty)).collect::<Result<_, _>>()?,
     };
     let transport = match (&arg.mode, arg.layout.backend_repr) {
+        // Trust: keep the typed source frame even when rustc omits its bytes.
+        (PassMode::Ignore, _) => Transport::Ignore,
         (PassMode::Direct(attrs), BackendRepr::Scalar(value)) => {
             Transport::Direct(lane(tcx, value, attrs)?)
         }
@@ -168,11 +191,50 @@ fn scalar_arg<'tcx>(
     agreement::scalar_transport(ir, actual, apple_c)
 }
 
+/// Trust: the production frontend's physical thin-pointer transport contract.
+/// This reuses the same independent source-layout/FnAbi/IR comparison as the
+/// native source route, without borrowing the legacy MIR read-only fragment.
+/// The original FnAbi still owns value validity, aliasing and pointee contracts;
+/// this Boolean grants no provenance, dereference, NoUB or proof authority.
+///
+/// Only the existing qualified Darwin AArch64 pointer carrier is added here.
+/// The producer remains `Ty::Ptr`; a matching integer is never a pointer witness.
+pub(crate) fn direct_thin_pointer_transport_supported<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    arg: &ArgAbi<'tcx, Ty<'tcx>>,
+) -> bool {
+    if tcx.sess.opts.target_triple.tuple() != "aarch64-apple-darwin"
+        || tcx.sess.target.pointer_width != 64
+        || tcx.sess.target.endian != rustc_abi::Endian::Little
+        || tcx.data_layout.pointer_size().bits() != 64
+        || tcx.data_layout.pointer_offset().bits() != 64
+        || arg.layout.size.bytes() != 8
+        || arg.layout.align.bytes() != 8
+        || !matches!(arg.layout.ty.kind(), ty::Ref(..) | ty::RawPtr(..))
+    {
+        return false;
+    }
+    let BackendRepr::Scalar(value) = arg.layout.backend_repr else {
+        return false;
+    };
+    if !matches!(value.primitive(), Primitive::Pointer(space)
+        if space == tcx.data_layout.default_address_space)
+    {
+        return false;
+    }
+    // Trust: scalar_arg independently queries the source layout, requires an
+    // initialized scalar and actual Direct mode, and rejects extensions/InReg
+    // or any disagreement with the unchanged Ptr carrier. Other FnAbi metadata
+    // is retained by its existing semantic/proof owners, not reinterpreted here.
+    scalar_arg(tcx, &IrTy::Ptr, arg, false).is_ok()
+}
+
 /// P describes the original producer parameters, not a flattened replacement
 /// signature. An unsupported target has no P entry (the gate must say Unknown).
 fn aarch64_placement<'tcx>(
     tcx: TyCtxt<'tcx>,
     abi: &FnAbi<'tcx, Ty<'tcx>>,
+    argument_start: usize,
 ) -> Option<trust_cg_bridge::call_event::FnPlacement> {
     use trust_cg_bridge::call_event::{
         AbiExt, FnPlacement, ParamPlace, ReturnPlace, ScalarPlace, Slot,
@@ -197,8 +259,11 @@ fn aarch64_placement<'tcx>(
     };
     let mut next = 0u8;
     let mut params = Vec::with_capacity(abi.args.len());
-    for arg in &abi.args {
+    for arg in abi.args.get(argument_start..)? {
         match (&arg.mode, arg.layout.backend_repr) {
+            (PassMode::Ignore, _) if arg.layout.size.bytes() == 0 => {
+                params.push(ParamPlace::Ignore);
+            }
             (PassMode::Direct(attrs), BackendRepr::Scalar(value)) if next < 8 => {
                 params.push(ParamPlace::Scalar(place(next, value, attrs)?));
                 next += 1;
@@ -270,6 +335,11 @@ pub(crate) fn validate_module_instance<'tcx, 'module>(
                 .into(),
         );
     }
+    // Trust: this distinct compiler-owned agreement keeps the actual ignored
+    // receiver and complete raw FnAbi. It does not widen source RustCall bodies.
+    if matches!(instance.def, ty::InstanceKind::Shim(ty::ShimKind::ClosureOnce { .. })) {
+        return closure_once::validate(tcx, instance, module, id);
+    }
     let fn_abi =
         crate::fn_abi_preconditions_with_source(tcx, instance, signature.params.len(), true)?;
     let expected_conv = match fn_abi.conv {
@@ -325,7 +395,9 @@ pub(crate) fn validate_module_instance<'tcx, 'module>(
         source: module,
         function: id,
         fn_abi,
-        placement: if has_fp { None } else { aarch64_placement(tcx, fn_abi) },
+        placement: if has_fp { None } else { aarch64_placement(tcx, fn_abi, 0) },
+        argument_start: 0,
+        adapter_identity: None,
     })
 }
 

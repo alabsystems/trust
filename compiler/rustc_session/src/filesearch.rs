@@ -16,9 +16,18 @@ pub struct FileSearch {
     sysroot_dependency_path: Option<SearchPath>,
     use_implicit_sysroot_deps: bool,
     files: Vec<FileSearchCandidate>,
+    // Trust (TARGO-HOST-COMPILE-E0463-1): each search directory, or entry of one, that could
+    // not be read, with the error, so a crate the search then misses says why.
+    unread: Vec<(PathBuf, String)>,
 }
 
 impl FileSearch {
+    /// Trust: the search directories, and entries of them, that could not be read when the
+    /// search was built, each with its error. A missing crate names these.
+    pub fn unread(&self) -> &[(PathBuf, String)] {
+        &self.unread
+    }
+
     pub fn cli_search_paths<'b>(&'b self, kind: PathKind) -> impl Iterator<Item = &'b SearchPath> {
         self.cli_search_paths.iter().filter(move |sp| sp.kind.matches(kind))
     }
@@ -95,17 +104,32 @@ impl FileSearch {
         // Load all files from all search paths, filter them by supported prefixes, and sort them,
         // so that we can efficiently look them up in `get_file_candidates` via binary search.
         let mut files: Vec<FileSearchCandidate> = Vec::with_capacity(cli_search_paths.len());
+        let mut unread = Vec::new();
         for (search_path, is_sysroot) in cli_search_paths
             .iter()
             .map(|path| (path, false))
             .chain(iter::once((tlib_path, true)))
             .chain(sysroot_dependency_path.iter().map(|path| (path, true)))
         {
-            let Ok(dir) = fs::read_dir(&search_path.dir) else {
-                continue;
+            let dir = match fs::read_dir(&search_path.dir) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    // A directory that does not exist holds no candidate; any other error
+                    // hides what it holds, which a missing crate reports.
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        unread.push((search_path.dir.to_path_buf(), error.to_string()));
+                    }
+                    continue;
+                }
             };
             files.extend(dir.filter_map(|entry| {
-                let entry = entry.ok()?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        unread.push((search_path.dir.to_path_buf(), error.to_string()));
+                        return None;
+                    }
+                };
 
                 let filename = entry.file_name();
                 let filename = filename.to_str()?;
@@ -132,6 +156,7 @@ impl FileSearch {
             sysroot_dependency_path,
             use_implicit_sysroot_deps,
             files,
+            unread,
         }
     }
 }
@@ -508,6 +533,41 @@ pub(crate) fn default_sysroot() -> PathBuf {
         rustlib_path.exists().then_some(p)
     }
 
-    from_env_args_next()
-        .unwrap_or_else(|| default_from_rustc_driver_dll().expect("Failed finding sysroot"))
+    // Trust (TARGO-HOST-COMPILE-E0463-1): `dladdr` names the driver library by the path the
+    // kernel gives its file, and a file with several hard links is named by whichever link was
+    // last looked up, by any process. Bootstrap links one driver into the build tree, the
+    // stage's sysroot and the next stage's private sysroot; a compiler that derived its
+    // sysroot from another link than its own found no `std` (E0463) whenever another process
+    // had just opened the driver by that link. The sysroot above the running executable
+    // (`$sysroot/bin/rustc`, named by the path the kernel was asked to run) is taken where
+    // its `lib` holds this very driver file and a `rustlib`; a driver loaded from anywhere
+    // else (a tool outside the sysroot) keeps the sysroot its library names.
+    fn from_current_exe(dll: &Path) -> Option<PathBuf> {
+        let sysroot = env::current_exe().ok()?.parent()?.parent()?.to_path_buf();
+        let own_driver = sysroot.join("lib").join(dll.file_name()?);
+        let mut rustlib = sysroot.join(rustc_target::relative_target_rustlib_path(&sysroot, "x"));
+        rustlib.pop();
+        (same_file(&own_driver, dll) && rustlib.is_dir()).then_some(sysroot)
+    }
+
+    #[cfg(unix)]
+    fn same_file(a: &Path, b: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn same_file(_: &Path, _: &Path) -> bool {
+        false
+    }
+
+    from_env_args_next().unwrap_or_else(|| {
+        current_dll_path()
+            .ok()
+            .and_then(|dll| from_current_exe(&dll))
+            .unwrap_or_else(|| default_from_rustc_driver_dll().expect("Failed finding sysroot"))
+    })
 }

@@ -338,18 +338,21 @@ def _cargo_home(root: Path, env: dict[str, str]) -> Path:
 
 
 def _source_inputs(root: Path, manifests: list[Path], env: dict[str, str], *,
-                   source_view=None, graph_source_view=None, source_only=False,
-                   require_lockfiles=False) -> list[Path]:
+                   source_view=None, graph_source_view=None, graph_source_root=None,
+                   source_only=False, require_lockfiles=False) -> list[Path]:
     """Bind the recipe entries, possible ancestor locks/configs, and driver config.
 
     Cargo remains the resolver. We do not infer workspace ownership from a
     nearest-lock heuristic: that loses explicit and excluded workspace roots.
     The actual fetch is run on EVERY recipe entry, with no owner guess/dedup.
     """
-    owner = (graph_source_view.root if graph_source_view is not None else root) / "scripts/recreate_bootstrap.py"
+    if graph_source_root is not None and graph_source_view is not None:
+        raise DependencyClosureError("dependency graph needs one source owner")
+    graph_root = graph_source_view.root if graph_source_view is not None else (graph_source_root or root)
+    owner = graph_root / "scripts/recreate_bootstrap.py"
     # Reuse the source owner's declared member/path/patch census, without
     # importing its unrelated CLI or consulting bytecode/import search paths.
-    reader = graph_source_view if graph_source_view is not None else source_view
+    reader = None if graph_source_root is not None else (graph_source_view or source_view)
     nodes = [node for node in ast.parse(reader.read_text(owner) if reader is not None
                                       else owner.read_text(encoding="utf-8")).body
              if isinstance(node, ast.ClassDef) and node.name == "_Stage0ManifestGraph"]
@@ -741,7 +744,19 @@ def _darwin_kevent_exit(events, pid: int, timeout: float | None) -> bool:
     return True
 
 
-def _fetch_darwin(command: list[str], root: Path, env: dict[str, str], end: float) -> None:
+# How often a supervising wait looks at a fetch's progress, when it is handed one.
+PROGRESS_POLL_SECONDS = 1.0
+
+
+def _observe_progress(progress, command: list[str], output) -> None:
+    """Count what the fetch printed, then let its bound judge it (it raises when stalled)."""
+    printed = os.fstat(output.fileno()).st_size
+    progress.printed(printed - getattr(progress, "_closure_printed", 0))
+    progress._closure_printed = printed
+    progress.check(command)
+
+
+def _fetch_darwin(command: list[str], root: Path, env: dict[str, str], end: float, progress=None) -> None:
     lib = _darwin_prerequisites()
     import fcntl
     cargo_home = _cargo_home(root, env)
@@ -781,12 +796,21 @@ def _fetch_darwin(command: list[str], root: Path, env: dict[str, str], end: floa
         try:
             events = select.kqueue()
             try:
+                if progress is not None:
+                    progress.begin()
                 exited = _darwin_kevent_exit(events, custodian, 0)
                 while not exited:
                     left = end - time.monotonic() - 5.0
                     if left <= 0:
                         break
-                    exited = bool(events.control(None, 1, left))
+                    if progress is None:
+                        exited = bool(events.control(None, 1, left))
+                    else:
+                        # A fetch that keeps moving runs on; one that stalls, or is
+                        # running at the preparation's ceiling, is ended by its bound.
+                        exited = bool(events.control(None, 1, min(left, PROGRESS_POLL_SECONDS)))
+                        if not exited:
+                            _observe_progress(progress, command, output)
             finally:
                 events.close()
             if not exited:
@@ -850,7 +874,9 @@ def _fetch_darwin(command: list[str], root: Path, env: dict[str, str], end: floa
                 + _diagnostic_tail_without_seeking(output))
 
 
-def _fetch(command: list[str], root: Path, env: dict[str, str], end: float) -> None:
+def _fetch(command: list[str], root: Path, env: dict[str, str], end: float, progress=None) -> None:
+    """One locked fetch, ended at ``end`` and, when ``progress`` is given, by that bound:
+    the recreator's progress bound of one dependency-preparation item."""
     # Reserve five seconds INSIDE the finite budget for child observation.
     # Never signal a numeric PGID after wait(): an interrupted wait can already
     # have reaped the leader, allowing that numeric identity to be reused. The
@@ -859,7 +885,7 @@ def _fetch(command: list[str], root: Path, env: dict[str, str], end: float) -> N
     if remaining <= 0:
         raise DependencyClosureError("dependency preparation/check deadline exhausted")
     if sys.platform == "darwin":
-        return _fetch_darwin(command, root, env, end)
+        return _fetch_darwin(command, root, env, end, progress)
     # Known boundary off Darwin: an unresolved-child exception is NOT a custody
     # transfer, and a terminated helper leaves its new-session fetch running
     # (docs/OPEN_ISSUES.md DEPENDENCY-FETCH-PARENT-DEATH-LINUX-1). Diagnostics
@@ -884,7 +910,17 @@ def _fetch(command: list[str], root: Path, env: dict[str, str], end: float) -> N
                 # No wait/poll precedes this acquisition. The FD keeps the
                 # original kernel process identity even if a later wait reaps.
                 pidfd = os.pidfd_open(child.pid, 0)
-            status = child.wait(timeout=max(0.001, end - time.monotonic() - 5.0))
+            if progress is not None:
+                progress.begin()
+            while True:
+                left = max(0.001, end - time.monotonic() - 5.0)
+                try:
+                    status = child.wait(timeout=left if progress is None else min(left, PROGRESS_POLL_SECONDS))
+                    break
+                except subprocess.TimeoutExpired:
+                    if progress is None or end - time.monotonic() - 5.0 <= 0:
+                        raise
+                    _observe_progress(progress, command, output)
         except BaseException as error:
             signal_error = None
             try:
@@ -949,11 +985,75 @@ def _fetch(command: list[str], root: Path, env: dict[str, str], end: float) -> N
 DEFAULT_BUDGET_SECONDS = 900.0
 
 
+class DependencyAcquisition:
+    """Fetch-only attempt DATA, never an offline-readiness observation.
+
+    Only the train's subsequent actual closure in its safe handoff home may
+    establish readiness. Keep this distinct from dependency_closure's reply.
+    """
+
+    def __init__(self, fetched: dict):
+        self._fetched = fetched
+
+    def report(self) -> dict:
+        return {**self._fetched,
+                "schema": "trust.bootstrap-dependency-acquisition.v1",
+                "scope": "fetch-only acquisition; no offline readiness or native/proof/root admission"}
+
+
+def _manifest_policy(root: Path, manifests: list[Path], env: dict[str, str], inputs: dict) -> str:
+    """Bind identical resolver inputs across two separately owned Cargo homes.
+
+    Only the home pathname and the explicitly stronger offline phase differ.
+    Their config files remain bound under logical names, including absence;
+    every other source/config/driver byte and environment value remains exact.
+    The digest is comparison DATA, not a portable source/cache seal.
+    """
+    logical = dict(inputs)
+    for name in ("config", "config.toml"):
+        logical["$CARGO_HOME/" + name] = logical.pop(str(_cargo_home(root, env) / name))
+    environment = {**env, "CARGO_HOME": "$OWNED_CARGO_HOME", "CARGO_NET_OFFLINE": "$FETCH_PHASE"}
+    value = {"domain": "trust.bootstrap-manifest-policy/1", "inputs": logical,
+             "environment": environment,
+             "manifests": [str(path.relative_to(root)) for path in manifests]}
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def acquire_dependency_inputs(
+    root: Path, targo: str, env: dict[str, str], *,
+    deadline: float | None = None, progress=None,
+) -> DependencyAcquisition:
+    """Acquire the exact recipe envelope once under the caller's network policy.
+
+    No readiness receipt is returned, even when the caller already chose offline.
+    The train must replay dependency_closure in its separately copied safe home.
+    """
+    if not env.get("CARGO_HOME") or not Path(env["CARGO_HOME"]).is_absolute():
+        raise DependencyClosureError("dependency acquisition needs an explicit absolute Cargo home")
+    return DependencyAcquisition(_dependency_fetches(root, targo, env, (False,), deadline, progress))
+
+
 def dependency_closure(
     root: Path, targo: str, env: dict[str, str], *, prepare: bool = False,
-    deadline: float | None = None,
+    deadline: float | None = None, progress=None,
 ) -> dict:
-    """Perform actual locked fetches; no JSON/cache verdict can satisfy this API."""
+    """Perform actual locked fetches; no JSON/cache verdict can satisfy this API.
+
+    Standalone prepare still acquires and checks the same home; check is offline.
+    """
+    fetched = _dependency_fetches(root, targo, env, (False, True) if prepare else (True,), deadline, progress)
+    return {**fetched, "schema": "trust.bootstrap-offline-dependency-closure.v1",
+            "scope": "recipe-capability-envelope; availability only; no native/proof/root admission"}
+
+
+def _dependency_fetches(root: Path, targo: str, env: dict[str, str], modes: tuple[bool, ...],
+                        deadline: float | None, progress) -> dict:
+    """The actual common resolver, with no readiness schema on its internal reply.
+
+    ``progress(label, paths)``, when given, makes each fetch one bounded item of a
+    dependency preparation: it is ended when what arrives in its Cargo home and on its
+    output stops moving, or at the preparation's ceiling, and the refusal names it.
+    """
     root = root.resolve()
     end = time.monotonic() + DEFAULT_BUDGET_SECONDS if deadline is None else deadline
     if not targo:
@@ -972,7 +1072,7 @@ def dependency_closure(
         raise DependencyClosureError("bootstrap recipe manifest envelope is empty")
     inputs = _source_inputs(root, manifests, env) + [Path(__file__).resolve(), Path(targo).resolve()]
     before = _snapshot(inputs)
-    modes = (False, True) if prepare else (True,)
+    policy = _manifest_policy(root, manifests, env, before)
     completed = []
     total = len(modes) * len(manifests)
     for offline in modes:
@@ -988,7 +1088,10 @@ def dependency_closure(
                 command.append("--offline")
             command += ["--manifest-path", str(manifest)]
             try:
-                _fetch(command, root, fetch_env, end)
+                watch = None
+                if progress is not None:
+                    watch = progress(f"locked fetch {label}", (_cargo_home(root, fetch_env),))
+                _fetch(command, root, fetch_env, end, watch)
                 if _snapshot(inputs) != before:
                     raise DependencyClosureError("bootstrap dependency inputs changed during fetch")
             except (DependencyClosureError, OSError, subprocess.TimeoutExpired) as error:
@@ -1009,8 +1112,8 @@ def dependency_closure(
     if time.monotonic() > end:
         raise DependencyClosureError("dependency closure finished outside its deadline")
     return {
-        "schema": "trust.bootstrap-offline-dependency-closure.v1",
-        "scope": "recipe-capability-envelope; availability only; no native/proof/root admission",
+        "manifests": [str(path.relative_to(root)) for path in manifests],
+        "manifest_policy_sha256": policy,
         "source_inputs_sha256": before,
         "completed_fetches": completed,
     }

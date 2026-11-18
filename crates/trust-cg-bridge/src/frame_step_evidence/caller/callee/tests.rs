@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates | Apache-2.0
 use super::*;
-use crate::compiler_input_capture::CompilerInputCapture;
+use crate::compiler_input_capture::historical_b8_data_for_tests;
 
-const INPUT: &[u8] = include_bytes!("../../../compiler_frame_inputs/actual-b8-caller-input.json");
 const CALLER: &str = "source_memory_caller";
 
 fn guarded<T>(f: impl FnOnce() -> T) -> T {
@@ -18,7 +17,7 @@ fn actual_callee_byte_store_derives_conditional_frame_agreement() {
 
 #[test]
 fn callee_data_trace_refuses_a_conditional_path_that_skips_the_store() {
-    let data = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    let data = historical_b8_data_for_tests();
     let original = guarded(|| binding::observe(&data.input(), CALLER).unwrap());
     assert_eq!(original.subject.store_step, 2);
 
@@ -26,7 +25,7 @@ fn callee_data_trace_refuses_a_conditional_path_that_skips_the_store() {
     // reachable instructions, but a taken branch skips the byte store.
     // A linear data-effect trace must not stand in for either path.
     for word in [0xb4000062u32, 0x36000062u32] {
-        let mut changed = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+        let mut changed = historical_b8_data_for_tests();
         let callee = BoundFunction::bind(
             &changed.object,
             &changed.m_cg,
@@ -71,7 +70,7 @@ fn original_callee_frame_packet_replays_without_production() {
                 std::env::var_os("TRUST_CALLEE_FRAME_COHORT")
                     .expect("actual callee cohort required"),
             );
-            let data = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+            let data = historical_b8_data_for_tests();
             let packet = SeparateCalleeFramePacket::from_bytes(include_bytes!(
                 "actual-separate-frame-packet.json"
             ))
@@ -88,7 +87,7 @@ fn check_actual() {
     let directory = std::path::PathBuf::from(
         std::env::var_os("TRUST_CALLEE_FRAME_COHORT").expect("actual callee cohort required"),
     );
-    let data = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    let data = historical_b8_data_for_tests();
     // Retain the exact original real-data-effect control, including the
     // saved-LR alias which corrupts the eventual caller return target.
     super::super::tests::actual_callee_alias_control(&data.input());
@@ -147,7 +146,7 @@ fn check_actual() {
         }
         assert!(guarded(|| fresh.replay_separate_callee(&changed, &data.input())).is_err());
     }
-    let mut other = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
+    let mut other = historical_b8_data_for_tests();
     let callee = BoundFunction::bind(
         &other.object,
         &other.m_cg,

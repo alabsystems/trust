@@ -89,8 +89,10 @@ pub(crate) fn recover_instance<'tcx>(
             if !closure.parent_args().iter().all(|arg| arg.as_region().is_some()) {
                 return Err("source closure has a type/const-instantiated generic parent".into());
             }
-            if closure.kind() != ty::ClosureKind::FnOnce || closure.upvar_tys().is_empty() {
-                return Err("source residue requires a capturing FnOnce environment".into());
+            let borrowed_zero = closure.kind() == ty::ClosureKind::Fn
+                && closure.upvar_tys().is_empty();
+            if closure.kind() != ty::ClosureKind::FnOnce && !borrowed_zero {
+                return Err("source residue requires an FnOnce or borrowed empty Fn environment".into());
             }
             ty::Instance::new_raw(def, args)
         }

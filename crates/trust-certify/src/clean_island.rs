@@ -3840,6 +3840,11 @@ impl CleanIslandSession {
         self.keyed.enable_facts(facts);
     }
 
+    #[cfg(test)]
+    pub(crate) fn facts_active_for_tests(&self) -> bool {
+        self.keyed.active().is_some()
+    }
+
     /// This session's settings, as a fact key reads them.
     fn params(&self) -> keyed_env::SessionParams {
         keyed_env::SessionParams {
@@ -4003,6 +4008,49 @@ impl CleanIslandSession {
             format!("source-batch builtin PProd initialization failed: {error}")
         })?;
         Ok(session)
+    }
+
+    pub(crate) fn new_for_pinned_source_batch(
+        prelude: crate::lean_source_batch::ProducedSourcePrelude,
+    ) -> Self {
+        let mut session = Self::new();
+        session.keyed = keyed_env::KeyedEnv::for_pinned_source(prelude);
+        session
+    }
+
+    /// Explicit source-only path. The fresh producer context remains intact;
+    /// every owned original and anonymous judgment uses the closed reference
+    /// base. Ordinary checking/reporting/refusal remains after elaboration.
+    pub(crate) fn check_all_pinned_source(
+        &mut self,
+        sources: &[&str],
+        collect_census: bool,
+        baseline: &std::collections::BTreeSet<clean_kernel::Name>,
+    ) -> crate::clean_island_batch::CleanIslandBatch {
+        if let Err(why) = self.ensure_live() {
+            self.tainted = true;
+            return failed_batch(sources.len(), &why);
+        }
+        let mut batch = if collect_census {
+            let (env, file_ctx, _) = self.keyed.parts_mut();
+            crate::clean_island_batch::check_pinned_sources_batched(
+                env,
+                file_ctx,
+                sources,
+                &[],
+                true,
+                baseline,
+            )
+        } else {
+            let declarations = self.prepare_pinned_source_declarations(sources, baseline);
+            self.finish_declarations(sources, declarations)
+        };
+        self.tainted |= batch.is_rejected();
+        self.record_standin_imports(&batch.outcomes);
+        if let Some(census) = &mut batch.census {
+            census.mark_session_tainted(self.tainted);
+        }
+        batch
     }
 
     /// Whether ordinary checking or caller ingestion invalidated this session.
@@ -5561,6 +5609,17 @@ pub(crate) fn strict_registered_pre_reference_error(
     env: &Environment,
     name: &clean_kernel::Name,
 ) -> Option<String> {
+    strict_registered_declaration_policy_error(env, name)
+        .or_else(|| strict_registered_theorem_error(env, env.get_const(name)?))
+}
+
+/// The original declaration policy, before selecting a reference base. A
+/// pinned-source batch runs the unchanged theorem audit after its full closed
+/// replay, against the rebuilt base and the original type/proof expressions.
+pub(crate) fn strict_registered_declaration_policy_error(
+    env: &Environment,
+    name: &clean_kernel::Name,
+) -> Option<String> {
     // Failed transactional batches report temporary registered names but
     // commit no constants. They are progress data only. The successful-batch
     // reference gate still refuses every absent name (check_registered).
@@ -5603,6 +5662,14 @@ pub(crate) fn strict_registered_pre_reference_error(
         ));
     }
 
+    None
+}
+
+pub(crate) fn strict_registered_theorem_error(
+    env: &Environment,
+    info: &clean_kernel::env::ConstantInfo,
+) -> Option<String> {
+    let name = &info.name;
     if info.kind == ConstantKind::Theorem {
         let Some(proof) = &info.value else {
             return Some(format!(
@@ -12286,6 +12353,22 @@ def pb_min (lhs : UInt64) (rhs : UInt64) : UInt64 := if rhs < lhs then rhs else 
         );
         assert!(!commented.is_rejected(), "{:?}", commented.errors);
         assert!(commented.standin_imports.is_empty());
+        assert!(session.standin_imports().is_empty());
+    }
+
+    #[test]
+    fn prelude_header_cannot_clear_an_islands_existing_kernel_environment() {
+        let mut session = CleanIslandSession::new();
+        let outcome = session.check("prelude\nimport Lean\n");
+        assert!(outcome.is_rejected(), "{:?}", outcome.errors);
+        assert!(
+            outcome.errors.iter().any(|error| error
+                .message
+                .contains("prelude requires a fresh module environment without implicit Init")),
+            "{:?}",
+            outcome.errors
+        );
+        assert!(outcome.standin_imports.is_empty());
         assert!(session.standin_imports().is_empty());
     }
 

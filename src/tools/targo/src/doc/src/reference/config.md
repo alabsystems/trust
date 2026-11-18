@@ -1033,7 +1033,25 @@ exits 3. It has no effect without `--plan`.
 
 Seconds a running test executable of a test plan may print nothing, over the
 plan's `[run] stall-seconds`. A run with one silent for longer is stopped and
-exits 3. It has no effect without `--plan`.
+exits 3.
+
+Without a plan, this is the inactivity window of each actual test executable
+and its current descendants on Linux and macOS. Output bytes or measured
+process-tree CPU/disk-I/O activity keep that executable active. Incomplete
+native observations never count as zero activity; persistent observation loss
+refuses execution. The existing owner stops and retires its original process
+group on expiry. This policy grants no CPU or memory resources and does not
+reinterpret a harness's expected `seconds` or reserved `memory-mib` as limits.
+Configured activity supervision refuses retained execution, unsupported hosted
+executors and rustdoc-owned generated test processes instead of omitting the
+requested supervision. Ordinary execution without this policy is unchanged.
+
+The native ordinary-test API can also carry an independent child policy. The
+actual receiver combines each bound with its effective configuration using the
+minimum; a caller cannot widen a configured inactivity window or remove a
+resident-byte ceiling. These are execution limits, not expected durations,
+memory reservations or CPU grants. Plans, prepared sessions and retained test
+execution refuse this ordinary-only request rather than ignoring it.
 
 #### `build.test-harnesses` (Trust)
 
@@ -1077,21 +1095,120 @@ variables cannot spell this table and are refused; use a config file or
 * Default: `false`
 
 Share eligible dependency compilations between projects on the same
-machine and under the same `CARGO_HOME`:
+machine and under the same `CARGO_HOME`. A repository can check the key in:
 
-```sh
-targo --unverified build -Zbuild-dir-new-layout -Zfine-grain-locking \
-  --config build.shared-dependency-cache=true
+```toml
+# .cargo/config.toml
+[build]
+shared-dependency-cache = true
 ```
 
-This currently requires native unverified Targo on macOS, the native host
-architecture, and no compiler wrappers. Targo selects registry library units
-and external path dependencies outside the current workspace whose entire
-dependency graph can be compiled without build scripts, proc macros or
-workspace-local inputs. Selected units use the confinement and declared
-environment contract described above. Other units retain ordinary private
-build directories and execution, so a project can still use build scripts and
-proc macros without placing their results in this shared store.
+The key takes effect only for a native `targo --unverified` build on macOS
+whose compiler reports the native host triple and runs without a compiler
+wrapper (`build.rustc-wrapper` or `build.rustc-workspace-wrapper`). Such a
+build turns on the fine-grain locking the shared store needs by itself, as
+`-Zfine-grain-locking` would, with no `-Z` flag on the command line. Every
+other lane (`targo trust`, a host that is not macOS, a cargo-named invocation,
+a compiler wrapper, a foreign host architecture) runs exactly as with the key
+unset and never reads or writes the store; its `shared-dependency-policy`
+record says `enabled: false`. `enabled: true` says the key applies to the
+build, not that a unit was shared: where no unit is eligible, the build still
+creates the store and uses fine-grain locking, and each unit's decision record
+says why it stayed private.
+
+Targo selects registry library units and external path dependencies outside
+the current workspace whose entire dependency graph can be compiled without
+build scripts or proc macros, and the library units of workspace members whose
+dependencies are shared too, apart from their own build script and the proc
+macros they load. Selected units use the confinement and declared environment
+contract described above, except that an ambient deployment target, `SDKROOT`
+or `DEVELOPER_DIR` reaches a shared unit's compiler only where `[env]`
+declares it. Other units retain ordinary private build directories and
+execution, so a project can still use build scripts and proc macros without
+placing their results in this shared store. A library outside the workspace
+that links a member with a build script stays private
+(`member-script-dependency`): that script's output reaches its command.
+
+A workspace member's library (needing a compiler that takes
+`-Ztrust-path-free`) is compiled with the workspace directory remapped to `.`
+in every scope, without incremental state, and under `-Ztrust-path-free`, so
+its bytes name no checkout. Its slot is named by its unit, its sources
+digested without the checkout's path, the platform its compiler sees, the
+compiler, its prepared command (environment and arguments, with the
+checkout's and the slot's own paths read as tokens), and each dependency's
+slot; it records the SHA-256 of every library it consumed through `--extern`
+and is fresh only while those bytes are unchanged. A second checkout at the
+same commit reads the slots in place; a member built another way (as a
+requested package or as a dependency only, say) takes another slot. A shared
+unit's compiler is not given the terminal's width (`--diagnostic-width`), so
+its command does not follow the terminal a build runs in.
+
+In a git work tree only committed sources are shared: a member with a change
+git reports at or below its package directory (modified, staged, untracked)
+is compiled privately with its incremental state (`member-uncommitted`), and
+so is each member that depends on it. A member also stays private, compiled in
+the project's build directory as without the key, where its package directory
+holds or sits in a build output, the cargo home or the store, or would write a
+trim-paths unremap file; where the caller's flags remap paths
+(`--remap-path-prefix`, `--remap-path-scope`, `-Zremap-cwd-prefix`), under
+`targo fix` and under a forced rebuild (all `member-not-confined`); and where
+its package tree cannot be captured, as when it holds a link
+(`member-source-uncaptured`). A shared compile that fails is not reported: the
+build is planned again in the same invocation with the member private, whose
+compile reports what it reports. The checkout records why in its build
+directory, under `.targo-member-private`: `path-bound` where the compiler
+refused the member's metadata because it needs its real path (held while the
+environment, compiler, lockfile and member manifest are unchanged), and
+`member-compile-failed` for any other failure, such as a read outside the
+package that its confinement denies (held while its sources, environment and
+compiler are unchanged). A slot that holds a unit recorded for other bytes is
+never written over (`member-slot-differs`, recorded the same way), and a
+member whose sources move during the build is private for that invocation.
+Under the remap, `file!()` and panic locations in a shared member read as
+workspace-relative paths.
+
+Build scripts and proc macros themselves stay in each checkout: a member's
+build script runs there, and a proc macro, from the workspace or not, is
+compiled there. A member with a build script, or that loads a proc macro, is
+shared keyed on what they produced in this checkout: the stdout of each build
+script whose directives reach its command (its own, and those of the
+libraries it links and the proc macros it loads), its own script's `OUT_DIR`
+tree, and the bytes of each proc macro's library. These name its slot, so two
+checkouts whose scripts print the same and whose macros are the same bytes
+share it, and any difference (a script that prints its checkout's path, say)
+names another slot. The member's compile may read its own script's `OUT_DIR`
+and each macro's library directory, and nothing else of theirs. They are read
+when the build is planned and again before the member's job uses its slot; a
+member whose script has not yet run in this checkout, or whose macro is not
+yet built, waits: the build is planned again in the same invocation once they
+have run. A waiting member stops only its dependents: the scripts, macros and
+members that do not depend on it still run, so a checkout's first build is
+usually planned twice. A member whose inputs change after that, or cannot be
+read whole (a link in `OUT_DIR`), is private for the invocation
+(`member-inputs-moved`). A script whose output a `links` override in
+configuration replaces prints nothing, so its member waits, is renamed, and is
+then private for the invocation. The whole stdout is the key, `cargo::warning`
+and `rerun-if` lines included, so a script that prints a changing warning
+shares nothing. Code that reads `OUT_DIR` with `include!(concat!(env!("OUT_DIR"),
+…))` reads a host path through `env!`, which `-Ztrust-path-free` refuses: such a
+member is path-bound. `OUT_DIR` keys a member mostly through what it bundles
+from there, a native library a script built.
+
+A proc macro runs inside the member's compile and may read what no key holds:
+an environment variable or a file with `std::env::var` or `std::fs`, the
+working directory, a span's file. `-Ztrust-path-free` judges only the
+member's metadata. Before a shared member's job ends, its library and metadata
+are searched for the checkout's directories, as spelled and canonical: the
+workspace, the member's package, and the target and build directories. A
+member whose outputs name one is path-bound, and its outputs leave the store
+but for metadata that names none. The compiler's dep-info is not searched: it
+names what the compile read, a macro's library and the files of `OUT_DIR`
+among them, at the compiling checkout's path, and the key holds those bytes. Directories every
+checkout sharing the store has in common (the store, `CARGO_HOME`, `HOME`)
+bind no slot to a checkout and are not searched for. What a macro reads that
+is not a path of the checkout (a file outside it, the time) is not keyed; the
+member's compile can read only its sources, its dependencies' outputs, its own
+script's `OUT_DIR` and its macros' library directories.
 
 Shared unit files live under `CARGO_HOME/trust/native-dependencies-v1`. Targo
 requires a local filesystem and owned directories that other users cannot write, checks recorded
@@ -1099,6 +1216,38 @@ inputs and output digests, and coordinates readers and writers through a
 per-unit lock. A waiting builder checks freshness again after obtaining its
 lock. This is a local development cache, not a verified verdict or a remote
 artifact trust policy. `targo clean` remains scoped to project build outputs.
+
+A build that shares can also name a unit source, a program that may hold
+shared units staged elsewhere, in the Targo-internal environment variable
+`TRUST_TARGO_UNIT_SOURCE`. No process the build starts sees it: not the
+compiler, a build script, a test or a run. Where the check of a shared unit
+misses under its lock, the unit's worker asks the source, which Targo starts
+once per build at its first ask, with one JSON line on its standard input:
+`{"key":…,"staging":…,"version":1}`. The key is the SHA-256 of the fingerprint
+record this build computed for the unit; the staging folder is a new private
+folder inside the store. The source may send `working` lines while it stages,
+then answers with one line, `staged` (it laid the unit out in that folder as
+the unit's own `fingerprint/` and `out/` folders, each file a copy or clone it
+owns alone, never a hard link) or `none`. Targo renames only the unit's
+planned files into the unit's directory, and only where the staged
+fingerprint record is the computed one, every planned file is a plain file
+with one link and no folder on the way is a link; placed files get the
+store's mode. It then checks the unit again: it takes the unit where the
+fingerprint and the outputs' receipt hold, and otherwise removes what it
+placed, refuses the unit and compiles it. A unit whose dependency this build
+compiled is compiled, as it would be with no source. A unit's
+`shared-dependency-decision` record says `taken`, or `refused` with its reason
+(`fingerprint-differs`, `output-integrity`, `incomplete` or `stale`). Asks are
+answered one at a time. A source that stays silent for 2 seconds (a `working`
+line breaks the silence), takes more than 120 seconds over one ask, exits, or
+sends any other line, or a line before it is asked, is killed and passed over
+for the rest of the build. When the build ends the source's input is closed,
+it has 2 seconds to exit before it is killed, and the build's staging folder
+is removed. The key and the receipt bind the store's absolute path and the
+keyed environment, so a unit is taken only where the cargo home path and that
+environment match. The source is trusted as far as it sends a fingerprint
+record and receipt: name only a program that serves units from builders
+allowed to run here.
 
 #### `build.rustflags`
 * Type: string or array of strings

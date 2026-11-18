@@ -27,6 +27,10 @@ pub(super) fn strip_for_general(module: &mut Module) -> Result<(), String> {
         function.summary = None;
         function.source_provenance = None;
         function.body_gate = if function.is_declaration() { None } else { Some(BodyGate::Ungated) };
+        for node in function.blocks.iter_mut().flat_map(|block| &mut block.body) {
+            node.proofs.clear();
+            node.proof_context = None;
+        }
     }
     let errors = trust_ir_build::validate_module(module);
     if errors.is_empty() {

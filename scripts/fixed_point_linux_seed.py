@@ -5495,7 +5495,10 @@ def pinned_lean_directory(repo: Path, commit: str) -> str | None:
     and its module store without a checkout; None when it cannot be read."""
     try:
         entry = refresh.git(repo, "ls-tree", commit, "first-party/clean").split()
-        store = Path(refresh.git(repo, "rev-parse", "--absolute-git-dir")) / "modules" / "first-party" / "clean"
+        # A second worktree's Clean checkout is a linked worktree of the first checkout's store.
+        store = refresh.module_store(refresh.module_roots(repo), "first-party/clean")
+        if store is None:
+            return None
         pin = subprocess.run(["git", "--git-dir", str(store), "show", f"{entry[2]}:lean-toolchain"],
                              capture_output=True, text=True)
         return lean_directory(pin.stdout.strip()) if pin.returncode == 0 else None

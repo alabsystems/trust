@@ -1,11 +1,11 @@
-//! The five PINNED C-ABI entry points of the `Nat` trusted handle runtime.
+//! The nineteen PINNED C-ABI entry points of the `Nat` trusted handle runtime.
 //!
 //! Copyright 2026 Andrew Yates. SPDX-License-Identifier: Apache-2.0 OR MIT.
 //!
 //! # What these are
 //!
 //! `trust_ir_build::validate::TRUSTED_HANDLE_RUNTIMES` pins one runtime row,
-//! `("Nat", "trust_bignum::Nat")`, with five entry points named by LINK-TIME
+//! `("Nat", "trust_bignum::Nat")`, with nineteen entry points named by LINK-TIME
 //! SYMBOL and exact signature. A TrustIR module carrying a `Ty::Handle` for
 //! that row may only reach the runtime through a bodyless `External` C
 //! declaration of one of those symbols; the validator refuses every other
@@ -25,6 +25,20 @@
 //! | `trust_bignum_nat_sub`        | `(Handle, Handle) -> Handle`      | [`Nat::sub`] |
 //! | `trust_bignum_nat_is_zero`    | `(Handle) -> Bool`                | [`Nat::is_zero`] |
 //! | `trust_bignum_nat_drop`       | `(Handle) -> ()`                  | `Box::from_raw` + drop |
+//! | `trust_bignum_nat_mul`        | `(Handle, Handle) -> Handle`      | [`Nat::mul`] |
+//! | `trust_bignum_nat_div`        | `(Handle, Handle) -> Handle`      | [`Nat::div`] |
+//! | `trust_bignum_nat_mod`        | `(Handle, Handle) -> Handle`      | [`Nat::rem`] |
+//! | `trust_bignum_nat_beq`        | `(Handle, Handle) -> Bool`        | canonical equality |
+//! | `trust_bignum_nat_ble`        | `(Handle, Handle) -> Bool`        | [`Nat::cmp`] |
+//! | `trust_bignum_nat_fits_u64`   | `(Handle) -> Bool`                | [`Nat::to_u64`] |
+//! | `trust_bignum_nat_to_u64`     | `(Handle) -> U64`                 | checked [`Nat::to_u64`] |
+//! | `trust_bignum_nat_clone`      | `(Handle) -> Handle`              | [`Nat::clone`] |
+//! | `trust_bignum_nat_land`       | `(Handle, Handle) -> Handle`      | [`Nat::land`] |
+//! | `trust_bignum_nat_lor`        | `(Handle, Handle) -> Handle`      | [`Nat::lor`] |
+//! | `trust_bignum_nat_xor`        | `(Handle, Handle) -> Handle`      | [`Nat::xor`] |
+//! | `trust_bignum_nat_shift_left` | `(Handle, Handle) -> Handle`      | [`Nat::shift_left`] |
+//! | `trust_bignum_nat_shift_right`| `(Handle, Handle) -> Handle`      | [`Nat::shift_right`] |
+//! | `trust_bignum_nat_pow`        | `(Handle, Handle) -> Handle`      | [`Nat::pow`] |
 //!
 //! `Ty::Handle` is pointer-width (`trust_ir::ty`: `bit_width_with` answers
 //! `pointer_bits` for it), so a handle is exactly a thin `*mut Nat`. `Nat` is
@@ -68,14 +82,14 @@
 //! `"drop"`, ratified in `docs/SPEC_RATIFICATIONS.md` §7 on 2026-09-17), so the
 //! release shim is here and the disclosure is replaced by the real discipline:
 //!
-//! * **`from_u64` / `add` / `sub` ALLOCATE.** Each returns a `Box::into_raw`
+//! * **Every handle-returning entry point ALLOCATES.** Each returns a `Box::into_raw`
 //!   pointer to a FRESH `Nat`: a brand-new allocation that aliases no argument
 //!   and no earlier result. That is a property of the wrapped methods, not a
 //!   convention — [`Nat::add`] and [`Nat::sub`] are `(&self, &Self) -> Self`,
 //!   so they cannot return one of their operands, and [`Nat::from_u64`] has no
 //!   operand to return. Every handle this runtime hands out is therefore owned
 //!   by whoever received it.
-//! * **`add` / `sub` / `is_zero` only BORROW their arguments.** They take
+//! * **Every entry point except `drop` only BORROWS its handle arguments.** They take
 //!   `*const Nat` and reborrow it shared; none consumes, frees or mutates a
 //!   handle. So passing a handle to one of them transfers nothing, and the
 //!   caller still owns it afterwards. A producer relies on this: it is what
@@ -107,7 +121,7 @@
 //! # The contract each caller must meet
 //!
 //! Every handle argument must be a non-null, properly aligned, live pointer
-//! returned by `from_u64`, `add` or `sub`. A null pointer is the one violation
+//! returned by one of this runtime's handle-producing entry points. A null pointer is the one violation
 //! cheap enough to catch, and it is caught: the shim aborts rather than
 //! dereference or free it (an `extern "C"` function is `nounwind`, so the
 //! assertion terminates the process instead of unwinding into C). Every other
@@ -158,6 +172,146 @@ pub unsafe extern "C" fn trust_bignum_nat_sub(a: *const Nat, b: *const Nat) -> *
     Box::into_raw(Box::new(a.sub(b)))
 }
 
+/// The pinned multiplication entry point. Borrows both operands; returns a fresh handle.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_mul(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_mul", a, b) };
+    Box::into_raw(Box::new(a.mul(b)))
+}
+
+/// The pinned division entry point, including Lean's `n / 0 = 0`.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_div(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_div", a, b) };
+    Box::into_raw(Box::new(a.div(b)))
+}
+
+/// The pinned remainder entry point, including Lean's `n % 0 = n`.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_mod(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_mod", a, b) };
+    Box::into_raw(Box::new(a.rem(b)))
+}
+
+/// Canonical natural equality, with the registry's C `Bool` result.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_beq(a: *const Nat, b: *const Nat) -> bool {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_beq", a, b) };
+    a == b
+}
+
+/// Natural less-than-or-equal, with the registry's C `Bool` result.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_ble(a: *const Nat, b: *const Nat) -> bool {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_ble", a, b) };
+    a <= b
+}
+
+/// Test `n < 2^64`, without truncating or consuming the handle.
+///
+/// # Safety
+/// As [`trust_bignum_nat_is_zero`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_fits_u64(handle: *const Nat) -> bool {
+    unsafe { handle_ref("trust_bignum_nat_fits_u64", handle) }.to_u64().is_some()
+}
+
+/// Checked projection. A value outside `u64` aborts across this nounwind C ABI;
+/// no wrapped value is returned. `fits_u64` supplies the separate total predicate.
+///
+/// # Safety
+/// As [`trust_bignum_nat_is_zero`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_to_u64(handle: *const Nat) -> u64 {
+    unsafe { handle_ref("trust_bignum_nat_to_u64", handle) }
+        .to_u64()
+        .expect("trust_bignum_nat_to_u64: Nat does not fit u64")
+}
+
+/// Return a fresh allocation equal to a borrowed input, including for zero.
+///
+/// # Safety
+/// As [`trust_bignum_nat_is_zero`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_clone(handle: *const Nat) -> *mut Nat {
+    Box::into_raw(Box::new(unsafe { handle_ref("trust_bignum_nat_clone", handle) }.clone()))
+}
+
+/// The pinned natural bitwise conjunction.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_land(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_land", a, b) };
+    Box::into_raw(Box::new(a.land(b)))
+}
+
+/// The pinned natural bitwise disjunction.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_lor(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_lor", a, b) };
+    Box::into_raw(Box::new(a.lor(b)))
+}
+
+/// The pinned natural bitwise exclusive disjunction.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_xor(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_xor", a, b) };
+    Box::into_raw(Box::new(a.xor(b)))
+}
+
+/// The pinned left shift. The second handle is a full natural count.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_shift_left(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_shift_left", a, b) };
+    Box::into_raw(Box::new(a.shift_left(b)))
+}
+
+/// The pinned right shift. A count past the input's bits returns zero.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_shift_right(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_shift_right", a, b) };
+    Box::into_raw(Box::new(a.shift_right(b)))
+}
+
+/// The pinned natural power, including `0 ^ 0 = 1` and natural-valued exponents.
+///
+/// # Safety
+/// As [`trust_bignum_nat_add`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trust_bignum_nat_pow(a: *const Nat, b: *const Nat) -> *mut Nat {
+    let (a, b) = unsafe { handle_pair("trust_bignum_nat_pow", a, b) };
+    Box::into_raw(Box::new(a.pow(b)))
+}
+
 /// The pinned `is_zero` entry point: `(Handle) -> Bool`.
 ///
 /// # Safety
@@ -183,7 +337,7 @@ pub unsafe extern "C" fn trust_bignum_nat_is_zero(a: *const Nat) -> bool {
 /// # Safety
 ///
 /// `handle` must be a non-null, aligned handle THIS runtime allocated — the
-/// value `from_u64`, `add` or `sub` returned — and the caller must guarantee
+/// value any handle-producing entry point returned — and the caller must guarantee
 /// two further things nothing here can see:
 ///
 /// * **no use after this call.** Every other handle value denoting this same
@@ -226,7 +380,7 @@ unsafe fn handle_ref<'a>(entry: &str, handle: *const Nat) -> &'a Nat {
 
 /// The one null refusal, shared by every entry point.
 ///
-/// Five copies of a trusted check are five chances for one of them to drift,
+/// Separate copies of a trusted check are chances for one of them to drift,
 /// and the release entry point is the one that would drift in the worst
 /// direction: a null it accepted would reach `Box::from_raw`.
 fn require_non_null(entry: &str, handle: *const Nat) {
@@ -245,6 +399,32 @@ unsafe fn handle_pair<'a>(entry: &str, a: *const Nat, b: *const Nat) -> (&'a Nat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_nineteen_pinned_entry_points_have_the_exact_physical_c_signatures() {
+        let _: extern "C" fn(u64) -> *mut Nat = trust_bignum_nat_from_u64;
+        let _: unsafe extern "C" fn(*mut Nat) = trust_bignum_nat_drop;
+        let binaries: [unsafe extern "C" fn(*const Nat, *const Nat) -> *mut Nat; 11] = [
+            trust_bignum_nat_add,
+            trust_bignum_nat_sub,
+            trust_bignum_nat_mul,
+            trust_bignum_nat_div,
+            trust_bignum_nat_mod,
+            trust_bignum_nat_land,
+            trust_bignum_nat_lor,
+            trust_bignum_nat_xor,
+            trust_bignum_nat_shift_left,
+            trust_bignum_nat_shift_right,
+            trust_bignum_nat_pow,
+        ];
+        let predicates: [unsafe extern "C" fn(*const Nat, *const Nat) -> bool; 2] =
+            [trust_bignum_nat_beq, trust_bignum_nat_ble];
+        let _: unsafe extern "C" fn(*const Nat) -> bool = trust_bignum_nat_is_zero;
+        let _: unsafe extern "C" fn(*const Nat) -> bool = trust_bignum_nat_fits_u64;
+        let _: unsafe extern "C" fn(*const Nat) -> u64 = trust_bignum_nat_to_u64;
+        let _: unsafe extern "C" fn(*const Nat) -> *mut Nat = trust_bignum_nat_clone;
+        assert_eq!(binaries.len() + predicates.len() + 6, 19);
+    }
 
     /// The shims are the LINKED surface, so the test drives them the way the
     /// linker will: through the raw pointers, not through the Rust methods.

@@ -279,33 +279,31 @@ dependencies = [
 
 [[package]]
 name = "autocfg"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-allsat",
  "ay-chc",
  "ay-core",
- "ay-count",
  "ay-dpll",
  "ay-frontend",
- "ay-milp",
  "ay-proof",
  "ay-sat",
  "ay-translate",
  "num-bigint",
  "num-rational",
  "num-traits",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-allsat"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-sat",
  "tracing",
@@ -313,17 +311,17 @@ dependencies = [
 
 [[package]]
 name = "ay-arrays"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "num-bigint",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
 [[package]]
 name = "ay-bindings"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -334,25 +332,25 @@ dependencies = [
  "num-traits",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-bv"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-arrays",
  "ay-core",
  "ay-sys",
  "num-bigint",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
 [[package]]
 name = "ay-cdclt"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-diff-logic",
@@ -366,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "ay-chc"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -391,13 +389,13 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
 [[package]]
 name = "ay-core"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-sys",
  "foldhash 0.1.5",
@@ -408,26 +406,12 @@ dependencies = [
  "num-traits",
  "serde",
  "stacker",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "ay-count"
-version = "0.28.2"
-dependencies = [
- "ay-core",
- "ay-sat",
- "ay-sys",
- "num-bigint",
- "num-integer",
- "num-rational",
- "num-traits",
- "rustc-hash 2.1.2",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "num-bigint",
  "num-rational",
@@ -436,14 +420,14 @@ dependencies = [
 
 [[package]]
 name = "ay-dispatch"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "ay-dpll"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -477,23 +461,23 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
 [[package]]
 name = "ay-drat-check"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-proof-common",
  "ay-sys",
  "rustc-hash 2.1.2",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-dt"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -502,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "ay-encode"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-bindings",
  "ay-chc",
@@ -512,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "hashbrown 0.15.5",
@@ -522,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "ay-fp"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -533,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "ay-frontend"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "logos",
@@ -541,12 +525,12 @@ dependencies = [
  "num-rational",
  "num-traits",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-intsat"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -556,16 +540,16 @@ dependencies = [
 
 [[package]]
 name = "ay-jit"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "serde",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-lia"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-intsat",
@@ -579,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lra"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -594,53 +578,33 @@ dependencies = [
 
 [[package]]
 name = "ay-map"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
-]
-
-[[package]]
-name = "ay-milp"
-version = "0.28.2"
-dependencies = [
- "ay-dpll",
- "ay-lra",
- "ay-pb-core",
- "ay-sat",
- "ay-sys",
- "num-bigint",
- "num-integer",
- "num-rational",
- "num-traits",
- "serde",
- "serde_json",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
- "smallvec",
- "thiserror 2.0.17",
 ]
 
 [[package]]
 name = "ay-model-check"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "num-bigint",
  "num-integer",
  "num-rational",
  "num-traits",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-multiset"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-nia"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-lia",
@@ -657,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -665,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nra"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-lra",
@@ -676,35 +640,17 @@ dependencies = [
  "num-rational",
  "num-traits",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
 [[package]]
-name = "ay-pb-core"
-version = "0.28.2"
-dependencies = [
- "ay-core",
- "ay-sat",
- "ay-sys",
- "num-bigint",
- "num-rational",
- "num-traits",
- "rustc-hash 2.1.2",
- "serde",
- "serde_json",
- "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
- "signal-hook",
- "thiserror 2.0.17",
-]
-
-[[package]]
 name = "ay-prefetch"
-version = "0.28.2"
+version = "0.28.4"
 
 [[package]]
 name = "ay-proof"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -714,19 +660,19 @@ dependencies = [
  "num-traits",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-proof-common"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ay-sat"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-drat-check",
@@ -744,17 +690,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "smallvec",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.28.2"
+version = "0.28.4"
 
 [[package]]
 name = "ay-seq"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -762,14 +708,14 @@ dependencies = [
 
 [[package]]
 name = "ay-set"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
 ]
 
 [[package]]
 name = "ay-strings"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -778,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "ay-sys"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "libc",
  "nix 0.29.0",
@@ -789,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "ay-translate"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -893,9 +839,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "2.10.0"
+version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "blake3"
@@ -1037,7 +983,7 @@ checksum = "89385e82b5d1821d2219e0b095efa2cc1f246cbf99080f3be46a1a85c0d392d9"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1118,7 +1064,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1162,7 +1108,7 @@ dependencies = [
  "serde",
  "serde-untagged",
  "serde-value",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "toml 0.8.23",
  "unicode-xid",
  "url",
@@ -1180,7 +1126,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1194,7 +1140,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1308,7 +1254,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1319,7 +1265,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clean-auto"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "ay",
@@ -1340,14 +1286,14 @@ dependencies = [
  "serde",
  "serde_json",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "clean-compiler"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "bincode 1.3.3",
  "blake3",
@@ -1355,7 +1301,7 @@ dependencies = [
  "clean-olean",
  "clean-reflect",
  "serde",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir",
  "trust-ir-build",
  "trust-ir-conformance",
@@ -1363,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "clean-elab"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "clean-auto",
@@ -1382,14 +1328,14 @@ dependencies = [
  "sha2 0.11.1",
  "stacker",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "clean-kernel"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -1404,22 +1350,22 @@ dependencies = [
  "sha2 0.11.1",
  "smallvec",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "zstd",
 ]
 
 [[package]]
 name = "clean-macro"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "clean-kernel",
  "clean-parser",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "clean-olean"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -1434,41 +1380,41 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "smallvec",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "clean-parser"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "clean-kernel",
  "serde",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "clean-reflect"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "clean-kernel",
  "serde",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir",
 ]
 
 [[package]]
 name = "clean-runtime"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "clean-verify"
-version = "0.9.2"
+version = "0.9.4"
 dependencies = [
  "blake3",
  "clean-elab",
@@ -1478,8 +1424,8 @@ dependencies = [
  "num-rational",
  "serde",
  "serde_json",
- "syn 2.0.117",
- "thiserror 2.0.17",
+ "syn 2.0.119",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1563,7 +1509,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1620,7 +1566,7 @@ dependencies = [
  "nom 7.1.3",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1920,7 +1866,7 @@ checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1950,7 +1896,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "scratch",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1964,7 +1910,7 @@ dependencies = [
  "indexmap",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1982,7 +1928,7 @@ dependencies = [
  "indexmap",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2006,7 +1952,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2017,7 +1963,7 @@ checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
 dependencies = [
  "darling_core",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2048,7 +1994,7 @@ checksum = "d08b3a0bcc0d079199cd476b2cae8435016ec11d1c0986c6901c5ac223041534"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2069,7 +2015,7 @@ dependencies = [
  "darling",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2079,7 +2025,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
 dependencies = [
  "derive_builder_core",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2091,7 +2037,7 @@ dependencies = [
  "darling",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2177,7 +2123,7 @@ checksum = "97369cbbc041bc366949bc74d34658d6cda5621039731c6310521892a3a20ae0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2430,7 +2376,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54f0d287c53ffd184d04d8677f590f4ac5379785529e5e08b1c8083acdd5c198"
 dependencies = [
  "memchr",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3054,7 +3000,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde_core",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "uuid",
  "windows 0.61.3",
 ]
@@ -3076,9 +3022,9 @@ dependencies = [
 
 [[package]]
 name = "itoa"
-version = "1.0.15"
+version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jaq-core"
@@ -3151,7 +3097,7 @@ checksum = "980af8b43c3ad5d8d349ace167ec8170839f753a42d233ba19e08afe1850fa69"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3234,7 +3180,7 @@ dependencies = [
  "pest_derive",
  "regex",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3436,7 +3382,7 @@ dependencies = [
  "quote",
  "regex-syntax",
  "rustc_version",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3625,7 +3571,7 @@ checksum = "4568f25ccbd45ab5d5603dc34318c1ec56b117531781260002151b8530a9f931"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3859,9 +3805,9 @@ dependencies = [
 
 [[package]]
 name = "once_cell"
-version = "1.21.3"
+version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "once_cell_polyfill"
@@ -4027,7 +3973,7 @@ dependencies = [
  "pest_meta",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4099,9 +4045,9 @@ dependencies = [
 
 [[package]]
 name = "pin-project-lite"
-version = "0.2.16"
+version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pkcs8"
@@ -4290,7 +4236,7 @@ checksum = "7347867d0a7e1208d93b46767be83e2b8f978c3dad35f775ac8d8847551d6fe1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4331,9 +4277,9 @@ checksum = "07589615d719a60c8dd8a4622e7946465dfef20d1a428f969e3443e7386d5f45"
 
 [[package]]
 name = "quote"
-version = "1.0.45"
+version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
+checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
@@ -4488,7 +4434,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.16",
  "libredox",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4508,7 +4454,7 @@ checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4548,9 +4494,9 @@ checksum = "8d942b98df5e658f56f20d592c7f868833fe38115e65c33003d8cd224b0155da"
 
 [[package]]
 name = "regex-syntax"
-version = "0.8.8"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remote-test-client"
@@ -5447,7 +5393,7 @@ version = "0.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -5611,7 +5557,7 @@ dependencies = [
  "indexmap",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
  "synstructure",
 ]
 
@@ -6302,7 +6248,7 @@ dependencies = [
  "indexmap",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
  "synstructure",
 ]
 
@@ -6411,7 +6357,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -6534,7 +6480,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -6563,9 +6509,9 @@ checksum = "16c2f82143577edb4921b71ede051dac62ca3c16084e918bf7b40c96ae10eb33"
 
 [[package]]
 name = "semver"
-version = "1.0.27"
+version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 dependencies = [
  "serde",
  "serde_core",
@@ -6620,7 +6566,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -6631,7 +6577,7 @@ checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -6761,16 +6707,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "signal-hook"
-version = "0.3.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
-dependencies = [
- "libc",
- "signal-hook-registry",
-]
-
-[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6815,9 +6751,9 @@ checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
 
 [[package]]
 name = "smallvec"
-version = "1.15.1"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "socket2"
@@ -6931,9 +6867,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
-version = "2.0.117"
+version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6959,7 +6895,7 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -6997,7 +6933,7 @@ dependencies = [
 
 [[package]]
 name = "targo-trust"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "build_helper",
@@ -7136,11 +7072,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.17"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f63587ca0f12b72a0600bcba1d40081f830876000bb46dd2337a3051618f4fc8"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.17",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -7151,18 +7087,18 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.17"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ff15c8ecd7de3849db632e14d18d2571fa09dfc5ed93479bc4485c7a517c913"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -7286,7 +7222,7 @@ dependencies = [
 
 [[package]]
 name = "tla-lock"
-version = "1.20261116.1"
+version = "1.20261118.1"
 dependencies = [
  "tla-lock-api",
  "tla-lock-core",
@@ -7294,14 +7230,14 @@ dependencies = [
 
 [[package]]
 name = "tla-lock-api"
-version = "1.20261116.1"
+version = "1.20261118.1"
 dependencies = [
  "scopeguard",
 ]
 
 [[package]]
 name = "tla-lock-core"
-version = "1.20261116.1"
+version = "1.20261118.1"
 dependencies = [
  "cfg-if",
  "libc",
@@ -7312,19 +7248,19 @@ dependencies = [
 
 [[package]]
 name = "tla-mc-core"
-version = "1.20261116.1"
+version = "1.20261118.1"
 dependencies = [
  "crossbeam",
  "rustc-hash 2.1.2",
  "sha2 0.10.9",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tla-lock",
  "tla-smallvec",
 ]
 
 [[package]]
 name = "tla-smallvec"
-version = "1.20261116.1"
+version = "1.20261118.1"
 
 [[package]]
 name = "tokio"
@@ -7478,7 +7414,7 @@ checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -7558,19 +7494,19 @@ dependencies = [
 
 [[package]]
 name = "trust-align"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-backprop"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde",
  "serde_json",
- "syn 2.0.117",
+ "syn 2.0.119",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-os",
  "trust-sha2",
  "trust-strengthen",
@@ -7580,7 +7516,7 @@ dependencies = [
 
 [[package]]
 name = "trust-bignum"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
  "rustc-std-workspace-alloc 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -7589,32 +7525,32 @@ dependencies = [
 
 [[package]]
 name = "trust-binary-parse"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-types",
 ]
 
 [[package]]
 name = "trust-bitfield"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "trust-bits",
 ]
 
 [[package]]
 name = "trust-bits"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-bmc"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ay-bindings",
  "ay-chc",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir",
  "trust-ir-bridge",
  "trust-ir-build",
@@ -7631,7 +7567,7 @@ dependencies = [
 
 [[package]]
 name = "trust-bridge-closure"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
  "clean-olean",
@@ -7642,11 +7578,11 @@ dependencies = [
 
 [[package]]
 name = "trust-budget"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-build-cpu"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "jobserver",
@@ -7677,25 +7613,25 @@ dependencies = [
 
 [[package]]
 name = "trust-cache"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "fs2",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-sha2",
  "trust-types",
 ]
 
 [[package]]
 name = "trust-cert-meter"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
 ]
 
 [[package]]
 name = "trust-certify"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-auto",
@@ -7732,7 +7668,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-bridge"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ar_archive_writer",
  "ay",
@@ -7740,12 +7676,13 @@ dependencies = [
  "clean-auto",
  "clean-kernel",
  "clean-olean",
+ "clean-reflect",
  "object 0.39.1",
  "serde",
  "serde_json",
  "stacker",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-certify",
  "trust-cg-codegen",
  "trust-cg-ir",
@@ -7767,14 +7704,14 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "rayon",
  "serde",
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-cg-dialect",
  "trust-cg-ir",
  "trust-cg-irmid",
@@ -7789,21 +7726,21 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7811,7 +7748,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-irmid"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde_json",
  "trust-cg-ir",
@@ -7822,10 +7759,10 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-cg-ir",
  "trust-ir",
  "trust-ir-build",
@@ -7833,11 +7770,11 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-cg-ir",
  "trust-cg-lower",
  "trust-cg-process-env",
@@ -7845,7 +7782,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -7853,15 +7790,15 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clean-kernel",
  "clean-olean",
@@ -7871,7 +7808,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-cg-drat-trim",
  "trust-cg-ir",
  "trust-cg-lower",
@@ -7883,11 +7820,11 @@ dependencies = [
 
 [[package]]
 name = "trust-checksum"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-clean"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ay",
  "bincode 1.3.3",
@@ -7898,7 +7835,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-bridge-closure",
  "trust-ir",
  "trust-proof-cert",
@@ -7912,7 +7849,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-carrier"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
  "trust-symbols",
@@ -7921,7 +7858,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-ir"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
  "serde_json",
@@ -7935,7 +7872,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-ir-gate"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
  "trust-certify",
@@ -7950,7 +7887,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-origin"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-auto",
@@ -7966,11 +7903,11 @@ dependencies = [
 
 [[package]]
 name = "trust-convergence"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-spec",
  "trust-strengthen",
  "trust-types",
@@ -7978,12 +7915,12 @@ dependencies = [
 
 [[package]]
 name = "trust-coordinator"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "libc",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-budget",
  "trust-file-lock",
  "trust-rand",
@@ -7992,12 +7929,12 @@ dependencies = [
 
 [[package]]
 name = "trust-decompile"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-binary-parse",
  "trust-cg-bridge",
  "trust-ir",
@@ -8009,14 +7946,14 @@ dependencies = [
 
 [[package]]
 name = "trust-disasm"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "trust-ed25519"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ed25519-dalek",
  "trust-sha2",
@@ -8024,7 +7961,7 @@ dependencies = [
 
 [[package]]
 name = "trust-endian"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-exec-policy"
@@ -8042,19 +7979,19 @@ dependencies = [
 
 [[package]]
 name = "trust-file-lock"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "libc",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "trust-fixed"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-floatbits"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-fs-acl"
@@ -8065,7 +8002,7 @@ dependencies = [
 
 [[package]]
 name = "trust-fs-observation"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -8079,19 +8016,19 @@ dependencies = [
 
 [[package]]
 name = "trust-hex"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-index"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-intbound"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-integration-tests"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "jobserver_utils",
  "serde_json",
@@ -8115,11 +8052,11 @@ dependencies = [
 
 [[package]]
 name = "trust-interval"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-ir"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -8130,11 +8067,11 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-bridge"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-intbound",
  "trust-ir",
  "trust-ir-build",
@@ -8147,7 +8084,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
  "rayon",
@@ -8158,7 +8095,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-conformance"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "trust-ir",
  "trust-ir-build",
@@ -8166,7 +8103,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-contract"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -8175,21 +8112,21 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "trust-ir",
 ]
 
 [[package]]
 name = "trust-ir-laws"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "trust-ir",
 ]
 
 [[package]]
 name = "trust-json"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8197,11 +8134,11 @@ dependencies = [
 
 [[package]]
 name = "trust-lift"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ay",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-binary-parse",
  "trust-disasm",
  "trust-machine-sem",
@@ -8210,16 +8147,16 @@ dependencies = [
 
 [[package]]
 name = "trust-loop"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-convergence",
  "trust-types",
 ]
 
 [[package]]
 name = "trust-luminal-rows"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde_json",
  "trust-ir",
@@ -8228,9 +8165,9 @@ dependencies = [
 
 [[package]]
 name = "trust-machine-sem"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-disasm",
  "trust-types",
 ]
@@ -8250,7 +8187,7 @@ dependencies = [
  "num-bigint",
  "serde",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -8276,7 +8213,7 @@ name = "trust-mc-trust-bmc"
 version = "0.1.0"
 dependencies = [
  "ay-bindings",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir",
  "trust-ir-build",
  "trust-mc-core",
@@ -8284,7 +8221,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mir-extract"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
  "clean-verify",
@@ -8315,18 +8252,18 @@ dependencies = [
 
 [[package]]
 name = "trust-model-prelude"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "trust-sha2",
 ]
 
 [[package]]
 name = "trust-modular"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-odt"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8337,7 +8274,7 @@ dependencies = [
 
 [[package]]
 name = "trust-os"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -8346,14 +8283,14 @@ dependencies = [
 
 [[package]]
 name = "trust-platform"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "trust-platform-census"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde_json",
  "trust-ir",
@@ -8366,7 +8303,7 @@ dependencies = [
 
 [[package]]
 name = "trust-platform-derive"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "rayon",
  "serde_json",
@@ -8392,13 +8329,13 @@ version = "0.1.0"
 
 [[package]]
 name = "trust-proof-cert"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bincode 1.3.3",
  "proptest",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-certify",
  "trust-ed25519",
  "trust-ir",
@@ -8409,7 +8346,7 @@ dependencies = [
 
 [[package]]
 name = "trust-proof-session"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "getrandom 0.4.3",
  "nix 0.31.3",
@@ -8436,11 +8373,11 @@ dependencies = [
 
 [[package]]
 name = "trust-radix64"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-rand"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
@@ -8448,18 +8385,18 @@ dependencies = [
 
 [[package]]
 name = "trust-ratio"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-release"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "trust-report"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8492,7 +8429,7 @@ dependencies = [
 
 [[package]]
 name = "trust-router"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ay",
  "ay-bindings",
@@ -8506,7 +8443,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tla-mc-core",
  "tracing",
  "trust-bmc",
@@ -8537,7 +8474,7 @@ dependencies = [
 
 [[package]]
 name = "trust-semantics"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-kernel",
  "trust-types",
@@ -8545,14 +8482,14 @@ dependencies = [
 
 [[package]]
 name = "trust-sha2"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "trust-source-contract"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8567,16 +8504,16 @@ dependencies = [
 
 [[package]]
 name = "trust-spec"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-spec-elab"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-auto",
  "clean-kernel",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
  "trust-cert-meter",
  "trust-symbols",
  "trust-types",
@@ -8594,11 +8531,11 @@ dependencies = [
 
 [[package]]
 name = "trust-strengthen"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-types",
  "trust-vcgen",
  "trust-wp",
@@ -8606,18 +8543,18 @@ dependencies = [
 
 [[package]]
 name = "trust-symbols"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "trust-types",
 ]
 
 [[package]]
 name = "trust-symex"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-disasm",
  "trust-machine-sem",
  "trust-types",
@@ -8625,7 +8562,7 @@ dependencies = [
 
 [[package]]
 name = "trust-temporal"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "tla-mc-core",
  "trust-types",
@@ -8633,11 +8570,11 @@ dependencies = [
 
 [[package]]
 name = "trust-temporal-prelude"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-test-execution"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "getrandom 0.4.3",
  "libc",
@@ -8647,7 +8584,7 @@ dependencies = [
 
 [[package]]
 name = "trust-thir-lower"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "rustc_abi",
  "rustc_ast",
@@ -8680,11 +8617,11 @@ dependencies = [
 
 [[package]]
 name = "trust-timearith"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-toml"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -8692,11 +8629,11 @@ dependencies = [
 
 [[package]]
 name = "trust-transval"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "proptest",
  "serde",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-router",
  "trust-types",
  "trust-vcgen",
@@ -8704,7 +8641,7 @@ dependencies = [
 
 [[package]]
 name = "trust-types"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ay-bindings",
  "bincode 1.3.3",
@@ -8716,7 +8653,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir",
  "trust-ir-contract",
  "trust-sha2",
@@ -8726,31 +8663,31 @@ dependencies = [
 
 [[package]]
 name = "trust-upstream-compat"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "libc",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-sha2",
  "trust-toml",
 ]
 
 [[package]]
 name = "trust-utf"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-varint"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-vc-bitvector"
-version = "0.7.0"
+version = "0.8.0"
 
 [[package]]
 name = "trust-vc-bridge"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8764,7 +8701,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vc-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -8778,8 +8715,8 @@ dependencies = [
  "serde",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "stacker",
- "syn 2.0.117",
- "thiserror 2.0.17",
+ "syn 2.0.119",
+ "thiserror 2.0.21",
  "tracing",
  "trust-vc-bitvector",
  "trust-vc-kernel",
@@ -8788,32 +8725,32 @@ dependencies = [
 
 [[package]]
 name = "trust-vc-kernel"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "trust-vc-merge-contract"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "rustdoc-types",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "trust-vc-trust-engine"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir",
  "trust-ir-build",
  "trust-ir-contract",
@@ -8822,12 +8759,12 @@ dependencies = [
 
 [[package]]
 name = "trust-vcgen"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-certify",
  "trust-floatbits",
  "trust-lift",
@@ -8840,7 +8777,7 @@ dependencies = [
 
 [[package]]
 name = "trust-verifier-api"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -8852,7 +8789,7 @@ dependencies = [
 
 [[package]]
 name = "trust-version"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8861,12 +8798,12 @@ dependencies = [
 
 [[package]]
 name = "trust-wasm-bridge"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "clean-compiler",
  "clean-kernel",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-cg-codegen",
  "trust-ir",
  "trust-ir-bridge",
@@ -8876,11 +8813,11 @@ dependencies = [
 
 [[package]]
 name = "trust-widthconv"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-witness"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "rustc_abi",
  "rustc_ast",
@@ -8904,11 +8841,11 @@ dependencies = [
 
 [[package]]
 name = "trust-wp"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir",
  "trust-os",
  "trust-sha2",
@@ -8919,7 +8856,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-ay"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -8931,30 +8868,30 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "stacker",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "tracing",
  "trust-wp-core",
 ]
 
 [[package]]
 name = "trust-wp-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "num-bigint",
  "serde",
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir-contract",
 ]
 
 [[package]]
 name = "trust-wp-lib"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.21",
  "trust-ir",
  "trust-ir-build",
  "trust-ir-contract",
@@ -9005,9 +8942,9 @@ checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
 
 [[package]]
 name = "typenum"
-version = "1.20.0"
+version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ucd-parse"
@@ -9095,7 +9032,7 @@ checksum = "a1249a628de3ad34b821ecb1001355bca3940bcb2f88558f1a8bd82e977f75b5"
 dependencies = [
  "proc-macro-hack",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
  "unic-langid-impl",
 ]
 
@@ -9352,7 +9289,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
  "wasm-bindgen-shared",
 ]
 
@@ -9641,7 +9578,7 @@ checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -9652,7 +9589,7 @@ checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -9884,7 +9821,7 @@ checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
  "synstructure",
 ]
 
@@ -9905,7 +9842,7 @@ checksum = "88d2b8d9c68ad2b9e4340d7832716a4d21a22a1154777ad56ea55c51a9cf3831"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -9925,7 +9862,7 @@ checksum = "d71e5d6e06ab090c67b5e44993ec16b72dcbaabc526db883a360057678b48502"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
  "synstructure",
 ]
 
@@ -9972,9 +9909,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.3"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

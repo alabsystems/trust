@@ -1981,12 +1981,9 @@ dependencies = [
 [[package]]
 name = "serde_stacker"
 version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4936375d50c4be7eff22293a9344f8e46f323ed2b3c243e52f89138d9bb0f4a"
 dependencies = [
- "serde",
  "serde_core",
- "stacker",
+ "tla-stack",
 ]
 
 [[package]]
@@ -2282,7 +2279,7 @@ dependencies = [
  "tla-value",
  "toml",
  "trust-ir",
- "xxhash-rust 0.8.15",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2373,7 +2370,7 @@ dependencies = [
  "thiserror",
  "tla-core",
  "tla-value",
- "xxhash-rust 0.8.15",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2481,7 +2478,7 @@ dependencies = [
  "tla-core",
  "tla-shapes",
  "tla-value",
- "xxhash-rust 0.8.15",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2538,7 +2535,7 @@ dependencies = [
  "trust-cg-opt",
  "trust-ir",
  "trust-ir-build",
- "xxhash-rust 0.8.18",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2861,11 +2858,11 @@ dependencies = [
 
 [[package]]
 name = "trust-json"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-model-prelude"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-resource-provenance"
@@ -2880,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "trust-sha2"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "trust-spec-temporal"
@@ -3217,12 +3214,6 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "xxhash-rust"
 version = "0.8.15"
-
-[[package]]
-name = "xxhash-rust"
-version = "0.8.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yansi"

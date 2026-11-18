@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use trust_ir::{BlockId, ModuleFunctionCatalog, Ty};
+use trust_ir::{BlockId, FuncTyId, ModuleFunctionCatalog, Ty, ValueId};
 
 use super::tests::{append_general, destination, general_pair};
 use super::*;
@@ -32,6 +32,66 @@ fn global(ty: Ty, value: Constant) -> trust_ir::Global {
         visibility: trust_ir::Visibility::Default,
         retained: false,
     }
+}
+
+fn with_indirect_caller(mut source: Module, signature: FuncTyId) -> Module {
+    let callee_signature = source.functions[0].ty;
+    let calling_conv = source.functions[0].calling_conv;
+    let body = &mut source.functions[1].blocks[0].body;
+    let call = body.iter_mut().find(|node| matches!(node.inst, Inst::Call { .. })).unwrap();
+    let Inst::Call { args, .. } = &call.inst else { unreachable!() };
+    call.inst = Inst::CallIndirect {
+        sig: signature, callee: ValueId::new(42), args: args.clone(), calling_conv,
+    };
+    body.insert(
+        0,
+        trust_ir::InstrNode::new(Inst::Const {
+            ty: Ty::Func(callee_signature),
+            value: Constant::FnDef(FuncId::new(0)),
+        })
+        .with_result(ValueId::new(42)),
+    );
+    source
+}
+
+#[test]
+fn public_append_missing_signature_ids_refuse_before_any_table_is_published() {
+    for missing in [1, u32::MAX] {
+        let mut source = general_pair();
+        // The second function used to panic only after the first had landed.
+        source.functions[1].ty = FuncTyId::new(missing);
+        refuse_unchanged(destination(&[0]), source, "function signature");
+
+        let source = with_indirect_caller(general_pair(), FuncTyId::new(missing));
+        refuse_unchanged(destination(&[0]), source, "indirect-call signature");
+    }
+}
+
+#[test]
+fn public_append_valid_indirect_signature_retains_its_remapped_callee_binding() {
+    let source = general_pair();
+    let signature = source.functions[0].ty;
+    let source = with_indirect_caller(source, signature);
+    assert!(trust_ir_build::validate_module(&source).is_empty(), "valid indirect source");
+    let mut destination = destination(&[0]);
+    let owner = destination.functions[0].clone();
+    let summary = append_general(&mut destination, source);
+    assert_eq!(summary.general[0].1, "compiled", "{:?}", summary.general);
+    assert_eq!(destination.functions[0], owner);
+    let catalog = ModuleFunctionCatalog::new(&destination);
+    let callee = catalog.unique(FuncId::new(1)).unwrap();
+    let caller = catalog.unique(FuncId::new(2)).unwrap();
+    assert!(
+        caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .any(|node| matches!(node.inst, Inst::CallIndirect { sig, callee: value, .. }
+            if sig == callee.ty && value == ValueId::new(42)))
+    );
+    assert!(caller.blocks.iter().flat_map(|block| &block.body).any(|node|
+        matches!(&node.inst, Inst::Const { ty: Ty::Func(sig), value: Constant::FnDef(target) }
+            if *sig == callee.ty && *target == callee.id)));
 }
 
 #[test]

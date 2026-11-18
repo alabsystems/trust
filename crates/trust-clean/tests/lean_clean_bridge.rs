@@ -1121,7 +1121,7 @@ fn bridge_gate_pin_drift_fails_closed() {
     let legacy = temp_dir("legacy-pin-drift");
     copy_dir(&base.trustir_olean_dir, &legacy);
     // Preserve the original exact-pin refusal independently of the optional
-    // source-reuse lane now shipped by the real manifest.
+    // source-reuse lane, whether or not the real manifest carries a record.
     let path = legacy.join("MANIFEST.toml");
     let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
     doc.as_table_mut().unwrap().remove("source_reuse");
@@ -1178,7 +1178,9 @@ fn bridge_gate_expected_pin_cannot_authorize_source_reuse() {
 
 /// The selected context names the real checkout. Original producer stamps
 /// remain original when the complete source-reuse lane is used. The full
-/// default-on test independently checks that lane and all mathematical work.
+/// default-on test admits that lane end to end only while the real manifest
+/// carries a reuse record; a direct generation has none, and then no test here
+/// admits a reuse (BRIDGE-REUSE-AUDIT-1 in docs/OPEN_ISSUES.md).
 #[test]
 fn bridge_gate_manifest_commit_matches_checkout() {
     let config = BridgeGateConfig::locate(BridgeGateMode::Spot);

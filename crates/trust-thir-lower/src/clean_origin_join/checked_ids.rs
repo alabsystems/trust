@@ -31,6 +31,9 @@ pub(super) fn validate_join(destination: &Module, source: &Module) -> Result<(u3
     }
     let mut source_ids = BTreeSet::new();
     for function in &source.functions {
+        if source.func_types.get(function.ty.index() as usize).is_none() {
+            return Err("source function signature is missing".to_owned());
+        }
         if !source_ids.insert(function.id.index()) {
             return Err("source function IDs are ambiguous".to_owned());
         }
@@ -48,6 +51,11 @@ pub(super) fn validate_join(destination: &Module, source: &Module) -> Result<(u3
     for function in &source.functions {
         for node in function.blocks.iter().flat_map(|block| &block.body) {
             match &node.inst {
+                Inst::CallIndirect { sig, .. } => {
+                    if source.func_types.get(sig.index() as usize).is_none() {
+                        return Err("source indirect-call signature is missing".to_owned());
+                    }
+                }
                 Inst::Call { callee, .. } | Inst::Invoke { callee, .. } => {
                     validate_function(*callee, &source_ids, function_offset)?;
                 }

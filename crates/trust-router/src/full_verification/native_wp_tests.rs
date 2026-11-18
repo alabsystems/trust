@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[path = "native_wp_tests/archived_envelopes.rs"]
+mod archived_envelopes;
+use archived_envelopes::{assert_archived_schema8_input, derived_current_native_input};
+
 fn fixture(negate: bool) -> (TrustContractBundle, NativeVerificationBundle) {
     fixture_with_requirement(negate, None)
 }

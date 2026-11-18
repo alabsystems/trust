@@ -215,21 +215,40 @@ impl Cache {
     }
 
     fn acquire(path: &Path, create: bool) -> CargoResult<Self> {
+        Self::acquire_home(Self::capture_source_home(path)?, create)
+    }
+
+    // Trust: retain the original directory without taking cache locks yet.
+    // A later DATA phase acquires through this same descriptor, never a path
+    // reconstruction. No source bytes or authority are accepted by capture.
+    fn capture_source_home(path: &Path) -> CargoResult<Directory> {
         ensure!(
             path.is_absolute() && path.canonicalize()? == path,
             "cache input must be an absolute canonical directory"
         );
-        Self::acquire_home(Directory::open(path)?, create)
+        let home = Directory::open(path)?;
+        Self::validate_home(&home)?;
+        Ok(home)
     }
 
-    fn acquire_home(home: Directory, create: bool) -> CargoResult<Self> {
+    fn validate_home(home: &Directory) -> CargoResult<()> {
+        home.same_identity()?;
+        // SAFETY: geteuid only reads this process's effective account.
         let uid = unsafe { libc::geteuid() };
+        let metadata = home.file.metadata()?;
         ensure!(
-            home.before.uid() == uid && home.before.mode() & 0o022 == 0,
+            metadata.uid() == uid && metadata.mode() & 0o022 == 0,
             "cache input is not an owner-controlled directory"
         );
         trust_resource_provenance::require_no_acl_grants(&home.file)?;
         require_local_filesystem(&home.file)?;
+        home.same_identity()
+    }
+
+    fn acquire_home(home: Directory, create: bool) -> CargoResult<Self> {
+        Self::validate_home(&home)?;
+        // SAFETY: geteuid only reads this process's effective account.
+        let uid = unsafe { libc::geteuid() };
         let mut result = Self {
             home,
             locks: Vec::new(),

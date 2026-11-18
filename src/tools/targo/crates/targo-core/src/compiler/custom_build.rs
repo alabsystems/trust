@@ -46,7 +46,9 @@ use crate::util::data_structures::HashSet;
 use crate::util::errors::CargoResult;
 use crate::util::internal;
 use crate::util::machine_message::{self, Message};
-use crate::util::process_authority::is_compiler_flag_environment;
+use crate::util::process_authority::{
+    NativePairingInputRole, is_compiler_flag_environment, prepare_native_pairing_input,
+};
 // Trust: EW-9 re-rooting of cached output recorded in another tree.
 use crate::util::relocation_roots::OutputRelocation;
 use crate::util::rustc_options::rustc_option_parts;
@@ -615,11 +617,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
     let (build_script_unit, to_exec) = compiled_script_executable(build_runner, unit)?;
     let script_dir = build_runner.files().build_script_dir(&build_script_unit);
 
-    let script_out_dir = if bcx.gctx.cli_unstable().build_dir_new_layout {
-        build_runner.files().out_dir_new_layout(unit)
-    } else {
-        build_runner.files().build_script_out_dir(unit)
-    };
+    let script_out_dir = script_out_dir(build_runner, unit);
 
     if let Some(deps) = unit.pkg.manifest().metabuild() {
         prepare_metabuild(build_runner, &build_script_unit, deps)?;
@@ -754,6 +752,10 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
         build_script_rustflags.join("\x1f"),
     );
     cmd.env_remove("RUSTFLAGS");
+    // Trust: this compiler input is not build-script runtime data, on either
+    // lane. Keep all original scheduling transport and the compiler's own
+    // captured value; never ask untrusted script output to replay it.
+    prepare_native_pairing_input(&mut cmd, NativePairingInputRole::BuildScript)?;
 
     if build_runner.bcx.ws.gctx().extra_verbose() {
         cmd.display_env_vars();
@@ -1861,11 +1863,7 @@ fn prev_build_output(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
 ) -> (Option<BuildOutput>, PathBuf, Option<ReceiptKey>, bool) {
-    let script_out_dir = if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
-        build_runner.files().out_dir_new_layout(unit)
-    } else {
-        build_runner.files().build_script_out_dir(unit)
-    };
+    let script_out_dir = script_out_dir(build_runner, unit);
     let run_files = BuildScriptRunFiles::for_unit(build_runner, unit);
 
     // Trust: verify bounded bytes before parsing any cached directives or
@@ -2035,6 +2033,23 @@ pub(super) fn planning_command_outputs(
     Ok(outputs)
 }
 
+/// Trust (DC-18c): the file that holds what a build-script run printed, its
+/// directives, as Targo reads them for its dependents' commands.
+pub(crate) fn script_stdout(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> PathBuf {
+    BuildScriptRunFiles::for_unit(build_runner, unit).stdout
+}
+
+/// The `OUT_DIR` a run of a build script writes, in the build directory's
+/// layout: what the script is told, what its outputs are cached from, and
+/// what a shared member that runs it is keyed on (DC-18c).
+pub(crate) fn script_out_dir(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> PathBuf {
+    if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
+        build_runner.files().out_dir_new_layout(unit)
+    } else {
+        build_runner.files().build_script_out_dir(unit)
+    }
+}
+
 /// Files with information about a running build script.
 struct BuildScriptRunFiles {
     /// The directory containing files related to running a build script.
@@ -2055,11 +2070,7 @@ struct BuildScriptRunFiles {
 // never paths or keys supplied by a receipt being decoded.
 pub(super) fn cached_output(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CachedOutput {
     let files = BuildScriptRunFiles::for_unit(build_runner, unit);
-    let generated = if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
-        build_runner.files().out_dir_new_layout(unit)
-    } else {
-        build_runner.files().build_script_out_dir(unit)
-    };
+    let generated = script_out_dir(build_runner, unit);
     CachedOutput::new(
         &files.root,
         build_runner.get_run_build_script_metadata(unit).to_string(),

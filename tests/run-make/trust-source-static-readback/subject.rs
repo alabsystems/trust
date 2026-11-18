@@ -99,3 +99,16 @@ pub static TOO_LARGE: [u8; 65_537] = [0; 65_537];
 pub fn too_large_address() -> &'static [u8; 65_537] {
     &TOO_LARGE
 }
+
+// CTFE creates a Synthetic/NestedStatic for this mutable backing allocation.
+// It deliberately has no Rust type; reading its initializer must not query type_of.
+pub static mut NESTED_BACKING: &mut [u64; 1] = &mut [17];
+#[inline(never)]
+pub unsafe fn nested_backing_address() -> *mut [u64; 1] {
+    unsafe { NESTED_BACKING as *mut _ }
+}
+
+// A non-promotable immutable tail temporary has the same no-type standing.
+pub static NESTED_IMMUTABLE: &[u64; 1] = { let element = 29; &[element] };
+#[inline(never)]
+pub fn nested_immutable_address() -> &'static [u64; 1] { NESTED_IMMUTABLE }

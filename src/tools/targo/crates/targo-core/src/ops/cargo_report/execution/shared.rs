@@ -53,6 +53,8 @@ pub(super) fn validate(
         .filter(|unit| unit.requested)
         .map(|unit| unit.package_id.as_str())
         .collect();
+    // Trust (DC-18b): a workspace member's library is shared although its
+    // package is requested; any other requested package stays private.
     for unit in units.values() {
         let decision = unit
             .shared_dependency
@@ -62,23 +64,32 @@ pub(super) fn validate(
             && (unit.target.kind != "lib"
                 || unit.mode.is_any_test()
                 || !(unit.mode.is_check() || unit.mode == crate::compiler::CompileMode::Build)
-                || requested_packages.contains(unit.package_id.as_str()))
+                || (!unit.shared_member && requested_packages.contains(unit.package_id.as_str())))
         {
             bail!(
                 "shared dependency candidate contradicts its registered target or requested package"
             );
         }
+        // Trust (DC-18c): a member is keyed on its own build-script run and
+        // on each proc macro it loads, which stay per checkout; they neither
+        // block it nor need to be eligible.
+        let keyed = |dependency: &UnitRow| {
+            unit.shared_member
+                && dependency.shared_keyed
+                && (!dependency.mode.is_run_custom_build()
+                    || dependency.package_id == unit.package_id)
+        };
         let mut blocked: Vec<_> = unit
             .dependencies
             .iter()
             .copied()
             .filter(|index| {
-                !matches!(
-                    units
-                        .get(index)
-                        .and_then(|unit| unit.shared_dependency.as_ref()),
-                    Some(SharedDependencyDecision::Eligible {})
-                )
+                let dependency = units.get(index);
+                !dependency.is_some_and(keyed)
+                    && !matches!(
+                        dependency.and_then(|unit| unit.shared_dependency.as_ref()),
+                        Some(SharedDependencyDecision::Eligible {})
+                    )
             })
             .collect();
         blocked.sort_unstable();
@@ -167,6 +178,9 @@ pub(super) fn summarize(
                 excluded += 1;
                 *frontier.direct_exclusions.entry(*reason).or_default() += 1;
             }
+            SharedDependencyDecision::Taken {} | SharedDependencyDecision::Refused { .. } => {
+                bail!("a unit source decision is not a planned frontier decision")
+            }
         }
         if compiler_unit(unit.mode) {
             if let Some(measured) = &mut measured {
@@ -176,6 +190,10 @@ pub(super) fn summarize(
                         &mut measured.dependency_blocked
                     }
                     SharedDependencyDecision::Excluded { .. } => &mut measured.excluded,
+                    SharedDependencyDecision::Taken {}
+                    | SharedDependencyDecision::Refused { .. } => {
+                        bail!("a unit source decision is not a planned frontier decision")
+                    }
                 };
                 if unit.process.command_started_seconds.is_none() {
                     if unit.outcome

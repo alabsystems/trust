@@ -346,7 +346,7 @@ fn retained_original_context_environment_and_valid_but_wrong_proof_all_refuse() 
     let mut changed = original.clone();
     let (goal, _) = changed.packet.terms.restore().unwrap();
     let false_proof = clean_kernel::Expr::const_str("True.intro");
-    changed.packet.terms = TermPacket::capture(&goal, &false_proof).unwrap();
+    changed.packet.terms = TermPacket::capture(&goal, &false_proof).unwrap().into();
     changed.packet.proof_sha256 = encoded_hash(&false_proof, 64 * 1024 * 1024).unwrap().0;
     let failure = without_production(|| changed.replay(&expected)).unwrap_err();
     assert!(failure.contains("kernel rejection"), "{failure}");

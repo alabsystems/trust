@@ -144,10 +144,8 @@ TESTS=(
 #       exact working DATA clones; daily staging reaches the same source owner.
 #   scripts/daily_dependency_git.py and scripts/daily_registry_proxy.py
 #       daily_toolchain_stage.py and its tests load dependency/registry transport.
-#   scripts/bootstrap_dependency_preparation.py
-#       seed_custody_source.py's BoundSourceLoader loads it by path
-#       (select_dependencies_from_capture and its projection), as one of the
-#       six code files a native dependency selection captures.
+#   scripts/sdk_diagnostic.py  daily_toolchain_stage.py loads its diagnostic
+#       worker only for diagnose and _sdk-diagnostic-worker invocations.
 #   Incremental reclamation runs the native build-tree library through an
 #       actual Bootstrap/Targo frontend; its Rust tests own that policy.
 # Named by the subjects and NOT loaded, so not here: scripts/check_driver_extra_symbols.py,
@@ -190,10 +188,10 @@ SCOPE=(
   scripts/seed_fixed_point.py
   scripts/seed_root_initialization.py
   scripts/seed_custody_source.py
-  scripts/bootstrap_dependency_preparation.py
   scripts/lib/seed_linux.py
   scripts/daily_dependency_git.py
   scripts/daily_registry_proxy.py
+  scripts/sdk_diagnostic.py
   scripts/check_seed_freshness.py
   scripts/lib/native_serial.py
   scripts/lib/landing_targo.py
@@ -220,8 +218,6 @@ SCOPE=(
   src/tools/trust-stage0-dist/prepare.py
   src/tools/trust-stage0-dist/bootstrap_steps.py
   scripts/bootstrap_dependency_closure.py
-  scripts/bootstrap_dependency_preparation.py
-  scripts/qualify_targo_resource.py
   x.py
 )
 

@@ -83,7 +83,7 @@ class Program:
     def __init__(self, ast, config):
         self.config = config
         self.adts = {}
-        self.aliases = {}           # name -> (generic param names, json type)
+        self.aliases = {}           # name -> ([(param, default json or None)], json type, file)
         self.traits = {}            # name -> JSON
         self.fns = []               # all FnDef (after argmatch merge, arms are not in this list)
         self.consts = []
@@ -108,8 +108,7 @@ class Program:
                 elif k == 'struct':
                     self._struct_raw(v, path)
                 elif k == 'type':
-                    params = [one_key(p)[1]['ident'] for p in (v.get('generics') or {}).get('params', [])]
-                    self.aliases[v['ident']] = (params, v['ty'], path)
+                    self.aliases[v['ident']] = (type_param_decls(v.get('generics')), v['ty'], path)
                 elif k == 'trait':
                     self.traits[v['ident']] = (v, path)
         # pass 2: code
@@ -182,6 +181,15 @@ class Program:
                 self.refused_items.append((f'{path}: impl {trait or ""} for {owner}::{iv.get("ident")}',
                                            'impl-on-library-type', f'{owner} (trait {trait})'))
             return
+        refusal = self._unconfigured_impl(trait, owner, v['self_ty'], generics)
+        if refusal is not None:
+            # The monomorphization binds each bound trait to one owner and each ADT to one
+            # instance; any other impl would be translated as if it were that one.
+            for item in v['items']:
+                ik, iv = one_key(item)
+                self.refused_items.append((f'{path}: impl {trait or ""} for {owner}::{iv.get("ident")}',
+                                           refusal.construct, refusal.detail))
+            return
         for item in v['items']:
             ik, iv = one_key(item)
             if ik == 'fn':
@@ -194,6 +202,30 @@ class Program:
                 pass  # associated type definitions are covered by the monomorphization config
             else:
                 self.refused_items.append((f'{path}: impl item {ik}', 'impl-item-kind', ik))
+
+    def _unconfigured_impl(self, trait, owner, self_ty_json, generics):
+        """The refusal for an impl the monomorphization does not configure, or None.
+
+        (c) an impl of a bound trait (`impl Memory for TreeBorrowsMemory<T>`) whose owner is not
+        the configured one (`monomorphization.bound`); (a) an impl whose self type, with its
+        declared defaults filled, is not the ADT's configured instance
+        (`impl BasicMemory<T, Path, Extra>`): `Self` inside it would mean the configured instance."""
+        cfg = self.config['monomorphization']
+        if trait in cfg['bound'] and to_ty(cfg['bound'][trait]) != ('adt', owner):
+            return Refusal('impl-of-bound-trait-for-unconfigured-owner',
+                           f'{trait} for {owner}; the monomorphization binds {trait} to '
+                           f'{to_ty(cfg["bound"][trait])[1]}')
+        from tyres import resolve  # noqa: PLC0415  (tyres imports this module)
+        try:
+            resolve(self, self_ty_json, generics, None)
+        except Refusal as r:
+            return r
+        return None
+
+    def trait_assoc_types(self, trait):
+        """The associated type names a spec trait declares (`type Provenance;`)."""
+        tv, _ = self.traits.get(trait, ({'items': []}, None))
+        return {one_key(item)[1]['ident'] for item in tv.get('items', []) if one_key(item)[0] == 'type'}
 
     def _fn(self, v, owner, trait, path, outer_generics):
         g = dict(outer_generics)
@@ -255,6 +287,17 @@ class Program:
             if c.owner == owner and c.name == name:
                 return c
         return None
+
+
+def type_param_decls(generics_json):
+    """An item's type parameters in order, each with its declared default JSON type or None
+    (syn's `TypeParam.default`: `struct Allocation<ProvExtra = (), AllocExtra = ()>`)."""
+    out = []
+    for p in (generics_json or {}).get('params', []):
+        pk, pv = one_key(p)
+        if pk == 'type':
+            out.append((pv['ident'], pv.get('default')))
+    return out
 
 
 def to_ty(j):

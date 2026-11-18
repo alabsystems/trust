@@ -15,6 +15,7 @@ use std::process::{Command, ExitStatus};
 use cargo_util::{ProcessBuilder, paths};
 
 use crate::CargoResult;
+use crate::context::NativeLintContextArgs;
 use crate::util::GlobalContext;
 use crate::util::tippy_arg_protocol;
 use crate::util::tippy_frontend_args::FrontendArgs;
@@ -101,7 +102,7 @@ impl Inputs {
     fn prepare(
         &self,
         args: FrontendArgs,
-        context: &[std::ffi::OsString],
+        context: &NativeLintContextArgs,
         environment: OverlayEnvironment,
     ) -> Result<Command, String> {
         let configured = if environment.is_configured() {
@@ -134,14 +135,18 @@ fn compile_command(
     compiler: &Path,
     driver: &Path,
     args: &FrontendArgs,
-    context: &[std::ffi::OsString],
+    context: &NativeLintContextArgs,
 ) -> Command {
     let mut command = Command::new(planner);
     overlay::clear_overlay_command_environment(&mut command);
     command
         .arg("--unverified")
+        // Parent globals belong to the root parser frame. Keep the original
+        // frontend tail in the child frame: Cargo combines restrictions there
+        // without interpreting option values as flags or changing its schema.
+        .args(&context.global)
         .arg(args.verb)
-        .args(context)
+        .args(&context.command)
         .args(&args.args)
         .env("CARGO", planner)
         .env("RUSTC", compiler)
@@ -260,7 +265,7 @@ pub fn run(
             inputs.compiler.path(),
             &inputs.driver_path,
             &probe,
-            &[],
+            &NativeLintContextArgs::default(),
         );
         for (name, value) in environment.get_envs() {
             match value {
@@ -299,7 +304,7 @@ mod tests {
             Path::new("/sdk/bin/trustc"),
             Path::new("/sdk/bin/tippy-driver"),
             &args,
-            &[],
+            &NativeLintContextArgs::default(),
         );
         assert_eq!(command.get_program(), "/current/targo");
         assert_eq!(
@@ -337,6 +342,93 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.no_deps, NoDepsFlag::Explicit(false));
         assert_eq!(decoded.compiler_args, ["-D", "warnings"]);
+    }
+
+    #[test]
+    fn native_lint_parent_globals_keep_child_options_and_compiler_channels_exact() {
+        let args = FrontendArgs::parse(
+            [
+                "--offline",
+                "--locked",
+                "--config",
+                "build.rustflags=['--frozen']",
+                "--",
+                "--cfg",
+                "policy_literal=\"--offline\"",
+                "-D",
+                "warnings",
+            ]
+            .map(str::to_owned),
+        );
+        let context = NativeLintContextArgs {
+            global: vec![
+                "--config=build.build-dir='cache with spaces'".into(),
+                "--frozen".into(),
+            ],
+            command: vec!["--target-dir".into(), "target with spaces".into()],
+        };
+        let command = compile_command(
+            Path::new("/current/targo"),
+            Path::new("/sdk/bin/trustc"),
+            Path::new("/sdk/bin/tippy-driver"),
+            &args,
+            &context,
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--unverified",
+                "--config=build.build-dir='cache with spaces'",
+                "--frozen",
+                "check",
+                "--target-dir",
+                "target with spaces",
+                "--offline",
+                "--locked",
+                "--config",
+                "build.rustflags=['--frozen']",
+            ]
+        );
+        let channels = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let encoded = channels[OsStr::new("TIPPY_ENCODED_ARGS")]
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let decoded = decode_args(encoded).unwrap();
+        assert_eq!(
+            decoded.compiler_args,
+            ["--cfg", "policy_literal=\"--offline\"", "-D", "warnings"]
+        );
+    }
+
+    #[test]
+    fn native_lint_never_filters_a_flag_spelling_from_an_option_value() {
+        let args = FrontendArgs::parse(["--config", "--offline"].map(str::to_owned));
+        let context = NativeLintContextArgs {
+            global: vec!["--offline".into()],
+            command: Vec::new(),
+        };
+        let command = compile_command(
+            Path::new("/current/targo"),
+            Path::new("/sdk/bin/trustc"),
+            Path::new("/sdk/bin/tippy-driver"),
+            &args,
+            &context,
+        );
+        // Whether this operand is valid belongs to Cargo's real grammar. The
+        // frontend must not turn its refusal into a different accepted command.
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--unverified",
+                "--offline",
+                "check",
+                "--config",
+                "--offline"
+            ]
+        );
     }
 
     #[test]
@@ -458,21 +550,64 @@ mod tests {
             .unwrap();
         let args = context.native_lint_context_args();
         assert_eq!(
-            args.iter()
+            args.global
+                .iter()
                 .filter(|arg| arg.as_os_str() == OsStr::new("--frozen"))
                 .count(),
             1
         );
         assert!(
-            args.windows(2)
-                .any(|pair| pair[0].as_os_str() == OsStr::new("--config")
-                    && pair[1].as_os_str() == OsStr::new(&config))
+            args.global
+                .iter()
+                .any(|arg| arg.as_os_str() == OsStr::new(&format!("--config={config}")))
         );
         assert!(
-            args.windows(2)
+            args.command
+                .windows(2)
                 .any(|pair| pair[0].as_os_str() == OsStr::new("--target-dir")
                     && pair[1].as_os_str() == directory.as_os_str())
         );
+    }
+
+    #[test]
+    fn flag_like_parent_config_paths_cannot_erase_lock_policy() {
+        for name in ["--locked", "--offline", "--frozen"] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(root.path().join(name), "[net]\noffline = true\n").unwrap();
+            let mut context = GlobalContext::new(
+                cargo_util_terminal::Shell::new(),
+                root.path().to_owned(),
+                home,
+            );
+            context
+                .configure(
+                    0,
+                    false,
+                    None,
+                    false,
+                    true,
+                    false,
+                    &None,
+                    &[],
+                    &[name.to_owned()],
+                )
+                .unwrap();
+            let args = context.native_lint_context_args();
+            assert!(
+                args.global
+                    .iter()
+                    .any(|arg| arg.as_os_str() == OsStr::new("--locked"))
+            );
+            assert!(
+                args.global
+                    .iter()
+                    .any(|arg| arg.as_os_str() == OsStr::new(&format!("--config={name}")))
+            );
+            assert!(!context.lock_update_allowed());
+            assert!(!context.network_allowed());
+        }
     }
 
     /// The files Tippy compiles into its own binaries: by `#[path]` in

@@ -135,6 +135,30 @@ pub(crate) fn trim_paths_args(
     Ok(())
 }
 
+/// Trust (DC-18b): a shared member's path arguments, whatever its profile's
+/// `trim-paths`: every scope remaps the workspace directory to `.` and the
+/// sysroot as trim-paths does, and `-Ztrust-path-free` refuses metadata that
+/// still names a host path. The build directory is not remapped: a shared
+/// member reads only the store, and its command must not name the checkout's
+/// build directory (`action_command::CommandInputs::capture_relocated`).
+pub(crate) fn shared_member_args(
+    cmd: &mut ProcessBuilder,
+    bcx: &BuildContext<'_, '_>,
+    unit: &Unit,
+) {
+    cmd.arg("--remap-path-scope=all");
+    for pair in package_remap(bcx, unit)
+        .into_pairs()
+        .into_iter()
+        .chain([sysroot_remap(bcx, unit)])
+    {
+        let mut arg = OsString::from("--remap-path-prefix=");
+        arg.push(join_remap(pair));
+        cmd.arg(arg);
+    }
+    cmd.arg("-Ztrust-path-free");
+}
+
 /// Computes the `<from>=<to>` path remap pairs for [RFC 3127] trim-paths.
 ///
 /// Order of `--remap-path-prefix` flags is important for `-Zbuild-std`.

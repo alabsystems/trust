@@ -149,13 +149,6 @@ fn exchange(
 }
 
 impl SourceBoundBootstrapGraph {
-    pub(super) fn require_preparation_cache(&self, deadline: Instant) -> io::Result<()> {
-        if self.original.as_ref().is_some_and(|original| original.offline_staged.is_some()) {
-            self.preparation_cache.as_ref().ok_or_else(crate::wire::invalid)?.check(deadline)?;
-        }
-        Ok(())
-    }
-
     /// Freeze canonical114 from this actual staged source/output/Root before
     /// offering the caller context's SAME readonly directory. A successful137
     /// is equality/physical-custody DATA, never a transferable cache-lock owner.

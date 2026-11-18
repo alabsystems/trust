@@ -388,12 +388,13 @@ impl Prepared {
     }
     fn protect_original_inputs(
         &self,
-        originals: impl IntoIterator<Item = (u64, u64)>,
+        controller: impl IntoIterator<Item = (u64, u64)>,
+        health: impl IntoIterator<Item = (u64, u64)>,
     ) -> io::Result<()> {
         let selected = self.inventory.identities();
-        if originals.into_iter().any(|identity| selected.contains(&identity)) {
+        if controller.into_iter().chain(health).any(|identity| selected.contains(&identity)) {
             return Err(invalid(
-                "whole-tree plan contains an actual retained native controller input",
+                "whole-tree plan contains an actual retained native controller input or health-probe backing",
             ));
         }
         Ok(())
@@ -720,11 +721,20 @@ pub fn reclaim(
         .with_current(&request.root, &request.build, || Prepared::new(request, output))?
         .map_err(|e| e.to_string())?;
     let controller = owner.controller_inputs().map_err(|e| e.to_string())?;
+    let mut health_inputs = Vec::new();
+    // Trust: a cache alias can name the SAME inode as an installed compiler, runtime
+    // or libstd file. Unlinking that alias changes its held original metadata
+    // even though the installed path and bytes remain. Refuse before detach,
+    // including inputs retained by a present but incomplete health probe.
+    for observed in &before {
+        health_inputs.extend(observed.retained_input_identities().map_err(|e| e.to_string())?);
+    }
     prepared
         .protect_original_inputs(
             std::iter::once(&controller.executable)
                 .chain(&controller.runtime)
                 .map(|file| (file.device, file.inode)),
+            health_inputs,
         )
         .map_err(|e| e.to_string())?;
     let space = prepared.inventory.finish().map_err(|e| e.to_string())?;

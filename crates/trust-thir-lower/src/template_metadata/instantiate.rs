@@ -588,12 +588,23 @@ impl<'tcx> InstantiationHost for RustHost<'_, 'tcx> {
     fn type_hole(
         &mut self,
         cx: &mut Module,
-        _: HoleId,
+        hole_id: HoleId,
         key: &HostKey,
         _: &[InstArg],
     ) -> std::result::Result<Ty, HostRefusal> {
+        let hole = self.artifact.template().header.holes.get(hole_id.as_usize())
+            .filter(|hole| &hole.key == key)
+            .ok_or_else(|| HostRefusal("type answer is detached from its original typed hole".into()))?;
+        let trust_ir::template::HoleKind::Type { contract } = &hole.kind else {
+            return Err(HostRefusal("type answer names a non-type hole".into()));
+        };
         let image = crate::concrete_type_transport::from_key(self.tcx, self.instance, key)
             .map_err(HostRefusal)?;
+        if *contract == trust_ir::template::TypeContract::ThinPointer
+            && !image.root_is_thin_pointer(self.tcx, 0)
+        {
+            return Err(HostRefusal("actual source type does not determine a thin pointer".into()));
+        }
         self.placed(cx, &image)?
             .into_iter()
             .next()
