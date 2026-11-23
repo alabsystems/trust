@@ -1,18 +1,18 @@
 trust
 Copyright 2026 Andrew Yates
 
-trust is licensed under the ALab Academic Use License 1.0; the terms are in LICENSE.
+trust is licensed under the PolyForm Noncommercial License 1.0.0; the terms are in LICENSE.
 
 trust's binaries include third-party components. Each remains under its own
-license, and nothing in the ALab Academic Use License limits the rights that license
-gives you.
+license: the PolyForm Noncommercial License 1.0.0 covers only ALab's own work
+and limits none of the rights those licenses give you.
 
 Trust is built on rust-lang/rust (https://github.com/rust-lang/rust), which is
 Copyright (c) The Rust Project Contributors and is licensed under the Apache
 License, Version 2.0 (licenses/Apache-2.0.txt) or the MIT license
-(licenses/MIT.txt), at your option. The files Trust inherits from it, with
-Trust's changes to them, remain under those terms; the files Trust wrote, and
-Trust as a whole, are licensed under the ALab Academic Use License.
+(licenses/MIT.txt), at your option. The files Trust inherits from it remain
+under those terms; Trust's changes to them, the files Trust wrote, and Trust as
+a whole are licensed under the PolyForm Noncommercial License 1.0.0.
 
 Trust's toolchain includes LLVM (https://llvm.org), licensed under the Apache
 License, Version 2.0 with LLVM Exceptions (licenses/Apache-2.0.txt and
@@ -29,5 +29,6 @@ Public License 3.0), and clean statically links GNU MP 6.3.0 with the rug and
 gmp-mpfr-sys crates (GNU Lesser General Public License 3.0 or later); the
 license text is licenses/LGPL-3.0.txt, which incorporates licenses/GPL-3.0.txt.
 Some crates are under the Mozilla Public License 2.0 (licenses/MPL-2.0.txt).
-Section 5 of the ALab Academic Use License keeps every right those licenses
-give you.
+Nothing in the PolyForm Noncommercial License limits those rights: you may
+modify those components, relink the binaries with modified versions of them,
+and reverse engineer the binaries to debug such modifications.
